@@ -94,6 +94,14 @@ pub const Buffer = struct {
         return line.end - line.start;
     }
 
+    /// Last "real" row: skips the phantom empty line that follows a
+    /// trailing newline (vim semantics for `G`).
+    pub fn lastRow(self: *const Buffer) usize {
+        const n = self.lines.items.len;
+        if (n > 1 and self.lineLen(n - 1) == 0) return n - 2;
+        return n -| 1;
+    }
+
     pub fn cursorByte(self: *const Buffer) usize {
         return self.lines.items[self.row].start + self.col;
     }

@@ -33,9 +33,15 @@ pub const Editor = struct {
     focus: Focus = .editor,
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
+    /// Visual-mode anchor (the end of the selection that does not move).
+    vis_row: usize = 0,
+    vis_col: usize = 0,
+    /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
+    reg: std.ArrayListUnmanaged(u8) = .{},
+    reg_linewise: bool = false,
 
-    pub const Mode = enum { normal, insert, command };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c };
+    pub const Mode = enum { normal, insert, command, visual, visual_line };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b };
     const Focus = enum { editor, tree };
     const tree_width_max: u16 = 30;
 
@@ -76,7 +82,10 @@ pub const Editor = struct {
         "Ctrl-l       focus editor",
         "Ctrl-d/u     half-page down/up",
         "/ then n/N   search / next/prev",
+        "]c / [c      next/prev git hunk",
         "gg / G       top / bottom",
+        "v / V        visual / line select",
+        "y d p        yank / delete / put",
         "dd           delete line",
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
@@ -159,6 +168,7 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
+        self.reg.deinit(self.alloc);
         self.cmd.deinit(self.alloc);
         self.search.deinit(self.alloc);
         self.popup.filter.deinit(self.alloc);
@@ -467,6 +477,7 @@ pub const Editor = struct {
                     .normal => try self.handleNormal(ctx, key),
                     .insert => try self.handleInsert(ctx, key),
                     .command => try self.handleCommand(ctx, key),
+                    .visual, .visual_line => try self.handleVisual(ctx, key),
                 }
             },
             else => {},
@@ -499,6 +510,91 @@ pub const Editor = struct {
             else => return,
         }
         ctx.consumeAndRedraw();
+    }
+
+    /// Display width of a line's leading whitespace, or null for blank lines.
+    fn lineIndentWidth(b: *const Buffer, li: usize) ?u16 {
+        const line = b.lines.items[li];
+        const text = b.buf.items[line.start..line.end];
+        var w: u16 = 0;
+        for (text) |ch| {
+            switch (ch) {
+                ' ' => w += 1,
+                '\t' => w = (w / 4 + 1) * 4,
+                else => return w,
+            }
+        }
+        return null; // empty or whitespace-only
+    }
+
+    /// Guide depth for a row: its own indent, or for blank lines the indent
+    /// of the surrounding block so guides continue through gaps
+    /// (indent-blankline behavior).
+    fn guideWidthFor(b: *const Buffer, li: usize) u16 {
+        if (lineIndentWidth(b, li)) |w| return w;
+        var prev: u16 = 0;
+        var next: u16 = 0;
+        var i = li;
+        while (i > 0) {
+            i -= 1;
+            if (lineIndentWidth(b, i)) |w| {
+                prev = w;
+                break;
+            }
+        }
+        var j = li + 1;
+        while (j < b.lines.items.len) : (j += 1) {
+            if (lineIndentWidth(b, j)) |w| {
+                next = w;
+                break;
+            }
+        }
+        return @min(prev, next);
+    }
+
+    /// gitsigns-style `]c` / `[c`: jump to the next/previous hunk start, wrapping.
+    fn jumpHunk(self: *Editor, dir: i2) void {
+        const b = self.cur();
+        const signs = b.git_signs.items;
+        var total: usize = 0;
+        var target: ?usize = null;
+        var target_n: usize = 0;
+        var first: usize = 0;
+        var last: usize = 0;
+        var row: usize = 0;
+        while (row < signs.len) : (row += 1) {
+            if (signs[row] == .none) continue;
+            if (row > 0 and signs[row - 1] != .none) continue; // not a hunk start
+            total += 1;
+            if (total == 1) first = row;
+            last = row;
+            if (dir > 0) {
+                if (row > b.row and target == null) {
+                    target = row;
+                    target_n = total;
+                }
+            } else if (row < b.row) {
+                target = row;
+                target_n = total;
+            }
+        }
+        if (total == 0) {
+            self.setStatus("no hunks", .{});
+            return;
+        }
+        var n = target_n;
+        const dest = target orelse blk: {
+            // Wrap around, like gitsigns nav_hunk.
+            if (dir > 0) {
+                n = 1;
+                break :blk first;
+            }
+            n = total;
+            break :blk last;
+        };
+        b.row = dest;
+        b.clampCol(false);
+        self.setStatus("hunk {d}/{d}", .{ n, total });
     }
 
     fn handleNormal(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -554,6 +650,16 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .bracket_f => {
+                self.pending = .none;
+                if (cp == 'c') self.jumpHunk(1);
+                return ctx.consumeAndRedraw();
+            },
+            .bracket_b => {
+                self.pending = .none;
+                if (cp == 'c') self.jumpHunk(-1);
+                return ctx.consumeAndRedraw();
+            },
         }
 
         if (key.mods.alt) return;
@@ -600,10 +706,12 @@ pub const Editor = struct {
             },
             'g' => self.pending = .g,
             'G' => {
-                b.row = b.lines.items.len - 1;
+                b.row = b.lastRow();
                 b.clampCol(false);
             },
             'd' => self.pending = .d,
+            ']' => self.pending = .bracket_f,
+            '[' => self.pending = .bracket_b,
             '/' => {
                 self.mode = .command;
                 self.cmd_is_search = true;
@@ -612,6 +720,9 @@ pub const Editor = struct {
             'n' => self.findNext(1),
             'N' => self.findNext(-1),
             'x' => try b.deleteCharAtCursor(),
+            'v' => self.enterVisual(.visual),
+            'V' => self.enterVisual(.visual_line),
+            'p' => try self.pasteAfter(),
             'i' => self.mode = .insert,
             'a' => {
                 self.mode = .insert;
@@ -650,6 +761,191 @@ pub const Editor = struct {
             else => return,
         }
         ctx.consumeAndRedraw();
+    }
+
+    // ---- visual mode ------------------------------------------------------
+
+    fn enterVisual(self: *Editor, m: Mode) void {
+        const b = self.cur();
+        self.vis_row = b.row;
+        self.vis_col = b.col;
+        self.mode = m;
+    }
+
+    /// Byte range [start, end) of the current selection, or null.
+    fn selRange(self: *Editor) ?[2]usize {
+        if (self.mode != .visual and self.mode != .visual_line) return null;
+        if (self.buffers.items.len == 0) return null;
+        const b = self.cur();
+        const ar = @min(self.vis_row, b.lines.items.len - 1);
+        const ac = @min(self.vis_col, b.lineLen(ar));
+        if (self.mode == .visual_line) {
+            const lo = @min(ar, b.row);
+            const hi = @max(ar, b.row);
+            const end = b.lines.items[hi].end;
+            return .{ b.lines.items[lo].start, @min(end + 1, b.buf.items.len) };
+        }
+        const a_first = ar < b.row or (ar == b.row and ac <= b.col);
+        const sr = if (a_first) ar else b.row;
+        const sc = if (a_first) ac else b.col;
+        const er = if (a_first) b.row else ar;
+        const ec = if (a_first) b.col else ac;
+        const start = b.lines.items[sr].start + sc;
+        const end = b.lines.items[er].start + ec + b.cpLenAt(er, ec);
+        return .{ start, @min(end, b.buf.items.len) };
+    }
+
+    /// Copy the selection into the unnamed register.
+    fn yankSel(self: *Editor, range: [2]usize) !void {
+        const b = self.cur();
+        self.reg.clearRetainingCapacity();
+        try self.reg.appendSlice(self.alloc, b.buf.items[range[0]..range[1]]);
+        self.reg_linewise = self.mode == .visual_line;
+        // Linewise registers always carry a trailing newline (yank of the
+        // last line has none in the buffer).
+        if (self.reg_linewise and (self.reg.items.len == 0 or
+            self.reg.items[self.reg.items.len - 1] != '\n'))
+            try self.reg.append(self.alloc, '\n');
+    }
+
+    fn handleVisual(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const b = self.cur();
+        const cp = key.shifted_codepoint orelse key.codepoint;
+        const half: i64 = @max(1, self.last_height / 2);
+
+        if (key.mods.ctrl) {
+            switch (cp) {
+                'c' => ctx.quit = true,
+                'd' => b.moveVert(half, false),
+                'u' => b.moveVert(-half, false),
+                else => return,
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        switch (cp) {
+            vaxis.Key.escape => self.mode = .normal,
+            'v' => if (self.mode == .visual) {
+                self.mode = .normal;
+            } else {
+                self.mode = .visual;
+            },
+            'V' => if (self.mode == .visual_line) {
+                self.mode = .normal;
+            } else {
+                self.mode = .visual_line;
+            },
+            'o' => {
+                // Swap anchor and cursor.
+                const r = b.row;
+                const c2 = b.col;
+                b.row = @min(self.vis_row, b.lines.items.len - 1);
+                b.col = @min(self.vis_col, b.lineLen(b.row));
+                b.goal_col = @intCast(b.col);
+                self.vis_row = r;
+                self.vis_col = c2;
+            },
+            'y' => {
+                if (self.selRange()) |r| {
+                    try self.yankSel(r);
+                    // Vim leaves the cursor at the start of the yanked text.
+                    if (self.mode == .visual) {
+                        if (self.vis_row < b.row or
+                            (self.vis_row == b.row and self.vis_col < b.col))
+                        {
+                            b.row = self.vis_row;
+                            b.col = self.vis_col;
+                        }
+                    } else {
+                        b.row = @min(self.vis_row, b.row);
+                    }
+                    b.clampCol(false);
+                }
+                self.mode = .normal;
+            },
+            'd', 'x' => {
+                if (self.selRange()) |r| {
+                    try self.yankSel(r);
+                    const lo_row = @min(self.vis_row, b.row);
+                    const lo_col = if (self.mode == .visual_line)
+                        0
+                    else if (self.vis_row < b.row or
+                        (self.vis_row == b.row and self.vis_col < b.col))
+                        self.vis_col
+                    else
+                        b.col;
+                    try b.replaceRange(r[0], r[1], "");
+                    b.row = @min(lo_row, b.lines.items.len - 1);
+                    b.col = lo_col;
+                    b.clampCol(false);
+                    b.goal_col = @intCast(b.col);
+                }
+                self.mode = .normal;
+            },
+            'h', vaxis.Key.left => b.moveLeft(),
+            'l', vaxis.Key.right => b.moveRight(false),
+            'j', vaxis.Key.down => b.moveVert(1, false),
+            'k', vaxis.Key.up => b.moveVert(-1, false),
+            'w' => b.wordForward(),
+            'b' => b.wordBackward(),
+            'e' => b.wordEnd(),
+            '0', vaxis.Key.home => {
+                b.col = 0;
+                b.goal_col = 0;
+            },
+            '^' => {
+                b.col = b.firstNonWs(b.row);
+                b.goal_col = @intCast(b.col);
+            },
+            '$', vaxis.Key.end => {
+                const len = b.lineLen(b.row);
+                b.col = if (len == 0) 0 else Buffer.snapToCp(b.lineText(b.row), len - 1);
+                b.goal_col = std.math.maxInt(u32);
+            },
+            'g' => {
+                b.row = 0;
+                b.col = 0;
+                b.goal_col = 0;
+            },
+            'G' => {
+                b.row = b.lastRow();
+                b.clampCol(false);
+            },
+            else => return,
+        }
+        ctx.consumeAndRedraw();
+    }
+
+    /// `p` in normal mode: put the unnamed register after the cursor
+    /// (charwise) or on a new line below (linewise).
+    fn pasteAfter(self: *Editor) !void {
+        if (self.reg.items.len == 0) return;
+        const b = self.cur();
+        if (self.reg_linewise) {
+            const line = b.lines.items[b.row];
+            if (line.end < b.buf.items.len) {
+                try b.replaceRange(line.end + 1, line.end + 1, self.reg.items);
+            } else {
+                // Last line without trailing newline: lead with one, drop ours.
+                const body = self.reg.items[0 .. self.reg.items.len - 1];
+                const tmp = try std.mem.concat(self.alloc, u8, &.{ "\n", body });
+                defer self.alloc.free(tmp);
+                try b.replaceRange(line.end, line.end, tmp);
+            }
+            b.row += 1;
+            b.col = b.firstNonWs(b.row);
+            b.goal_col = @intCast(b.col);
+        } else {
+            const len = b.lineLen(b.row);
+            const pos = b.lines.items[b.row].start +
+                (if (len == 0) b.col else b.col + b.cpLenAt(b.row, b.col));
+            try b.replaceRange(pos, pos, self.reg.items);
+            if (std.mem.indexOfScalar(u8, self.reg.items, '\n') == null) {
+                b.col = pos - b.lines.items[b.row].start + self.reg.items.len;
+                b.col = Buffer.snapToCp(b.lineText(b.row), b.col -| 1);
+                b.goal_col = @intCast(b.col);
+            }
+        }
     }
 
     fn handleInsert(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -922,6 +1218,7 @@ pub const Editor = struct {
             const text = b.buf.items[line.start..line.end];
             const pat = self.search.items;
             const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
+            const sel = self.selRange();
             var match: ?usize = if (pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
             var col: u16 = x0 + gutter;
             var i: usize = 0;
@@ -935,6 +1232,10 @@ pub const Editor = struct {
                 }
                 if (match) |m| {
                     if (i >= m and i < m + pat.len) style = search_style;
+                }
+                if (sel) |s| {
+                    const abs = line.start + i;
+                    if (abs >= s[0] and abs < s[1]) style.bg = th.bar_bg;
                 }
                 if (slice[0] == '\t') {
                     const stop = x0 + gutter + (((col - x0 - gutter) / 4) + 1) * 4;
@@ -953,6 +1254,21 @@ pub const Editor = struct {
                     }
                 }
                 i = end;
+            }
+
+            // indent-blankline style guides at each indent step, drawn over
+            // the leading-whitespace cells (and through blank lines).
+            var gstyle = base;
+            gstyle.fg = th.gutter;
+            var g: u16 = 0;
+            const guide_w = guideWidthFor(b, li);
+            while (g < guide_w) : (g += 4) {
+                const cx = x0 + gutter + g;
+                if (cx >= max.width) break;
+                surface.writeCell(cx, draw_row, .{
+                    .char = .{ .grapheme = "▏", .width = 1 },
+                    .style = gstyle,
+                });
             }
         }
 
@@ -1199,11 +1515,14 @@ pub const Editor = struct {
         const mode_style: vaxis.Style = switch (self.mode) {
             .normal => .{ .fg = th.badge_fg, .bg = th.green, .bold = true },
             .insert => .{ .fg = th.badge_fg, .bg = th.blue, .bold = true },
+            .visual, .visual_line => .{ .fg = th.badge_fg, .bg = th.purple, .bold = true },
             .command => unreachable,
         };
         const mode_txt = switch (self.mode) {
             .normal => " NORMAL ",
             .insert => " INSERT ",
+            .visual => " VISUAL ",
+            .visual_line => " V-LINE ",
             .command => unreachable,
         };
         var end = writeText(surface, ctx, 0, status_row, mode_txt, mode_style);

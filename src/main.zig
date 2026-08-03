@@ -14,15 +14,10 @@ pub fn main() !void {
     var editor = Editor.init(alloc);
     defer editor.deinit();
 
+    // With no args zide starts on the dashboard (NvDash-style).
     if (args.len > 1) {
         for (args[1..]) |path| try editor.openFile(path);
-        editor.active = 0;
-    } else {
-        try editor.openFile("src/main.zig");
-    }
-    if (editor.buffers.items.len == 0) {
-        std.debug.print("no files could be opened\n", .{});
-        return error.NoBuffers;
+        if (editor.buffers.items.len > 0) editor.active = 0;
     }
 
     var app = try vxfw.App.init(alloc);
