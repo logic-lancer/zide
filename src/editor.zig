@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const themes = @import("theme.zig");
 const Buffer = @import("buffer.zig").Buffer;
+const Tree = @import("tree.zig").Tree;
 
 /// Modal (vim-style) editor widget multiplexing several buffers.
 /// Layout: tabline on top, text area, status line at the bottom.
@@ -18,12 +19,25 @@ pub const Editor = struct {
     pending: Pending = .none,
     last_height: u16 = 24,
     cmd: std.ArrayListUnmanaged(u8) = .{},
+    /// Last committed `/` search pattern (used by n/N and match highlighting).
+    search: std.ArrayListUnmanaged(u8) = .{},
+    /// True while the command line is a `/` search prompt rather than `:`.
+    cmd_is_search: bool = false,
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
     popup: Popup = .{},
+    files: std.ArrayListUnmanaged([]u8) = .{},
+    grep_hits: std.ArrayListUnmanaged(GrepHit) = .{},
+    tree: Tree,
+    tree_open: bool = false,
+    focus: Focus = .editor,
+    git_branch: [64]u8 = undefined,
+    git_branch_len: usize = 0,
 
     pub const Mode = enum { normal, insert, command };
-    const Pending = enum { none, g, d, leader };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c };
+    const Focus = enum { editor, tree };
+    const tree_width_max: u16 = 30;
 
     /// Floating picker overlay (buffers / themes), telescope-flavored:
     /// typing filters, arrows or C-j/C-k move, Enter picks, Esc closes.
@@ -32,19 +46,75 @@ pub const Editor = struct {
         filter: std.ArrayListUnmanaged(u8) = .{},
         selected: usize = 0,
 
-        const Kind = enum { none, buffers, themes };
+        const Kind = enum { none, buffers, themes, files, keys, grep };
         const max_items = 64;
+        const max_files = 2000;
+        const max_file_size = 1024 * 1024;
+    };
+
+    /// One live-grep result: owned path + owned "path:line: text" display row.
+    const GrepHit = struct {
+        path: []u8,
+        line: usize,
+        disp: []u8,
+    };
+
+    /// NvCheatsheet-style keybinding reference, shown via `Space c h`.
+    const cheats = [_][]const u8{
+        "Tab          next buffer",
+        "Shift-Tab    prev buffer",
+        "Space /      toggle comment",
+        "Space b      buffer picker",
+        "Space c h    cheatsheet",
+        "Space e      focus/toggle tree",
+        "Space f f    find files",
+        "Space f w    live grep",
+        "Space t      theme picker",
+        "Space x      close buffer",
+        "Ctrl-n       toggle tree",
+        "Ctrl-h       focus tree",
+        "Ctrl-l       focus editor",
+        "Ctrl-d/u     half-page down/up",
+        "/ then n/N   search / next/prev",
+        "gg / G       top / bottom",
+        "dd           delete line",
+        "i / Esc      insert / normal mode",
+        ":w :q :wq    write / quit",
     };
 
     pub fn init(alloc: std.mem.Allocator) Editor {
-        return .{ .alloc = alloc };
+        var self: Editor = .{ .alloc = alloc, .tree = Tree.init(alloc) };
+        self.loadGitBranch();
+        return self;
+    }
+
+    /// Read the current branch from .git/HEAD (NvChad statusline segment).
+    fn loadGitBranch(self: *Editor) void {
+        var buf: [512]u8 = undefined;
+        const head = std.fs.cwd().readFile(".git/HEAD", &buf) catch return;
+        const trimmed = std.mem.trimRight(u8, head, "\r\n");
+        const name = if (std.mem.startsWith(u8, trimmed, "ref: "))
+            std.fs.path.basename(trimmed[5..])
+        else if (trimmed.len >= 7)
+            trimmed[0..7] // detached HEAD: short hash
+        else
+            return;
+        const n = @min(name.len, self.git_branch.len);
+        @memcpy(self.git_branch[0..n], name[0..n]);
+        self.git_branch_len = n;
     }
 
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
         self.cmd.deinit(self.alloc);
+        self.search.deinit(self.alloc);
         self.popup.filter.deinit(self.alloc);
+        self.clearFiles();
+        self.files.deinit(self.alloc);
+        self.clearGrep();
+        self.grep_hits.deinit(self.alloc);
+        self.tree.deinit();
     }
 
     pub fn widget(self: *Editor) vxfw.Widget {
@@ -138,19 +208,90 @@ pub const Editor = struct {
     // ---- popup ------------------------------------------------------------
 
     fn openPopup(self: *Editor, kind: Popup.Kind) void {
+        if (kind == .files or kind == .grep) self.refreshFiles();
+        if (kind == .grep) self.clearGrep();
         self.popup.kind = kind;
         self.popup.selected = 0;
         self.popup.filter.clearRetainingCapacity();
+    }
+
+    fn clearFiles(self: *Editor) void {
+        for (self.files.items) |p| self.alloc.free(p);
+        self.files.clearRetainingCapacity();
+    }
+
+    fn refreshFiles(self: *Editor) void {
+        self.clearFiles();
+        Tree.listFiles(self.alloc, &self.files, Popup.max_files) catch {};
     }
 
     fn closePopup(self: *Editor) void {
         self.popup.kind = .none;
     }
 
+    fn clearGrep(self: *Editor) void {
+        for (self.grep_hits.items) |h| {
+            self.alloc.free(h.path);
+            self.alloc.free(h.disp);
+        }
+        self.grep_hits.clearRetainingCapacity();
+    }
+
+    /// Re-run the project-wide search for the current popup filter.
+    /// Case-insensitive substring match, first Popup.max_items hits win.
+    fn refreshGrep(self: *Editor) void {
+        self.clearGrep();
+        const q = self.popup.filter.items;
+        self.popup.selected = 0;
+        if (q.len < 2) return; // avoid scanning everything on 1 char
+        outer: for (self.files.items) |path| {
+            const data = std.fs.cwd().readFileAlloc(self.alloc, path, Popup.max_file_size) catch continue;
+            defer self.alloc.free(data);
+            if (std.mem.indexOfScalar(u8, data, 0) != null) continue; // binary
+            var it = std.mem.splitScalar(u8, data, '\n');
+            var ln: usize = 1;
+            while (it.next()) |raw| : (ln += 1) {
+                const line = std.mem.trim(u8, raw, " \t\r");
+                if (!containsIgnoreCase(line, q)) continue;
+                var end: usize = @min(line.len, 80);
+                while (end > 0 and line[end - 1] >= 0x80 and line[end - 1] < 0xC0) end -= 1; // utf-8 boundary
+                if (end > 0 and end < line.len and line[end - 1] >= 0xC0) end -= 1;
+                const disp = std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ path, ln, line[0..end] }) catch continue;
+                const p = self.alloc.dupe(u8, path) catch {
+                    self.alloc.free(disp);
+                    continue;
+                };
+                self.grep_hits.append(self.alloc, .{ .path = p, .line = ln, .disp = disp }) catch {
+                    self.alloc.free(p);
+                    self.alloc.free(disp);
+                    return;
+                };
+                if (self.grep_hits.items.len >= Popup.max_items) break :outer;
+            }
+        }
+    }
+
+    /// Open `path` and place the cursor on `line` (1-based), roughly centered.
+    fn jumpTo(self: *Editor, path: []const u8, line: usize) void {
+        self.openFile(path) catch {
+            self.setStatus("could not open {s}", .{path});
+            return;
+        };
+        const b = self.cur();
+        b.row = @min(line -| 1, b.lines.items.len -| 1);
+        b.col = b.firstNonWs(b.row);
+        b.goal_col = b.col;
+        b.clampCol(false);
+        b.scroll = b.row -| (self.last_height / 2);
+    }
+
     fn popupTitle(self: *const Editor) []const u8 {
         return switch (self.popup.kind) {
             .buffers => " Buffers ",
             .themes => " Themes ",
+            .files => " Find Files ",
+            .keys => " Cheatsheet ",
+            .grep => " Live Grep ",
             .none => "",
         };
     }
@@ -159,6 +300,9 @@ pub const Editor = struct {
         return switch (self.popup.kind) {
             .buffers => self.buffers.items.len,
             .themes => themes.list.len,
+            .files => self.files.items.len,
+            .keys => cheats.len,
+            .grep => self.grep_hits.items.len,
             .none => 0,
         };
     }
@@ -167,6 +311,9 @@ pub const Editor = struct {
         return switch (self.popup.kind) {
             .buffers => self.buffers.items[i].displayName(),
             .themes => themes.list[i].name,
+            .files => self.files.items[i],
+            .keys => cheats[i],
+            .grep => self.grep_hits.items[i].disp,
             .none => "",
         };
     }
@@ -211,6 +358,14 @@ pub const Editor = struct {
                 switch (kind) {
                     .buffers => self.active = idx,
                     .themes => try self.setTheme(&themes.list[idx]),
+                    .files => self.openFile(self.files.items[idx]) catch {
+                        self.setStatus("could not open {s}", .{self.files.items[idx]});
+                    },
+                    .grep => {
+                        const h = self.grep_hits.items[idx];
+                        self.jumpTo(h.path, h.line);
+                    },
+                    .keys => {},
                     .none => {},
                 }
             } else self.closePopup();
@@ -225,10 +380,12 @@ pub const Editor = struct {
         } else if (key.matches(vaxis.Key.backspace, .{})) {
             _ = self.popup.filter.pop();
             self.popup.selected = 0;
+            if (self.popup.kind == .grep) self.refreshGrep();
         } else if (!key.mods.ctrl and !key.mods.alt) {
             const text = key.text orelse return;
             try self.popup.filter.appendSlice(self.alloc, text);
             self.popup.selected = 0;
+            if (self.popup.kind == .grep) self.refreshGrep();
         }
         ctx.consumeAndRedraw();
     }
@@ -242,6 +399,8 @@ pub const Editor = struct {
             .key_press => |key| {
                 self.status_len = 0;
                 if (self.popup.kind != .none) return self.handlePopup(ctx, key);
+                if (self.focus == .tree and self.mode != .command)
+                    return self.handleTree(ctx, key);
                 switch (self.mode) {
                     .normal => try self.handleNormal(ctx, key),
                     .insert => try self.handleInsert(ctx, key),
@@ -278,8 +437,29 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'b' => self.openPopup(.buffers),
+                    'c' => self.pending = .leader_c,
+                    'e' => self.toggleTree(),
+                    'f' => self.pending = .leader_f,
                     't' => self.openPopup(.themes),
                     'x' => self.closeBuffer(ctx, false),
+                    '/' => b.toggleComment() catch {},
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .leader_f => {
+                self.pending = .none;
+                switch (cp) {
+                    'f' => self.openPopup(.files),
+                    'w' => self.openPopup(.grep),
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .leader_c => {
+                self.pending = .none;
+                switch (cp) {
+                    'h' => self.openPopup(.keys),
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -294,6 +474,10 @@ pub const Editor = struct {
                 'c' => ctx.quit = true,
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
+                'n' => self.toggleTree(),
+                'h' => if (self.tree_open) {
+                    self.focus = .tree;
+                },
                 else => return,
             }
             return ctx.consumeAndRedraw();
@@ -330,6 +514,13 @@ pub const Editor = struct {
                 b.clampCol(false);
             },
             'd' => self.pending = .d,
+            '/' => {
+                self.mode = .command;
+                self.cmd_is_search = true;
+                self.cmd.clearRetainingCapacity();
+            },
+            'n' => self.findNext(1),
+            'N' => self.findNext(-1),
             'x' => try b.deleteCharAtCursor(),
             'i' => self.mode = .insert,
             'a' => {
@@ -362,6 +553,7 @@ pub const Editor = struct {
             },
             ':' => {
                 self.mode = .command;
+                self.cmd_is_search = false;
                 self.cmd.clearRetainingCapacity();
             },
             vaxis.Key.escape => self.pending = .none,
@@ -394,7 +586,12 @@ pub const Editor = struct {
     fn handleCommand(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         switch (key.codepoint) {
             vaxis.Key.escape => self.mode = .normal,
-            vaxis.Key.enter => try self.execCommand(ctx),
+            vaxis.Key.enter => if (self.cmd_is_search) {
+                self.mode = .normal;
+                self.search.clearRetainingCapacity();
+                try self.search.appendSlice(self.alloc, self.cmd.items);
+                self.findNext(1);
+            } else try self.execCommand(ctx),
             vaxis.Key.backspace => {
                 if (self.cmd.items.len == 0) self.mode = .normal else _ = self.cmd.pop();
             },
@@ -467,6 +664,110 @@ pub const Editor = struct {
         }
     }
 
+    /// Jump to the next/previous occurrence of the last `/` pattern, wrapping
+    /// around the buffer like vim (with a "search hit BOTTOM/TOP" status).
+    fn findNext(self: *Editor, dir: i2) void {
+        const pat = self.search.items;
+        if (pat.len == 0) return self.setStatus("no previous search", .{});
+        const b = self.cur();
+        const text = b.buf.items;
+        if (pat.len > text.len) return self.setStatus("pattern not found: {s}", .{pat});
+
+        const cur_pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+        var wrapped = false;
+        const hit: ?usize = if (dir > 0) blk: {
+            if (std.mem.indexOfPos(u8, text, @min(cur_pos + 1, text.len), pat)) |p| break :blk p;
+            wrapped = true;
+            break :blk std.mem.indexOf(u8, text, pat);
+        } else blk: {
+            if (std.mem.lastIndexOf(u8, text[0..cur_pos], pat)) |p| break :blk p;
+            wrapped = true;
+            break :blk std.mem.lastIndexOf(u8, text, pat);
+        };
+
+        if (hit) |pos| {
+            b.setCursorFromByte(pos);
+            if (wrapped)
+                self.setStatus("search hit {s}, continuing at {s}", .{
+                    if (dir > 0) "BOTTOM" else "TOP",
+                    if (dir > 0) "TOP" else "BOTTOM",
+                })
+            else
+                self.setStatus("/{s}", .{pat});
+        } else {
+            self.setStatus("pattern not found: {s}", .{pat});
+        }
+    }
+
+    // ---- file tree --------------------------------------------------------
+
+    fn toggleTree(self: *Editor) void {
+        if (self.tree_open) {
+            self.tree_open = false;
+            self.focus = .editor;
+            return;
+        }
+        self.tree.refresh() catch {
+            self.setStatus("file tree: scan failed", .{});
+            return;
+        };
+        self.tree_open = true;
+        self.focus = .tree;
+    }
+
+    /// NvimTree-ish keys: j/k move, Enter/l open or toggle dir, h collapse /
+    /// jump to parent, R refresh, q or C-n close, C-l back to the editor.
+    fn handleTree(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const t = &self.tree;
+        const cp = key.shifted_codepoint orelse key.codepoint;
+
+        if (key.mods.ctrl) {
+            switch (cp) {
+                'c' => ctx.quit = true,
+                'n' => self.toggleTree(),
+                'l' => self.focus = .editor,
+                else => return,
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        const len = t.entries.items.len;
+        switch (cp) {
+            'j', vaxis.Key.down => if (t.selected + 1 < len) {
+                t.selected += 1;
+            },
+            'k', vaxis.Key.up => t.selected -|= 1,
+            'G' => t.selected = len -| 1,
+            vaxis.Key.enter, 'l', 'o' => if (len > 0) {
+                const e = t.entries.items[t.selected];
+                if (e.is_dir) {
+                    t.toggle(t.selected) catch {};
+                } else {
+                    self.openFile(e.path) catch {
+                        self.setStatus("could not open {s}", .{e.path});
+                        return ctx.consumeAndRedraw();
+                    };
+                    self.focus = .editor;
+                }
+            },
+            'h' => if (len > 0) {
+                const e = t.entries.items[t.selected];
+                if (e.is_dir and e.expanded) {
+                    t.toggle(t.selected) catch {};
+                } else if (t.parentOf(t.selected)) |p| {
+                    t.selected = p;
+                }
+            },
+            'R' => t.refresh() catch {},
+            'q', vaxis.Key.escape => {
+                self.tree_open = false;
+                self.focus = .editor;
+            },
+            else => return,
+        }
+        ctx.consumeAndRedraw();
+    }
+
     // ---- drawing ----------------------------------------------------------
 
     fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -485,6 +786,8 @@ pub const Editor = struct {
         if (b.row < b.scroll) b.scroll = b.row;
         if (b.row >= b.scroll + text_rows) b.scroll = b.row - text_rows + 1;
 
+        const tree_w: u16 = if (self.tree_open) @min(tree_width_max, max.width / 3) else 0;
+        const x0 = tree_w; // text area starts right of the sidebar
         const gutter: u16 = @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 2);
         const gutter_style: vaxis.Style = .{ .fg = th.gutter, .bg = th.bg };
         const cursor_ln_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bg };
@@ -509,18 +812,27 @@ pub const Editor = struct {
             const draw_row = text_top + row;
 
             const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{li + 1});
-            _ = writeText(surface, ctx, @intCast(gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
+            _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
 
             const text = b.buf.items[line.start..line.end];
-            var col: u16 = gutter;
+            const pat = self.search.items;
+            const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
+            var match: ?usize = if (pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
+            var col: u16 = x0 + gutter;
             var i: usize = 0;
             while (i < text.len and col < max.width) {
                 const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
                 const end = @min(i + cp_len, text.len);
                 const slice = text[i..end];
-                const style = b.hl.styleAt(line.start + i);
+                var style = b.hl.styleAt(line.start + i);
+                if (match) |m| {
+                    if (i >= m + pat.len) match = std.mem.indexOfPos(u8, text, i, pat);
+                }
+                if (match) |m| {
+                    if (i >= m and i < m + pat.len) style = search_style;
+                }
                 if (slice[0] == '\t') {
-                    const stop = gutter + (((col - gutter) / 4) + 1) * 4;
+                    const stop = x0 + gutter + (((col - x0 - gutter) / 4) + 1) * 4;
                     while (col < stop and col < max.width) : (col += 1) {
                         surface.writeCell(col, draw_row, .{ .style = style });
                     }
@@ -539,6 +851,7 @@ pub const Editor = struct {
             }
         }
 
+        if (tree_w > 0) self.drawTree(surface, ctx, text_top, text_rows, tree_w);
         self.drawStatus(surface, ctx, max.height - 1, max.width);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
@@ -552,35 +865,107 @@ pub const Editor = struct {
                 .col = @intCast(@min(1 + self.cmd.items.len, max.width - 1)),
                 .shape = .beam,
             };
-        } else if (b.row >= b.scroll and b.row < b.scroll + text_rows) {
+        } else if (self.focus == .editor and b.row >= b.scroll and b.row < b.scroll + text_rows) {
             surface.cursor = .{
                 .row = @intCast(text_top + b.row - b.scroll),
-                .col = @intCast(@min(gutter + self.displayCol(ctx), max.width - 1)),
+                .col = @intCast(@min(x0 + gutter + self.displayCol(ctx), max.width - 1)),
                 .shape = if (self.mode == .insert) .beam else .block,
             };
         }
         return surface;
     }
 
+    /// Nerd-font devicon + accent color for a file name (NvChad-style).
+    fn fileIcon(name: []const u8, th: *const themes.Palette) struct { glyph: []const u8, color: vaxis.Color } {
+        const Ext = enum { zig, zon, js, mjs, ts, jsx, tsx, css, html, json, md, lua, py, c, h, cpp, go, rs, sh, toml, yml, yaml, vue };
+        const ext = std.fs.path.extension(name);
+        const e = if (ext.len > 1) std.meta.stringToEnum(Ext, ext[1..]) else null;
+        if (e == null) return .{ .glyph = "\u{f016}", .color = th.gray }; //
+        return switch (e.?) {
+            .zig, .zon => .{ .glyph = "\u{e6a9}", .color = th.orange }, //
+            .js, .mjs => .{ .glyph = "\u{e74e}", .color = th.yellow }, //
+            .ts => .{ .glyph = "\u{e628}", .color = th.blue },
+            .jsx, .tsx => .{ .glyph = "\u{e7ba}", .color = th.cyan }, //
+            .css => .{ .glyph = "\u{e749}", .color = th.blue }, //
+            .html => .{ .glyph = "\u{e736}", .color = th.orange },
+            .json => .{ .glyph = "\u{e60b}", .color = th.yellow }, //
+            .md => .{ .glyph = "\u{e73e}", .color = th.fg },
+            .lua => .{ .glyph = "\u{e620}", .color = th.blue },
+            .py => .{ .glyph = "\u{e606}", .color = th.yellow },
+            .c, .h => .{ .glyph = "\u{e61e}", .color = th.blue },
+            .cpp => .{ .glyph = "\u{e61d}", .color = th.blue },
+            .go => .{ .glyph = "\u{e626}", .color = th.cyan },
+            .rs => .{ .glyph = "\u{e7a8}", .color = th.orange },
+            .sh => .{ .glyph = "\u{f489}", .color = th.green },
+            .toml, .yml, .yaml => .{ .glyph = "\u{e615}", .color = th.gray },
+            .vue => .{ .glyph = "\u{fd42}", .color = th.green },
+        };
+    }
+
+    /// One tab cell: ` <icon> name <●|×> ` — active tab shares the editor bg
+    /// so it visually merges with the text area (like NvChad/base46).
     fn drawTabline(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, width: u16) void {
-        const th = self.theme.p;
+        const th = &self.theme.p;
         const line_style: vaxis.Style = .{ .fg = th.bar_fg, .bg = th.bar_bg };
         var col: u16 = 0;
         while (col < width) : (col += 1) {
             surface.writeCell(col, 0, .{ .style = line_style });
         }
 
-        const active_style: vaxis.Style = .{ .fg = th.fg, .bg = th.bg, .bold = true };
-        const inactive_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bar_bg };
-        col = 0;
-        for (self.buffers.items, 0..) |*b, i| {
-            if (col >= width) break;
-            const label = std.fmt.allocPrint(ctx.arena, " {s}{s} ", .{
-                b.displayName(),
-                if (b.dirty) " [+]" else "",
-            }) catch return;
-            col = writeText(surface, ctx, col, 0, label, if (i == self.active) active_style else inactive_style);
+        // Right-aligned tab-count badge, reserve its room first.
+        const badge = std.fmt.allocPrint(ctx.arena, " {d} ", .{self.buffers.items.len}) catch return;
+        const badge_w: u16 = @intCast(ctx.stringWidth(badge));
+        const avail: u16 = width -| badge_w;
+
+        // Tab widths: pad + icon + sp + name + sp + indicator + pad.
+        const n = self.buffers.items.len;
+        var widths = ctx.arena.alloc(u16, n) catch return;
+        for (self.buffers.items, 0..) |*b, i|
+            widths[i] = 6 + @as(u16, @intCast(ctx.stringWidth(b.displayName())));
+
+        // Scroll the strip so the active tab is always fully visible.
+        var first: usize = 0;
+        while (first < self.active) {
+            var w: u16 = 0;
+            for (widths[first .. self.active + 1]) |tw| w += tw;
+            if (w <= avail) break;
+            first += 1;
         }
+
+        col = 0;
+        for (self.buffers.items[first..], first..) |*b, i| {
+            if (col >= avail) break;
+            const is_active = i == self.active;
+            const bg = if (is_active) th.bg else th.bar_bg;
+            const icon = fileIcon(b.file_name, th);
+
+            col = writeText(surface, ctx, col, 0, " ", .{ .bg = bg });
+            col = writeText(surface, ctx, col, 0, icon.glyph, .{
+                .fg = if (is_active) icon.color else th.gutter_active,
+                .bg = bg,
+            });
+            const name = std.fmt.allocPrint(ctx.arena, " {s} ", .{b.displayName()}) catch return;
+            col = writeText(surface, ctx, col, 0, name, .{
+                .fg = if (is_active) th.fg else th.gutter_active,
+                .bg = bg,
+                .bold = is_active,
+            });
+            col = writeText(
+                surface,
+                ctx,
+                col,
+                0,
+                if (b.dirty) "\u{25cf}" else "\u{00d7}", // ● / ×
+                .{ .fg = if (b.dirty) th.green else if (is_active) th.red else th.gutter_active, .bg = bg },
+            );
+            col = writeText(surface, ctx, col, 0, " ", .{ .bg = bg });
+        }
+
+        _ = writeText(surface, ctx, width -| badge_w, 0, badge, .{
+            .fg = th.badge_fg,
+            .bg = th.blue,
+            .bold = true,
+        });
     }
 
     /// Display column of the cursor within its line (tabs expand to 4-stops).
@@ -612,7 +997,8 @@ pub const Editor = struct {
         }
 
         if (self.mode == .command) {
-            const cmdline = std.fmt.allocPrint(ctx.arena, ":{s}", .{self.cmd.items}) catch return;
+            const prefix: []const u8 = if (self.cmd_is_search) "/" else ":";
+            const cmdline = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.cmd.items }) catch return;
             _ = writeText(surface, ctx, 0, status_row, cmdline, bar_style);
             return;
         }
@@ -628,6 +1014,14 @@ pub const Editor = struct {
             .command => unreachable,
         };
         var end = writeText(surface, ctx, 0, status_row, mode_txt, mode_style);
+
+        if (self.git_branch_len > 0) {
+            const seg = std.fmt.allocPrint(ctx.arena, "  {s} ", .{
+                self.git_branch[0..self.git_branch_len],
+            }) catch return;
+            const branch_style: vaxis.Style = .{ .fg = th.blue, .bg = th.bar_bg, .bold = true };
+            end = writeText(surface, ctx, end, status_row, seg, branch_style);
+        }
 
         const left = if (self.status_len > 0)
             std.fmt.allocPrint(ctx.arena, " {s}", .{self.status_buf[0..self.status_len]}) catch return
@@ -710,6 +1104,82 @@ pub const Editor = struct {
             .col = @intCast(@min(x0 + 4 + self.popup.filter.items.len, max.width - 1)),
             .shape = .beam,
         };
+    }
+
+    /// Sidebar: indented tree with folder/file icons, git-status coloring,
+    /// selection bar, and a `│` separator on its right edge.
+    fn drawTree(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, top: u16, rows: u16, width: u16) void {
+        const t = &self.tree;
+        const th = self.theme.p;
+
+        // Keep the selection visible.
+        if (t.selected < t.scroll) t.scroll = t.selected;
+        if (t.selected >= t.scroll + rows) t.scroll = t.selected - rows + 1;
+
+        var r: u16 = 0;
+        while (r < rows) : (r += 1) {
+            const row = top + r;
+            const idx = t.scroll + r;
+            const has = idx < t.entries.items.len;
+            const selected = has and idx == t.selected;
+            const row_bg = if (selected and self.focus == .tree) th.bar_bg else th.bg;
+
+            var c: u16 = 0;
+            while (c + 1 < width) : (c += 1) {
+                surface.writeCell(c, row, .{ .style = .{ .bg = row_bg } });
+            }
+            surface.writeCell(width - 1, row, .{
+                .char = .{ .grapheme = "│", .width = 1 },
+                .style = .{ .fg = th.gutter, .bg = th.bg },
+            });
+            if (!has) continue;
+
+            const e = t.entries.items[idx];
+            var col: u16 = @min(1 + e.depth * 2, width - 1);
+            const limit = width - 1;
+
+            var glyph: []const u8 = if (e.expanded) "\u{f07c}" else "\u{f07b}";
+            var icon_fg = th.blue;
+            if (!e.is_dir) {
+                const ic = fileIcon(e.name, &th);
+                glyph = ic.glyph;
+                icon_fg = ic.color;
+            }
+            if (col + 2 < limit) {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = glyph, .width = 1 },
+                    .style = .{ .fg = icon_fg, .bg = row_bg },
+                });
+                col += 2;
+            }
+
+            const name_fg = switch (e.git) {
+                .none => if (e.is_dir) th.blue else th.fg,
+                .modified => th.yellow,
+                .added, .untracked => th.green,
+                .deleted => th.red,
+            };
+            const style: vaxis.Style = .{
+                .fg = name_fg,
+                .bg = row_bg,
+                .bold = e.is_dir,
+            };
+            var i: usize = 0;
+            while (i < e.name.len and col < limit) {
+                const cp_len = std.unicode.utf8ByteSequenceLength(e.name[i]) catch 1;
+                const end = @min(i + cp_len, e.name.len);
+                const slice = e.name[i..end];
+                const w: u16 = @intCast(@min(ctx.stringWidth(slice), 4));
+                if (w > 0 and col + w <= limit) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = slice, .width = @intCast(w) },
+                        .style = style,
+                    });
+                    col += w;
+                } else if (w > 0) break;
+                i = end;
+            }
+        }
     }
 
     fn writeText(surface: vxfw.Surface, ctx: vxfw.DrawContext, col_start: u16, row: u16, text: []const u8, style: vaxis.Style) u16 {

@@ -166,6 +166,44 @@ pub const Buffer = struct {
         return 0;
     }
 
+    /// Line-comment token for this buffer's language (NvChad `Space /`).
+    pub fn commentPrefix(self: *const Buffer) []const u8 {
+        const ext = std.fs.path.extension(self.file_name);
+        const map = .{
+            .{ ".py", "#" },   .{ ".sh", "#" },   .{ ".rb", "#" },
+            .{ ".toml", "#" }, .{ ".yaml", "#" }, .{ ".yml", "#" },
+            .{ ".lua", "--" }, .{ ".sql", "--" }, .{ ".hs", "--" },
+            .{ ".vim", "\"" }, .{ ".ml", "(*" },
+        };
+        inline for (map) |e| {
+            if (std.mem.eql(u8, ext, e[0])) return e[1];
+        }
+        return "//"; // zig, c, cpp, js, ts, rs, go, java, zon, ...
+    }
+
+    /// Toggle the line comment on the current line, preserving indentation.
+    pub fn toggleComment(self: *Buffer) !void {
+        const prefix = self.commentPrefix();
+        const line = self.lines.items[self.row];
+        const fnw = self.firstNonWs(self.row);
+        const text = self.lineText(self.row);
+        const rest = text[fnw..];
+        if (std.mem.startsWith(u8, rest, prefix)) {
+            var rm = prefix.len;
+            if (rest.len > rm and rest[rm] == ' ') rm += 1;
+            try self.replaceRange(line.start + fnw, line.start + fnw + rm, "");
+            self.col -|= @min(self.col, rm);
+        } else {
+            if (rest.len == 0) return; // skip blank lines
+            var buf: [8]u8 = undefined;
+            const ins = std.fmt.bufPrint(&buf, "{s} ", .{prefix}) catch return;
+            try self.replaceRange(line.start + fnw, line.start + fnw, ins);
+            self.col += ins.len;
+        }
+        self.clampCol(false);
+        self.goal_col = self.col;
+    }
+
     // ---- motions ----------------------------------------------------------
 
     pub fn moveLeft(self: *Buffer) void {

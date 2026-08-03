@@ -84,25 +84,32 @@ pub const Highlighter = struct {
 
         // NOTE: query predicates (#eq?/#match?) are not evaluated yet; the two
         // predicate-bearing patterns in the zig query may over-highlight slightly.
-        while (cursor.nextCapture()) |item| {
-            const capture = item[1].captures[item[0]];
-            const name = self.query.captureNameForId(capture.index) orelse continue;
-            const gop = try self.name_ids.getOrPut(self.alloc, name);
-            if (!gop.found_existing) {
-                if (self.theme.styleForCapture(name)) |style| {
-                    var themed = style;
-                    themed.bg = self.theme.p.bg;
-                    gop.value_ptr.* = @intCast(self.styles.items.len);
-                    try self.styles.append(self.alloc, themed);
-                } else {
-                    gop.value_ptr.* = 0;
+        //
+        // We iterate matches (not captures): ts_query_cursor_next_capture
+        // keeps a position-sorted heap of all pending captures and degrades
+        // to O(n^2) on large files (~25s for a 55KB file). nextMatch streams
+        // in tree order (outer nodes first), so inner/more-specific captures
+        // still overwrite outer ones below.
+        while (cursor.nextMatch()) |match| {
+            for (match.captures[0..match.captures.len]) |capture| {
+                const name = self.query.captureNameForId(capture.index) orelse continue;
+                const gop = try self.name_ids.getOrPut(self.alloc, name);
+                if (!gop.found_existing) {
+                    if (self.theme.styleForCapture(name)) |style| {
+                        var themed = style;
+                        themed.bg = self.theme.p.bg;
+                        gop.value_ptr.* = @intCast(self.styles.items.len);
+                        try self.styles.append(self.alloc, themed);
+                    } else {
+                        gop.value_ptr.* = 0;
+                    }
                 }
+                const sid = gop.value_ptr.*;
+                if (sid == 0) continue;
+                const start = capture.node.startByte();
+                const end = @min(capture.node.endByte(), source.len);
+                if (start < end) @memset(self.style_ids[start..end], sid);
             }
-            const sid = gop.value_ptr.*;
-            if (sid == 0) continue;
-            const start = capture.node.startByte();
-            const end = @min(capture.node.endByte(), source.len);
-            if (start < end) @memset(self.style_ids[start..end], sid);
         }
     }
 
