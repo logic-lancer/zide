@@ -1,7 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const syntax = @import("syntax.zig");
 const Editor = @import("editor.zig").Editor;
 
 pub fn main() !void {
@@ -11,22 +10,20 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
-    const path = if (args.len > 1) args[1] else "src/main.zig";
 
-    const contents = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => try alloc.dupe(u8, ""),
-        else => {
-            std.debug.print("could not read '{s}': {s}\n", .{ path, @errorName(err) });
-            return err;
-        },
-    };
-    defer alloc.free(contents);
-
-    var hl = try syntax.Highlighter.init(alloc);
-    defer hl.deinit();
-
-    var editor = try Editor.init(alloc, &hl, path, contents);
+    var editor = Editor.init(alloc);
     defer editor.deinit();
+
+    if (args.len > 1) {
+        for (args[1..]) |path| try editor.openFile(path);
+        editor.active = 0;
+    } else {
+        try editor.openFile("src/main.zig");
+    }
+    if (editor.buffers.items.len == 0) {
+        std.debug.print("no files could be opened\n", .{});
+        return error.NoBuffers;
+    }
 
     var app = try vxfw.App.init(alloc);
     defer app.deinit();

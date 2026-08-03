@@ -1,52 +1,11 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ts = @import("tree-sitter");
+const themes = @import("theme.zig");
 
 extern fn tree_sitter_zig() *ts.Language;
 
 const highlights_scm = @embedFile("queries/zig/highlights.scm");
-
-fn rgb(r: u8, g: u8, b: u8) vaxis.Color {
-    return .{ .rgb = .{ r, g, b } };
-}
-
-const theme = struct {
-    const red = rgb(0xe0, 0x6c, 0x75);
-    const orange = rgb(0xd1, 0x9a, 0x66);
-    const yellow = rgb(0xe5, 0xc0, 0x7b);
-    const green = rgb(0x98, 0xc3, 0x79);
-    const cyan = rgb(0x56, 0xb6, 0xc2);
-    const blue = rgb(0x61, 0xaf, 0xef);
-    const purple = rgb(0xc6, 0x78, 0xdd);
-    const gray = rgb(0x5c, 0x63, 0x70);
-};
-
-/// One Dark-ish theme. Exact capture names win over the base segment
-/// (`@keyword.repeat` -> "keyword"). Null means "leave unstyled".
-fn styleForCapture(name: []const u8) ?vaxis.Style {
-    const Full = enum { @"variable.member", @"variable.builtin" };
-    if (std.meta.stringToEnum(Full, name)) |full| return switch (full) {
-        .@"variable.member" => .{ .fg = theme.red },
-        .@"variable.builtin" => .{ .fg = theme.orange },
-    };
-
-    const Base = enum {
-        keyword, string, character, comment, function, @"type",
-        number, boolean, constant, operator, label, attribute, module, import,
-    };
-    const dot = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
-    const base = std.meta.stringToEnum(Base, name[0..dot]) orelse return null;
-    return switch (base) {
-        .keyword => .{ .fg = theme.purple },
-        .string, .character => .{ .fg = theme.green },
-        .comment => .{ .fg = theme.gray, .italic = true },
-        .function => .{ .fg = theme.blue },
-        .@"type", .module, .import => .{ .fg = theme.yellow },
-        .number, .boolean, .constant => .{ .fg = theme.orange },
-        .operator => .{ .fg = theme.cyan },
-        .label, .attribute => .{ .fg = theme.red },
-    };
-}
 
 /// Owns the tree-sitter state for one buffer and maintains a per-byte style
 /// table. `update` reparses incrementally when given the edit that was just
@@ -56,6 +15,7 @@ pub const Highlighter = struct {
     parser: *ts.Parser,
     query: *ts.Query,
     tree: ?*ts.Tree = null,
+    theme: *const themes.Theme = &themes.list[0],
     /// Per-byte index into `styles`; 0 = default style.
     style_ids: []u8 = &.{},
     styles: std.ArrayListUnmanaged(vaxis.Style) = .{},
@@ -72,8 +32,23 @@ pub const Highlighter = struct {
             return err;
         };
         var self = Highlighter{ .alloc = alloc, .parser = parser, .query = query };
-        try self.styles.append(alloc, .{});
+        try self.styles.append(alloc, self.baseStyle());
         return self;
+    }
+
+    /// Default text style for the active theme (style id 0).
+    pub fn baseStyle(self: *const Highlighter) vaxis.Style {
+        return .{ .fg = self.theme.p.fg, .bg = self.theme.p.bg };
+    }
+
+    /// Switch theme and restyle the whole buffer. The name->style-id cache is
+    /// theme-dependent, so it is rebuilt from scratch.
+    pub fn setTheme(self: *Highlighter, t: *const themes.Theme, source: []const u8) !void {
+        self.theme = t;
+        self.name_ids.clearRetainingCapacity();
+        self.styles.clearRetainingCapacity();
+        try self.styles.append(self.alloc, self.baseStyle());
+        try self.update(source, null);
     }
 
     pub fn deinit(self: *Highlighter) void {
@@ -114,9 +89,11 @@ pub const Highlighter = struct {
             const name = self.query.captureNameForId(capture.index) orelse continue;
             const gop = try self.name_ids.getOrPut(self.alloc, name);
             if (!gop.found_existing) {
-                if (styleForCapture(name)) |style| {
+                if (self.theme.styleForCapture(name)) |style| {
+                    var themed = style;
+                    themed.bg = self.theme.p.bg;
                     gop.value_ptr.* = @intCast(self.styles.items.len);
-                    try self.styles.append(self.alloc, style);
+                    try self.styles.append(self.alloc, themed);
                 } else {
                     gop.value_ptr.* = 0;
                 }
@@ -130,7 +107,7 @@ pub const Highlighter = struct {
     }
 
     pub fn styleAt(self: *const Highlighter, byte: usize) vaxis.Style {
-        if (byte >= self.style_ids.len) return .{};
+        if (byte >= self.style_ids.len) return self.baseStyle();
         return self.styles.items[self.style_ids[byte]];
     }
 };
