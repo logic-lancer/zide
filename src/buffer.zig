@@ -21,6 +21,12 @@ pub const Buffer = struct {
     scroll: usize = 0,
     dirty: bool = false,
 
+    /// Per-line git status vs HEAD (gitsigns-style gutter markers).
+    /// Refreshed on open/save; may be shorter than `lines` after edits.
+    git_signs: std.ArrayListUnmanaged(Sign) = .{},
+
+    pub const Sign = enum(u8) { none, add, change, delete };
+
     pub const Line = struct { start: u32, end: u32 };
 
     pub fn init(
@@ -49,8 +55,14 @@ pub const Buffer = struct {
     pub fn deinit(self: *Buffer) void {
         self.buf.deinit(self.alloc);
         self.lines.deinit(self.alloc);
+        self.git_signs.deinit(self.alloc);
         self.hl.deinit();
         self.alloc.free(self.file_name);
+    }
+
+    pub fn signFor(self: *const Buffer, row_idx: usize) Sign {
+        if (row_idx < self.git_signs.items.len) return self.git_signs.items[row_idx];
+        return .none;
     }
 
     /// Short name shown in the tabline.

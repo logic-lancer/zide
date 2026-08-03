@@ -104,6 +104,58 @@ pub const Editor = struct {
         self.git_branch_len = n;
     }
 
+    /// Rebuild per-line git signs for `b` by parsing `git diff -U0 HEAD -- file`
+    /// hunk headers (gitsigns-style). Silently no-ops outside a repo or for
+    /// untracked files (diff exits non-zero / prints nothing useful).
+    fn refreshGitSigns(self: *Editor, b: *Buffer) void {
+        b.git_signs.clearRetainingCapacity();
+        const res = std.process.Child.run(.{
+            .allocator = self.alloc,
+            .argv = &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name },
+            .max_output_bytes = 1 << 20,
+        }) catch return;
+        defer self.alloc.free(res.stdout);
+        defer self.alloc.free(res.stderr);
+        if (res.term != .Exited or res.term.Exited != 0) return;
+
+        b.git_signs.appendNTimes(self.alloc, .none, b.lines.items.len) catch return;
+        var it = std.mem.tokenizeScalar(u8, res.stdout, '\n');
+        while (it.next()) |line| {
+            // @@ -old_start[,old_count] +new_start[,new_count] @@
+            if (!std.mem.startsWith(u8, line, "@@ ")) continue;
+            const plus = std.mem.indexOfScalar(u8, line, '+') orelse continue;
+            const rest = line[plus + 1 ..];
+            const end = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+            const spec = rest[0..end];
+            var new_start: usize = 0;
+            var new_count: usize = 1;
+            if (std.mem.indexOfScalar(u8, spec, ',')) |comma| {
+                new_start = std.fmt.parseInt(usize, spec[0..comma], 10) catch continue;
+                new_count = std.fmt.parseInt(usize, spec[comma + 1 ..], 10) catch continue;
+            } else {
+                new_start = std.fmt.parseInt(usize, spec, 10) catch continue;
+            }
+            const minus_spec = blk: { // old side, to tell adds from changes
+                const sp = std.mem.indexOfScalar(u8, line[3..], ' ') orelse break :blk line[4..];
+                break :blk line[4 .. 3 + sp];
+            };
+            var old_count: usize = 1;
+            if (std.mem.indexOfScalar(u8, minus_spec, ',')) |comma|
+                old_count = std.fmt.parseInt(usize, minus_spec[comma + 1 ..], 10) catch 1;
+
+            if (new_count == 0) {
+                // pure deletion: mark the line the hunk lands after
+                const row = if (new_start > 0) new_start - 1 else 0;
+                if (row < b.git_signs.items.len) b.git_signs.items[row] = .delete;
+                continue;
+            }
+            const sign: Buffer.Sign = if (old_count == 0) .add else .change;
+            var i: usize = new_start - 1;
+            const stop = @min(i + new_count, b.git_signs.items.len);
+            while (i < stop) : (i += 1) b.git_signs.items[i] = sign;
+        }
+    }
+
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
@@ -150,6 +202,7 @@ pub const Editor = struct {
         const buffer = try Buffer.init(self.alloc, path, contents, self.theme);
         try self.buffers.append(self.alloc, buffer);
         self.active = self.buffers.items.len - 1;
+        self.refreshGitSigns(self.cur());
     }
 
     fn cycleBuffer(self: *Editor, delta: isize) void {
@@ -161,6 +214,10 @@ pub const Editor = struct {
 
     /// Close the active buffer; quits when it was the last one.
     fn closeBuffer(self: *Editor, ctx: *vxfw.EventContext, force: bool) void {
+        if (self.buffers.items.len == 0) {
+            ctx.quit = true; // :q on the dashboard quits
+            return;
+        }
         const b = self.cur();
         if (b.dirty and !force) {
             self.setStatus("unsaved changes in {s} (add ! to discard)", .{b.displayName()});
@@ -169,7 +226,8 @@ pub const Editor = struct {
         var removed = self.buffers.orderedRemove(self.active);
         removed.deinit();
         if (self.buffers.items.len == 0) {
-            ctx.quit = true;
+            self.active = 0; // back to the dashboard; :q there quits
+            self.mode = .normal;
             return;
         }
         self.active = @min(self.active, self.buffers.items.len - 1);
@@ -203,6 +261,7 @@ pub const Editor = struct {
             return;
         };
         self.setStatus("\"{s}\" {d}L, {d}B written", .{ b.file_name, b.lines.items.len, b.buf.items.len });
+        self.refreshGitSigns(b);
     }
 
     // ---- popup ------------------------------------------------------------
@@ -277,6 +336,7 @@ pub const Editor = struct {
             self.setStatus("could not open {s}", .{path});
             return;
         };
+        if (self.buffers.items.len == 0) return; // open failed softly
         const b = self.cur();
         b.row = @min(line -| 1, b.lines.items.len -| 1);
         b.col = b.firstNonWs(b.row);
@@ -401,6 +461,8 @@ pub const Editor = struct {
                 if (self.popup.kind != .none) return self.handlePopup(ctx, key);
                 if (self.focus == .tree and self.mode != .command)
                     return self.handleTree(ctx, key);
+                if (self.buffers.items.len == 0 and self.mode != .command)
+                    return self.handleDash(ctx, key);
                 switch (self.mode) {
                     .normal => try self.handleNormal(ctx, key),
                     .insert => try self.handleInsert(ctx, key),
@@ -409,6 +471,34 @@ pub const Editor = struct {
             },
             else => {},
         }
+    }
+
+    /// Keys on the NvDash-style start screen (no buffers open).
+    fn handleDash(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const cp = key.shifted_codepoint orelse key.codepoint;
+        if (key.mods.ctrl) {
+            switch (cp) {
+                'c' => ctx.quit = true,
+                'n' => self.toggleTree(),
+                else => return,
+            }
+            return ctx.consumeAndRedraw();
+        }
+        switch (cp) {
+            'f' => self.openPopup(.files),
+            'w', 'g' => self.openPopup(.grep),
+            't' => self.openPopup(.themes),
+            'h' => self.openPopup(.keys),
+            'e' => self.toggleTree(),
+            'q' => ctx.quit = true,
+            ':' => {
+                self.mode = .command;
+                self.cmd_is_search = false;
+                self.cmd.clearRetainingCapacity();
+            },
+            else => return,
+        }
+        ctx.consumeAndRedraw();
     }
 
     fn handleNormal(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -639,8 +729,12 @@ pub const Editor = struct {
                 ctx.quit = true;
             },
             .@"qa!" => ctx.quit = true,
-            .w => self.save(),
+            .w => {
+                if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
+                self.save();
+            },
             .wq, .x => {
+                if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
                 self.save();
                 if (!self.cur().dirty) self.closeBuffer(ctx, false);
             },
@@ -656,6 +750,7 @@ pub const Editor = struct {
             .theme => try self.switchTheme(it.next()),
             .themes => self.setStatus("themes: {s}", .{themes.names}),
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
+            if (self.buffers.items.len == 0) return;
             const b = self.cur();
             b.row = std.math.clamp(n -| 1, 0, b.lines.items.len - 1);
             b.clampCol(false);
@@ -669,6 +764,7 @@ pub const Editor = struct {
     fn findNext(self: *Editor, dir: i2) void {
         const pat = self.search.items;
         if (pat.len == 0) return self.setStatus("no previous search", .{});
+        if (self.buffers.items.len == 0) return;
         const b = self.cur();
         const text = b.buf.items;
         if (pat.len > text.len) return self.setStatus("pattern not found: {s}", .{pat});
@@ -775,6 +871,7 @@ pub const Editor = struct {
         const max = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), max);
         if (max.width == 0 or max.height < 3) return surface;
+        if (self.buffers.items.len == 0) return self.drawDash(surface, ctx, max);
 
         const b = self.cur();
         const th = self.theme.p;
@@ -788,7 +885,7 @@ pub const Editor = struct {
 
         const tree_w: u16 = if (self.tree_open) @min(tree_width_max, max.width / 3) else 0;
         const x0 = tree_w; // text area starts right of the sidebar
-        const gutter: u16 = @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 2);
+        const gutter: u16 = @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 3); // sign col + digits + pad
         const gutter_style: vaxis.Style = .{ .fg = th.gutter, .bg = th.bg };
         const cursor_ln_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bg };
 
@@ -813,6 +910,14 @@ pub const Editor = struct {
 
             const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{li + 1});
             _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
+
+            // gitsigns-style hunk marker in the leftmost gutter column
+            switch (b.signFor(li)) {
+                .none => {},
+                .add => _ = writeText(surface, ctx, x0, draw_row, "▎", .{ .fg = th.green, .bg = th.bg }),
+                .change => _ = writeText(surface, ctx, x0, draw_row, "▎", .{ .fg = th.orange, .bg = th.bg }),
+                .delete => _ = writeText(surface, ctx, x0, draw_row, "▁", .{ .fg = th.red, .bg = th.bg }),
+            }
 
             const text = b.buf.items[line.start..line.end];
             const pat = self.search.items;
@@ -870,6 +975,94 @@ pub const Editor = struct {
                 .row = @intCast(text_top + b.row - b.scroll),
                 .col = @intCast(@min(x0 + gutter + self.displayCol(ctx), max.width - 1)),
                 .shape = if (self.mode == .insert) .beam else .block,
+            };
+        }
+        return surface;
+    }
+
+    /// NvDash-style start screen: logo + shortcut buttons, shown whenever no
+    /// buffer is open. Popups, the file tree and `:` commands still work.
+    fn drawDash(self: *Editor, surface_in: vxfw.Surface, ctx: vxfw.DrawContext, max: vxfw.Size) std.mem.Allocator.Error!vxfw.Surface {
+        var surface = surface_in;
+        const th = self.theme.p;
+        self.last_height = max.height -| 1;
+
+        // Theme background everywhere.
+        var fr: u16 = 0;
+        while (fr < max.height) : (fr += 1) {
+            var fc: u16 = 0;
+            while (fc < max.width) : (fc += 1) {
+                surface.writeCell(fc, fr, .{ .style = .{ .fg = th.fg, .bg = th.bg } });
+            }
+        }
+
+        const tree_w: u16 = if (self.tree_open) @min(tree_width_max, max.width / 3) else 0;
+        const x_off = tree_w;
+        const area_w = max.width - tree_w;
+
+        const logo = [_][]const u8{
+            "███████╗ ██╗ ██████╗  ███████╗",
+            "╚══███╔╝ ██║ ██╔══██╗ ██╔════╝",
+            "  ███╔╝  ██║ ██║  ██║ █████╗  ",
+            " ███╔╝   ██║ ██║  ██║ ██╔══╝  ",
+            "███████╗ ██║ ██████╔╝ ███████╗",
+            "╚══════╝ ╚═╝ ╚═════╝  ╚══════╝",
+        };
+        const logo_w: u16 = 30;
+        const Btn = struct { icon: []const u8, label: []const u8, key: []const u8 };
+        const btns = [_]Btn{
+            .{ .icon = "\u{f002}", .label = "Find File", .key = "f" },
+            .{ .icon = "\u{f0c5}", .label = "Live Grep", .key = "w" },
+            .{ .icon = "\u{f114}", .label = "File Tree", .key = "e" },
+            .{ .icon = "\u{f043}", .label = "Themes", .key = "t" },
+            .{ .icon = "\u{f128}", .label = "Cheatsheet", .key = "h" },
+            .{ .icon = "\u{f011}", .label = "Quit", .key = "q" },
+        };
+        const btn_w: u16 = 26;
+        const total_h: u16 = logo.len + 1 + (@as(u16, btns.len) * 2 - 1) + 2;
+        var y: u16 = if (max.height > total_h + 1) (max.height - 1 - total_h) / 2 else 0;
+
+        // Logo.
+        for (logo) |line| {
+            if (y >= max.height -| 1) break;
+            const lx: u16 = x_off + (area_w -| logo_w) / 2;
+            _ = writeText(surface, ctx, lx, y, line, .{ .fg = th.blue, .bold = true });
+            y += 1;
+        }
+        y += 1;
+
+        // Buttons.
+        for (btns) |btn| {
+            if (y >= max.height -| 1) break;
+            const bx: u16 = x_off + (area_w -| btn_w) / 2;
+            var col = bx;
+            var pad: u16 = 0;
+            while (pad < btn_w) : (pad += 1)
+                surface.writeCell(bx + pad, y, .{ .style = .{ .bg = th.bar_bg } });
+            col = writeText(surface, ctx, col, y, "  ", .{ .bg = th.bar_bg });
+            col = writeText(surface, ctx, col, y, btn.icon, .{ .fg = th.green, .bg = th.bar_bg });
+            col = writeText(surface, ctx, col, y, "  ", .{ .bg = th.bar_bg });
+            col = writeText(surface, ctx, col, y, btn.label, .{ .fg = th.fg, .bg = th.bar_bg });
+            _ = writeText(surface, ctx, bx + btn_w - 3, y, btn.key, .{ .fg = th.yellow, .bg = th.bar_bg, .bold = true });
+            y += 2;
+        }
+        if (y < max.height -| 1) {
+            const hint = "zide — :e <path> to open a file";
+            const hx: u16 = x_off + (area_w -| @as(u16, @intCast(ctx.stringWidth(hint)))) / 2;
+            _ = writeText(surface, ctx, hx, y, hint, .{ .fg = th.gray });
+        }
+
+        if (tree_w > 0) self.drawTree(surface, ctx, 0, max.height - 1, tree_w);
+        self.drawStatus(surface, ctx, max.height - 1, max.width);
+        if (self.popup.kind != .none) {
+            try self.drawPopup(&surface, ctx, max);
+            return surface;
+        }
+        if (self.mode == .command) {
+            surface.cursor = .{
+                .row = max.height - 1,
+                .col = @intCast(@min(1 + self.cmd.items.len, max.width - 1)),
+                .shape = .beam,
             };
         }
         return surface;
@@ -988,7 +1181,7 @@ pub const Editor = struct {
     }
 
     fn drawStatus(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, status_row: u16, width: u16) void {
-        const b = self.cur();
+        const b: ?*Buffer = if (self.buffers.items.len > 0) self.cur() else null;
         const th = self.theme.p;
         const bar_style: vaxis.Style = .{ .fg = th.bar_fg, .bg = th.bar_bg };
         var col: u16 = 0;
@@ -1025,18 +1218,22 @@ pub const Editor = struct {
 
         const left = if (self.status_len > 0)
             std.fmt.allocPrint(ctx.arena, " {s}", .{self.status_buf[0..self.status_len]}) catch return
-        else
+        else if (b) |buf|
             std.fmt.allocPrint(ctx.arena, " {s}{s}", .{
-                b.file_name,
-                if (b.dirty) " [+]" else "",
-            }) catch return;
+                buf.file_name,
+                if (buf.dirty) " [+]" else "",
+            }) catch return
+        else
+            " dashboard";
         end = writeText(surface, ctx, end, status_row, left, bar_style);
 
-        const right = std.fmt.allocPrint(ctx.arena, " {d}/{d}  {d}:{d} ", .{
-            self.active + 1, self.buffers.items.len, b.row + 1, b.col + 1,
-        }) catch return;
-        if (right.len < width) {
-            _ = writeText(surface, ctx, @intCast(width - right.len), status_row, right, mode_style);
+        if (b) |buf| {
+            const right = std.fmt.allocPrint(ctx.arena, " {d}/{d}  {d}:{d} ", .{
+                self.active + 1, self.buffers.items.len, buf.row + 1, buf.col + 1,
+            }) catch return;
+            if (right.len < width) {
+                _ = writeText(surface, ctx, @intCast(width - right.len), status_row, right, mode_style);
+            }
         }
     }
 
