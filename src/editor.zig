@@ -91,7 +91,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -900,9 +900,11 @@ pub const Editor = struct {
                 self.pending = .none;
                 if (cp == 'g') {
                     self.pushJump();
-                    b.row = 0;
-                    b.col = 0;
-                    b.goal_col = 0;
+                    // `gg` = first line, `Ngg` = line N (like vim).
+                    b.row = if (self.count > 0) @min(self.count - 1, b.lastRow()) else 0;
+                    self.count = 0;
+                    b.col = b.firstNonWs(b.row);
+                    b.goal_col = @intCast(b.col);
                 } else if (cp == 'v') {
                     self.reselectVisual();
                 }
@@ -989,13 +991,21 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
-            .indent_gt, .indent_lt => {
-                const dedent = self.pending == .indent_lt;
+            .indent_gt, .indent_lt, .indent_eq => {
+                const p = self.pending;
                 self.pending = .none;
-                if ((dedent and cp == '<') or (!dedent and cp == '>')) {
+                const match: u21 = switch (p) {
+                    .indent_gt => '>',
+                    .indent_lt => '<',
+                    else => '=',
+                };
+                if (cp == match) {
                     const n = self.takeCount();
                     const hi = @min(b.row + n - 1, b.lines.items.len - 1);
-                    try b.indentRows(b.row, hi, dedent);
+                    if (p == .indent_eq)
+                        try b.reindentRows(b.row, hi)
+                    else
+                        try b.indentRows(b.row, hi, p == .indent_lt);
                     b.col = b.firstNonWs(b.row);
                     b.goal_col = @intCast(b.col);
                 }
@@ -1241,6 +1251,7 @@ pub const Editor = struct {
             'y' => self.pending = .y_op,
             '>' => self.pending = .indent_gt,
             '<' => self.pending = .indent_lt,
+            '=' => self.pending = .indent_eq,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
             'm' => self.pending = .mark_set,
@@ -1637,12 +1648,17 @@ pub const Editor = struct {
                 if (jc) |c| b.col = if (c > 0) Buffer.snapToCp(b.lineText(b.row), c) else 0;
                 b.goal_col = @intCast(b.col);
             },
-            '<', '>' => {
+            '<', '>', '=' => {
                 const lo = @min(self.vis_row, b.row);
                 const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
-                var steps = self.takeCount();
-                while (steps > 0) : (steps -= 1)
-                    b.indentRows(lo, hi, cp == '<') catch {};
+                if (cp == '=') {
+                    self.count = 0;
+                    b.reindentRows(lo, hi) catch {};
+                } else {
+                    var steps = self.takeCount();
+                    while (steps > 0) : (steps -= 1)
+                        b.indentRows(lo, hi, cp == '<') catch {};
+                }
                 self.exitVisual();
                 b.row = @min(lo, b.lines.items.len - 1);
                 b.col = b.firstNonWs(b.row);

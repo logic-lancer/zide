@@ -296,6 +296,53 @@ pub const Buffer = struct {
         self.goal_col = self.col;
     }
 
+    /// Brace depth after scanning `text`, skipping string/char literals and
+    /// `//` comments. Heuristic backbone of the `=` reindent operator.
+    fn braceDepthAfter(text: []const u8, depth: usize) usize {
+        var d = depth;
+        var j: usize = 0;
+        var in_str: u8 = 0;
+        while (j < text.len) : (j += 1) {
+            const c = text[j];
+            if (in_str != 0) {
+                if (c == '\\') j += 1 else if (c == in_str) in_str = 0;
+            } else switch (c) {
+                '"', '\'' => in_str = c,
+                '/' => if (j + 1 < text.len and text[j + 1] == '/') break,
+                '{', '(', '[' => d += 1,
+                '}', ')', ']' => d -|= 1,
+                else => {},
+            }
+        }
+        return d;
+    }
+
+    /// Vim `=`: recompute leading whitespace for rows [lo, hi] from brace
+    /// depth (4-space step). Blank lines are left empty.
+    pub fn reindentRows(self: *Buffer, lo: usize, hi: usize) !void {
+        const spaces = " " ** 128;
+        var depth: usize = 0;
+        var i: usize = 0;
+        while (i < lo) : (i += 1) depth = braceDepthAfter(self.lineText(i), depth);
+        i = lo;
+        while (i <= hi and i < self.lines.items.len) : (i += 1) {
+            const text = self.lineText(i);
+            var ws: usize = 0;
+            while (ws < text.len and (text[ws] == ' ' or text[ws] == '\t')) ws += 1;
+            const rest = text[ws..];
+            if (rest.len == 0) continue; // blank stays empty
+            var eff = depth;
+            if (rest[0] == '}' or rest[0] == ')' or rest[0] == ']') eff -|= 1;
+            const want = @min(eff * 4, spaces.len);
+            const line = self.lines.items[i];
+            if (want != ws or std.mem.indexOfScalar(u8, text[0..ws], '\t') != null)
+                try self.replaceRange(line.start, line.start + ws, spaces[0..want]);
+            depth = braceDepthAfter(self.lineText(i), depth);
+        }
+        self.clampCol(false);
+        self.goal_col = self.col;
+    }
+
     /// Vim `J`: join `row` with the following line — the newline and the next
     /// line's leading whitespace collapse into a single space (no space when
     /// the next line is empty or the current line ends the joined pair with
