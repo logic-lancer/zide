@@ -36,6 +36,8 @@ pub const Editor = struct {
     /// Visual-mode anchor (the end of the selection that does not move).
     vis_row: usize = 0,
     vis_col: usize = 0,
+    /// Last visual selection, for `gv` reselect: mode + anchor + cursor.
+    last_vis: ?struct { mode: Mode, ar: usize, ac: usize, cr: usize, cc: usize } = null,
     /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
     reg: std.ArrayListUnmanaged(u8) = .{},
     reg_linewise: bool = false,
@@ -611,6 +613,8 @@ pub const Editor = struct {
                     b.row = 0;
                     b.col = 0;
                     b.goal_col = 0;
+                } else if (cp == 'v') {
+                    self.reselectVisual();
                 }
                 return ctx.consumeAndRedraw();
             },
@@ -709,6 +713,12 @@ pub const Editor = struct {
                 b.row = b.lastRow();
                 b.clampCol(false);
             },
+            'J' => {
+                if (try b.joinLines(b.row)) |jc| {
+                    b.col = if (jc > 0) Buffer.snapToCp(b.lineText(b.row), jc) else 0;
+                    b.goal_col = @intCast(b.col);
+                }
+            },
             'd' => self.pending = .d,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
@@ -772,6 +782,34 @@ pub const Editor = struct {
         self.mode = m;
     }
 
+    /// Leave visual mode, remembering the selection for `gv`.
+    fn exitVisual(self: *Editor) void {
+        const b = self.cur();
+        self.last_vis = .{
+            .mode = self.mode,
+            .ar = self.vis_row,
+            .ac = self.vis_col,
+            .cr = b.row,
+            .cc = b.col,
+        };
+        self.mode = .normal;
+    }
+
+    /// `gv`: restore the last visual selection.
+    fn reselectVisual(self: *Editor) void {
+        const lv = self.last_vis orelse return;
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const last = b.lines.items.len - 1;
+        self.vis_row = @min(lv.ar, last);
+        self.vis_col = @min(lv.ac, b.lineLen(self.vis_row));
+        b.row = @min(lv.cr, last);
+        b.col = lv.cc;
+        b.clampCol(false);
+        b.goal_col = @intCast(b.col);
+        self.mode = lv.mode;
+    }
+
     /// Byte range [start, end) of the current selection, or null.
     fn selRange(self: *Editor) ?[2]usize {
         if (self.mode != .visual and self.mode != .visual_line) return null;
@@ -813,6 +851,20 @@ pub const Editor = struct {
         const cp = key.shifted_codepoint orelse key.codepoint;
         const half: i64 = @max(1, self.last_height / 2);
 
+        if (self.pending == .leader) {
+            self.pending = .none;
+            if (cp == '/') {
+                const lo = @min(self.vis_row, b.row);
+                const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
+                b.toggleCommentRows(lo, hi) catch {};
+                self.exitVisual();
+                b.row = @min(lo, b.lines.items.len - 1);
+                b.col = b.firstNonWs(b.row);
+                b.goal_col = @intCast(b.col);
+            }
+            return ctx.consumeAndRedraw();
+        }
+
         if (key.mods.ctrl) {
             switch (cp) {
                 'c' => ctx.quit = true,
@@ -824,16 +876,40 @@ pub const Editor = struct {
         }
 
         switch (cp) {
-            vaxis.Key.escape => self.mode = .normal,
+            vaxis.Key.escape => self.exitVisual(),
+            ' ' => self.pending = .leader,
             'v' => if (self.mode == .visual) {
-                self.mode = .normal;
+                self.exitVisual();
             } else {
                 self.mode = .visual;
             },
             'V' => if (self.mode == .visual_line) {
-                self.mode = .normal;
+                self.exitVisual();
             } else {
                 self.mode = .visual_line;
+            },
+            'J' => {
+                const lo = @min(self.vis_row, b.row);
+                const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
+                var n = hi - lo;
+                if (n == 0) n = 1; // single-line selection joins with the next
+                var jc: ?usize = null;
+                while (n > 0) : (n -= 1) {
+                    jc = (try b.joinLines(lo)) orelse break;
+                }
+                self.exitVisual();
+                b.row = @min(lo, b.lines.items.len - 1);
+                if (jc) |c| b.col = if (c > 0) Buffer.snapToCp(b.lineText(b.row), c) else 0;
+                b.goal_col = @intCast(b.col);
+            },
+            '<', '>' => {
+                const lo = @min(self.vis_row, b.row);
+                const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
+                b.indentRows(lo, hi, cp == '<') catch {};
+                self.exitVisual();
+                b.row = @min(lo, b.lines.items.len - 1);
+                b.col = b.firstNonWs(b.row);
+                b.goal_col = @intCast(b.col);
             },
             'o' => {
                 // Swap anchor and cursor.
@@ -861,7 +937,7 @@ pub const Editor = struct {
                     }
                     b.clampCol(false);
                 }
-                self.mode = .normal;
+                self.exitVisual();
             },
             'd', 'x' => {
                 if (self.selRange()) |r| {
@@ -880,7 +956,7 @@ pub const Editor = struct {
                     b.clampCol(false);
                     b.goal_col = @intCast(b.col);
                 }
-                self.mode = .normal;
+                self.exitVisual();
             },
             'h', vaxis.Key.left => b.moveLeft(),
             'l', vaxis.Key.right => b.moveRight(false),
@@ -994,6 +1070,8 @@ pub const Editor = struct {
         self.mode = .normal;
         if (s.len == 0) return;
 
+        if (try self.trySubstitute(s)) return;
+
         var it = std.mem.tokenizeScalar(u8, s, ' ');
         const head = it.next() orelse return;
 
@@ -1053,6 +1131,84 @@ pub const Editor = struct {
         } else {
             self.setStatus("not an editor command: {s}", .{s});
         }
+    }
+
+    /// `:[range]s/pat/rep/[g]` — plain-text substitute (vim staple). Ranges:
+    /// none (current line), `%` (whole file), `N,M` (1-based inclusive).
+    /// Returns false when `s` is not a substitute command at all.
+    fn trySubstitute(self: *Editor, s: []const u8) !bool {
+        if (self.buffers.items.len == 0) return false;
+        const b = self.cur();
+        var i: usize = 0;
+        var lo: usize = b.row;
+        var hi: usize = b.row;
+        if (i < s.len and s[i] == '%') {
+            lo = 0;
+            hi = b.lines.items.len - 1;
+            i += 1;
+        } else if (i < s.len and std.ascii.isDigit(s[i])) {
+            var j = i;
+            while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
+            if (j >= s.len or s[j] != ',') return false;
+            var k = j + 1;
+            while (k < s.len and std.ascii.isDigit(s[k])) k += 1;
+            if (k == j + 1) return false;
+            const a = std.fmt.parseInt(usize, s[i..j], 10) catch return false;
+            const c = std.fmt.parseInt(usize, s[j + 1 .. k], 10) catch return false;
+            lo = @min(a -| 1, b.lines.items.len - 1);
+            hi = @min(c -| 1, b.lines.items.len - 1);
+            if (lo > hi) std.mem.swap(usize, &lo, &hi);
+            i = k;
+        }
+        if (i + 1 >= s.len or s[i] != 's' or s[i + 1] != '/') return false;
+
+        var parts = std.mem.splitScalar(u8, s[i + 2 ..], '/');
+        const pat_raw = parts.next() orelse return false;
+        if (pat_raw.len == 0) {
+            self.setStatus("empty substitute pattern", .{});
+            return true;
+        }
+        const rep_raw = parts.next() orelse "";
+        const flags = parts.next() orelse "";
+        const global = std.mem.indexOfScalar(u8, flags, 'g') != null;
+        // Own the pattern/replacement: edits below invalidate `self.cmd` slices? No —
+        // `s` aliases self.cmd which buffer edits never touch, so slices stay valid.
+        const pat = pat_raw;
+        const rep = rep_raw;
+
+        var count: usize = 0;
+        var last_hit: ?usize = null;
+        var row = lo;
+        while (row <= hi and row < b.lines.items.len) : (row += 1) {
+            const text = self.alloc.dupe(u8, b.lineText(row)) catch return true;
+            defer self.alloc.free(text);
+            var scratch: std.ArrayListUnmanaged(u8) = .{};
+            defer scratch.deinit(self.alloc);
+            var pos: usize = 0;
+            var line_hits: usize = 0;
+            while (std.mem.indexOfPos(u8, text, pos, pat)) |p| {
+                try scratch.appendSlice(self.alloc, text[pos..p]);
+                try scratch.appendSlice(self.alloc, rep);
+                pos = p + pat.len;
+                line_hits += 1;
+                if (!global) break;
+            }
+            if (line_hits == 0) continue;
+            try scratch.appendSlice(self.alloc, text[pos..]);
+            const line = b.lines.items[row];
+            try b.replaceRange(line.start, line.end, scratch.items);
+            count += line_hits;
+            last_hit = row;
+        }
+        if (last_hit) |r| {
+            b.row = r;
+            b.clampCol(false);
+            b.goal_col = b.col;
+            self.setStatus("{d} substitution{s}", .{ count, if (count == 1) "" else "s" });
+        } else {
+            self.setStatus("pattern not found: {s}", .{pat});
+        }
+        return true;
     }
 
     /// Jump to the next/previous occurrence of the last `/` pattern, wrapping

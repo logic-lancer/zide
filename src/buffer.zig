@@ -224,6 +224,91 @@ pub const Buffer = struct {
         self.goal_col = self.col;
     }
 
+    fn rowBlank(self: *const Buffer, row: usize) bool {
+        for (self.lineText(row)) |c| {
+            if (c != ' ' and c != '\t') return false;
+        }
+        return true;
+    }
+
+    fn rowCommented(self: *const Buffer, row: usize) bool {
+        const text = self.lineText(row);
+        const fnw = self.firstNonWs(row);
+        return std.mem.startsWith(u8, text[fnw..], self.commentPrefix());
+    }
+
+    /// Comment/uncomment rows [lo, hi] as a group (comment.nvim style):
+    /// uncomment only when every non-blank row is already commented,
+    /// otherwise comment every non-blank, not-yet-commented row.
+    pub fn toggleCommentRows(self: *Buffer, lo: usize, hi: usize) !void {
+        const prefix = self.commentPrefix();
+        var all_commented = true;
+        var any = false;
+        var i = lo;
+        while (i <= hi) : (i += 1) {
+            if (self.rowBlank(i)) continue;
+            any = true;
+            if (!self.rowCommented(i)) all_commented = false;
+        }
+        if (!any) return;
+        i = lo;
+        while (i <= hi) : (i += 1) {
+            if (self.rowBlank(i)) continue;
+            const line = self.lines.items[i];
+            const fnw = self.firstNonWs(i);
+            const rest = self.lineText(i)[fnw..];
+            if (all_commented) {
+                var rm = prefix.len;
+                if (rest.len > rm and rest[rm] == ' ') rm += 1;
+                try self.replaceRange(line.start + fnw, line.start + fnw + rm, "");
+            } else if (!std.mem.startsWith(u8, rest, prefix)) {
+                var buf: [8]u8 = undefined;
+                const ins = std.fmt.bufPrint(&buf, "{s} ", .{prefix}) catch return;
+                try self.replaceRange(line.start + fnw, line.start + fnw, ins);
+            }
+        }
+        self.clampCol(false);
+        self.goal_col = self.col;
+    }
+
+    /// Indent (`>`) or dedent (`<`) rows [lo, hi] by one 4-space step.
+    pub fn indentRows(self: *Buffer, lo: usize, hi: usize, dedent: bool) !void {
+        var i = lo;
+        while (i <= hi) : (i += 1) {
+            const line = self.lines.items[i];
+            if (dedent) {
+                const text = self.lineText(i);
+                var rm: usize = 0;
+                while (rm < 4 and rm < text.len and text[rm] == ' ') rm += 1;
+                if (rm == 0 and text.len > 0 and text[0] == '\t') rm = 1;
+                if (rm > 0) try self.replaceRange(line.start, line.start + rm, "");
+            } else {
+                if (self.rowBlank(i)) continue; // never indent blank lines
+                try self.replaceRange(line.start, line.start, "    ");
+            }
+        }
+        self.clampCol(false);
+        self.goal_col = self.col;
+    }
+
+    /// Vim `J`: join `row` with the following line — the newline and the next
+    /// line's leading whitespace collapse into a single space (no space when
+    /// the next line is empty or the current line ends the joined pair with
+    /// whitespace). Returns the byte column of the join point.
+    pub fn joinLines(self: *Buffer, row: usize) !?usize {
+        if (row + 1 >= self.lines.items.len) return null;
+        const line = self.lines.items[row];
+        const next = self.lines.items[row + 1];
+        const ntext = self.buf.items[next.start..next.end];
+        var nfw: usize = 0;
+        while (nfw < ntext.len and (ntext[nfw] == ' ' or ntext[nfw] == '\t')) nfw += 1;
+        const join_col = line.end - line.start;
+        const next_empty = nfw == ntext.len;
+        const sep: []const u8 = if (next_empty or join_col == 0) "" else " ";
+        try self.replaceRange(line.end, next.start + nfw, sep);
+        return join_col;
+    }
+
     // ---- motions ----------------------------------------------------------
 
     pub fn moveLeft(self: *Buffer) void {
