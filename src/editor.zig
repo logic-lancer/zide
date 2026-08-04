@@ -47,6 +47,8 @@ pub const Editor = struct {
     /// In-progress change capture (from change-starting key until normal mode).
     dot_rec: std.ArrayListUnmanaged(vaxis.Key) = .{},
     dot_capturing: bool = false,
+    /// Pending count prefix for normal-mode commands (0 = none).
+    count: u32 = 0,
     /// Visual-mode anchor (the end of the selection that does not move).
     vis_row: usize = 0,
     vis_col: usize = 0,
@@ -56,6 +58,9 @@ pub const Editor = struct {
     last_click_col: usize = 0,
     /// Last visual selection, for `gv` reselect: mode + anchor + cursor.
     last_vis: ?struct { mode: Mode, ar: usize, ac: usize, cr: usize, cc: usize } = null,
+    /// Jumplist for Ctrl-o / Ctrl-i (vim `:jumps`): positions before big jumps.
+    jumps: std.ArrayListUnmanaged(Jump) = .{},
+    jump_idx: usize = 0,
     /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
     reg: std.ArrayListUnmanaged(u8) = .{},
     reg_linewise: bool = false,
@@ -85,6 +90,8 @@ pub const Editor = struct {
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
     const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char };
+
+    const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
 
@@ -126,6 +133,7 @@ pub const Editor = struct {
         "Ctrl-n       toggle tree",
         "Ctrl-h       focus tree",
         "Ctrl-l       focus editor",
+        "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-d/u     half-page down/up",
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
@@ -214,6 +222,7 @@ pub const Editor = struct {
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
+        self.jumps.deinit(self.alloc);
         self.reg.deinit(self.alloc);
         self.cmd.deinit(self.alloc);
         self.search.deinit(self.alloc);
@@ -247,10 +256,12 @@ pub const Editor = struct {
     pub fn openFile(self: *Editor, path: []const u8) !void {
         for (self.buffers.items, 0..) |*b, i| {
             if (std.mem.eql(u8, b.file_name, path)) {
+                if (i != self.active) self.pushJump();
                 self.active = i;
                 return;
             }
         }
+        self.pushJump();
         const contents = std.fs.cwd().readFileAlloc(self.alloc, path, 64 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => try self.alloc.dupe(u8, ""),
             else => {
@@ -566,6 +577,59 @@ pub const Editor = struct {
         }
     }
 
+    /// Record the current position before a "big" jump (G/gg, n/N, marks,
+    /// file switches). Truncates any forward (Ctrl-i) history, vim-style.
+    fn pushJump(self: *Editor) void {
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        self.jumps.shrinkRetainingCapacity(self.jump_idx);
+        if (self.jumps.items.len > 0) {
+            const last = self.jumps.items[self.jumps.items.len - 1];
+            if (last.buf == self.active and last.row == b.row) {
+                self.jump_idx = self.jumps.items.len;
+                return;
+            }
+        }
+        if (self.jumps.items.len >= 100) _ = self.jumps.orderedRemove(0);
+        self.jumps.append(self.alloc, .{ .buf = self.active, .row = b.row, .col = b.col }) catch {};
+        self.jump_idx = self.jumps.items.len;
+    }
+
+    /// Ctrl-o: walk back through the jumplist.
+    fn jumpBack(self: *Editor) void {
+        if (self.jump_idx == 0) return;
+        // First step back: pin the current spot so Ctrl-i can return to it.
+        if (self.jump_idx == self.jumps.items.len) {
+            const b = self.cur();
+            self.jumps.append(self.alloc, .{ .buf = self.active, .row = b.row, .col = b.col }) catch return;
+        }
+        self.jump_idx -= 1;
+        self.gotoJump(self.jumps.items[self.jump_idx]);
+    }
+
+    /// Ctrl-i: walk forward again.
+    fn jumpFwd(self: *Editor) void {
+        if (self.jump_idx + 1 >= self.jumps.items.len) return;
+        self.jump_idx += 1;
+        self.gotoJump(self.jumps.items[self.jump_idx]);
+    }
+
+    fn gotoJump(self: *Editor, j: Jump) void {
+        if (j.buf < self.buffers.items.len) self.active = j.buf;
+        const b = self.cur();
+        b.row = @min(j.row, b.lastRow());
+        b.col = j.col;
+        b.clampCol(false);
+        b.goal_col = @intCast(b.col);
+    }
+
+    /// Consume the pending count prefix (defaults to 1).
+    fn takeCount(self: *Editor) u32 {
+        const n = if (self.count == 0) 1 else self.count;
+        self.count = 0;
+        return n;
+    }
+
     /// Dot-repeat capture: when a change-starting key arrives in plain normal
     /// mode, start recording keys until the editor settles back into normal
     /// mode (covers single-key edits and whole insert sessions alike).
@@ -582,6 +646,16 @@ pub const Editor = struct {
             }
             self.dot_capturing = true;
             self.dot_rec.clearRetainingCapacity();
+            // Fold an active count prefix into the capture so `.` repeats
+            // e.g. `3x` in full.
+            if (self.count > 0) {
+                var digits: [8]u8 = undefined;
+                const s = std.fmt.bufPrint(&digits, "{d}", .{self.count}) catch "";
+                for (s) |c| self.dot_rec.append(
+                    self.alloc,
+                    .{ .codepoint = c },
+                ) catch {};
+            }
         }
         self.dot_rec.append(self.alloc, key) catch {};
     }
@@ -740,6 +814,7 @@ pub const Editor = struct {
             .g => {
                 self.pending = .none;
                 if (cp == 'g') {
+                    self.pushJump();
                     b.row = 0;
                     b.col = 0;
                     b.goal_col = 0;
@@ -750,7 +825,8 @@ pub const Editor = struct {
             },
             .d => {
                 self.pending = .none;
-                if (cp == 'd') try b.deleteLine();
+                const n = self.takeCount();
+                if (cp == 'd') for (0..n) |_| try b.deleteLine();
                 return ctx.consumeAndRedraw();
             },
             .mark_set => {
@@ -764,6 +840,7 @@ pub const Editor = struct {
                 self.pending = .none;
                 if (cp >= 'a' and cp <= 'z') {
                     if (b.marks[@intCast(cp - 'a')]) |mk| {
+                        self.pushJump();
                         b.row = @min(mk.row, b.lastRow());
                         b.col = mk.col;
                         b.clampCol(false);
@@ -855,6 +932,8 @@ pub const Editor = struct {
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
                 'n' => self.toggleTree(),
+                'o' => self.jumpBack(),
+                'i' => self.jumpFwd(),
                 'h' => if (self.tree_open) {
                     self.focus = .tree;
                 },
@@ -863,18 +942,28 @@ pub const Editor = struct {
             return ctx.consumeAndRedraw();
         }
 
+        // Count prefix: accumulate digits ('0' only extends an existing count,
+        // otherwise it stays the line-start motion).
+        if (!key.mods.ctrl and !key.mods.alt and
+            cp >= '0' and cp <= '9' and (cp != '0' or self.count > 0))
+        {
+            self.count = @min(self.count * 10 + @as(u32, @intCast(cp - '0')), 99999);
+            return ctx.consumeAndRedraw();
+        }
+        const n: u32 = @max(self.count, 1);
+
         switch (cp) {
             vaxis.Key.tab => if (key.mods.shift) self.cycleBuffer(-1) else self.cycleBuffer(1),
             ' ' => self.pending = .leader,
-            'h', vaxis.Key.left => b.moveLeft(),
-            'l', vaxis.Key.right => b.moveRight(false),
-            'j', vaxis.Key.down => b.moveVert(1, false),
-            'k', vaxis.Key.up => b.moveVert(-1, false),
+            'h', vaxis.Key.left => for (0..n) |_| b.moveLeft(),
+            'l', vaxis.Key.right => for (0..n) |_| b.moveRight(false),
+            'j', vaxis.Key.down => b.moveVert(n, false),
+            'k', vaxis.Key.up => b.moveVert(-@as(i64, n), false),
             vaxis.Key.page_down => b.moveVert(half, false),
             vaxis.Key.page_up => b.moveVert(-half, false),
-            'w' => b.wordForward(),
-            'b' => b.wordBackward(),
-            'e' => b.wordEnd(),
+            'w' => for (0..n) |_| b.wordForward(),
+            'b' => for (0..n) |_| b.wordBackward(),
+            'e' => for (0..n) |_| b.wordEnd(),
             '0', vaxis.Key.home => {
                 b.col = 0;
                 b.goal_col = 0;
@@ -890,13 +979,18 @@ pub const Editor = struct {
             },
             'g' => self.pending = .g,
             'G' => {
-                b.row = b.lastRow();
+                // `nG` jumps to line n; bare G goes to the last line.
+                self.pushJump();
+                b.row = if (self.count > 0) @min(self.count - 1, b.lastRow()) else b.lastRow();
                 b.clampCol(false);
             },
             'J' => {
-                if (try b.joinLines(b.row)) |jc| {
-                    b.col = if (jc > 0) Buffer.snapToCp(b.lineText(b.row), jc) else 0;
-                    b.goal_col = @intCast(b.col);
+                // `nJ` joins n lines (= n-1 joins, minimum one).
+                for (0..@max(n -| 1, 1)) |_| {
+                    if (try b.joinLines(b.row)) |jc| {
+                        b.col = if (jc > 0) Buffer.snapToCp(b.lineText(b.row), jc) else 0;
+                        b.goal_col = @intCast(b.col);
+                    } else break;
                 }
             },
             'd' => self.pending = .d,
@@ -921,13 +1015,13 @@ pub const Editor = struct {
             },
             'n' => self.findNext(1),
             'N' => self.findNext(-1),
-            'x' => try b.deleteCharAtCursor(),
+            'x' => for (0..n) |_| try b.deleteCharAtCursor(),
             'r' => self.pending = .replace_char,
-            '~' => try b.toggleCaseAtCursor(),
+            '~' => for (0..n) |_| try b.toggleCaseAtCursor(),
             '.' => try self.playDot(ctx),
             'v' => self.enterVisual(.visual),
             'V' => self.enterVisual(.visual_line),
-            'p' => try self.pasteAfter(),
+            'p' => for (0..n) |_| try self.pasteAfter(),
             'i' => self.mode = .insert,
             'a' => {
                 self.mode = .insert;
@@ -965,6 +1059,9 @@ pub const Editor = struct {
             vaxis.Key.escape => self.pending = .none,
             else => return,
         }
+        // Non-digit key handled: a still-unset pending consumes the count later
+        // (e.g. `2dd`); otherwise it is spent now.
+        if (self.pending == .none) self.count = 0;
         ctx.consumeAndRedraw();
     }
 
@@ -1429,6 +1526,7 @@ pub const Editor = struct {
         };
 
         if (hit) |pos| {
+            self.pushJump();
             b.setCursorFromByte(pos);
             if (wrapped)
                 self.setStatus("search hit {s}, continuing at {s}", .{
