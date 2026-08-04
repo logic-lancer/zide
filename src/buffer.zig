@@ -28,6 +28,9 @@ pub const Buffer = struct {
     /// a-z vim marks (`m{a-z}`); positions are clamped when jumped to, so
     /// stale marks after edits degrade gracefully instead of invalidating.
     marks: [26]?Mark = [_]?Mark{null} ** 26,
+    /// `'<` / `'>` — bounds of the most recent visual selection.
+    mark_lt: ?Mark = null,
+    mark_gt: ?Mark = null,
 
     pub const Mark = struct { row: usize, col: usize };
     pub const Sign = enum(u8) { none, add, change, delete };
@@ -502,6 +505,13 @@ pub const Buffer = struct {
             self.col = prev_len;
             self.goal_col = prev_len;
         }
+    }
+
+    /// Retarget the buffer at a new path (`:w <path>` save-as).
+    pub fn setPath(self: *Buffer, path: []const u8) !void {
+        const new = try self.alloc.dupe(u8, path);
+        self.alloc.free(self.file_name);
+        self.file_name = new;
     }
 
     pub fn save(self: *Buffer) !void {

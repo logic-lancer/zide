@@ -24,6 +24,8 @@ pub const Editor = struct {
     search: std.ArrayListUnmanaged(u8) = .{},
     /// True while the command line is a `/` search prompt rather than `:`.
     cmd_is_search: bool = false,
+    /// Search-match highlighting toggle — `:noh` turns it off until the next search.
+    search_hl: bool = true,
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
     popup: Popup = .{},
@@ -757,6 +759,7 @@ pub const Editor = struct {
             ':' => {
                 self.mode = .command;
                 self.cmd_is_search = false;
+                self.status_len = 0;
                 self.cmd.clearRetainingCapacity();
             },
             else => return,
@@ -1314,6 +1317,7 @@ pub const Editor = struct {
             ':' => {
                 self.mode = .command;
                 self.cmd_is_search = false;
+                self.status_len = 0;
                 self.cmd.clearRetainingCapacity();
             },
             vaxis.Key.escape => self.pending = .none,
@@ -1337,6 +1341,14 @@ pub const Editor = struct {
     /// Leave visual mode, remembering the selection for `gv`.
     fn exitVisual(self: *Editor) void {
         const b = self.cur();
+        // Vim's `'<` / `'>` marks: bounds of the selection just left.
+        if (self.vis_row < b.row or (self.vis_row == b.row and self.vis_col <= b.col)) {
+            b.mark_lt = .{ .row = self.vis_row, .col = self.vis_col };
+            b.mark_gt = .{ .row = b.row, .col = b.col };
+        } else {
+            b.mark_lt = .{ .row = b.row, .col = b.col };
+            b.mark_gt = .{ .row = self.vis_row, .col = self.vis_col };
+        }
         self.last_vis = .{
             .mode = self.mode,
             .ar = self.vis_row,
@@ -1623,6 +1635,15 @@ pub const Editor = struct {
         switch (cp) {
             vaxis.Key.escape => self.exitVisual(),
             ' ' => self.pending = .leader,
+            ':' => {
+                // `:` from visual mode — command line prefilled with the range.
+                self.exitVisual();
+                self.mode = .command;
+                self.cmd_is_search = false;
+                self.status_len = 0;
+                self.cmd.clearRetainingCapacity();
+                try self.cmd.appendSlice(self.alloc, "'<,'>");
+            },
             'v' => if (self.mode == .visual) {
                 self.exitVisual();
             } else {
@@ -1880,8 +1901,10 @@ pub const Editor = struct {
                 self.mode = .normal;
                 self.search.clearRetainingCapacity();
                 try self.search.appendSlice(self.alloc, self.cmd.items);
+                self.search_hl = true;
                 self.findNext(1);
             } else try self.execCommand(ctx),
+            vaxis.Key.tab => if (!self.cmd_is_search) try self.completeCmdline(),
             vaxis.Key.backspace => {
                 if (self.cmd.items.len == 0) self.mode = .normal else _ = self.cmd.pop();
             },
@@ -1891,6 +1914,97 @@ pub const Editor = struct {
             },
         }
         ctx.consumeAndRedraw();
+    }
+
+    // ---- cmdline tab completion -------------------------------------------
+
+    /// Tab in `:` mode — completes command names, `:theme` names, and file
+    /// paths for `:e` / `:w` (nvim-cmp cmdline flavor, TUI-sized).
+    fn completeCmdline(self: *Editor) !void {
+        const s = self.cmd.items;
+        if (std.mem.indexOfScalar(u8, s, ' ')) |sp| {
+            const head = s[0..sp];
+            const arg = s[sp + 1 ..];
+            if (std.mem.eql(u8, head, "theme")) {
+                var buf: [themes.list.len][]const u8 = undefined;
+                for (&themes.list, 0..) |*t, i| buf[i] = t.name;
+                return self.completeFrom(&buf, arg, sp + 1);
+            }
+            if (std.mem.eql(u8, head, "e") or std.mem.eql(u8, head, "w"))
+                return self.completePath(arg, sp + 1);
+            return;
+        }
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh" };
+        return self.completeFrom(&cmds, s, 0);
+    }
+
+    /// Complete `cmd[start..]` against `options`: extend to the longest common
+    /// prefix of all matches; list candidates in the status line when ambiguous.
+    fn completeFrom(self: *Editor, options: []const []const u8, prefix: []const u8, start: usize) !void {
+        var lcp: ?[]const u8 = null;
+        var count: usize = 0;
+        var listing: [96]u8 = undefined;
+        var listing_len: usize = 0;
+        for (options) |opt| {
+            if (!std.mem.startsWith(u8, opt, prefix)) continue;
+            count += 1;
+            lcp = if (lcp) |p| p[0..std.mem.indexOfDiff(u8, p, opt) orelse p.len] else opt;
+            if (listing_len + opt.len + 1 <= listing.len) {
+                if (listing_len > 0) {
+                    listing[listing_len] = ' ';
+                    listing_len += 1;
+                }
+                @memcpy(listing[listing_len..][0..opt.len], opt);
+                listing_len += opt.len;
+            }
+        }
+        const p = lcp orelse return self.setStatus("no match: {s}", .{prefix});
+        self.cmd.items.len = start;
+        try self.cmd.appendSlice(self.alloc, p);
+        if (count > 1) self.setStatus("{s}", .{listing[0..listing_len]});
+    }
+
+    /// File-path completion for `:e ` / `:w ` — scans the arg's directory.
+    fn completePath(self: *Editor, arg: []const u8, start: usize) !void {
+        const slash = std.mem.lastIndexOfScalar(u8, arg, '/');
+        const dir_part = if (slash) |i| arg[0 .. i + 1] else "";
+        const base = if (slash) |i| arg[i + 1 ..] else arg;
+
+        var names: std.ArrayListUnmanaged([]u8) = .{};
+        defer {
+            for (names.items) |n| self.alloc.free(n);
+            names.deinit(self.alloc);
+        }
+        var dir = std.fs.cwd().openDir(if (dir_part.len == 0) "." else dir_part, .{ .iterate = true }) catch
+            return self.setStatus("no such dir: {s}", .{dir_part});
+        defer dir.close();
+        var iter = dir.iterate();
+        while (iter.next() catch null) |ent| {
+            if (!std.mem.startsWith(u8, ent.name, base)) continue;
+            if (base.len == 0 and ent.name[0] == '.') continue; // hide dotfiles unless asked
+            const suffix: []const u8 = if (ent.kind == .directory) "/" else "";
+            const full = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{ dir_part, ent.name, suffix });
+            try names.append(self.alloc, full);
+        }
+        if (names.items.len == 0) return self.setStatus("no match: {s}", .{arg});
+        var buf: [self.status_buf.len]u8 = undefined;
+        var lcp: []const u8 = names.items[0];
+        var listing_len: usize = 0;
+        for (names.items) |n| {
+            lcp = lcp[0..std.mem.indexOfDiff(u8, lcp, n) orelse lcp.len];
+            const short = n[dir_part.len..];
+            if (listing_len + short.len + 1 <= buf.len) {
+                if (listing_len > 0) {
+                    buf[listing_len] = ' ';
+                    listing_len += 1;
+                }
+                @memcpy(buf[listing_len..][0..short.len], short);
+                listing_len += short.len;
+            }
+        }
+        self.cmd.items.len = start;
+        try self.cmd.appendSlice(self.alloc, lcp);
+        if (names.items.len > 1) self.setStatus("{s}", .{buf[0..listing_len]});
     }
 
     fn execCommand(self: *Editor, ctx: *vxfw.EventContext) !void {
@@ -1919,6 +2033,7 @@ pub const Editor = struct {
             ls,
             theme,
             themes,
+            noh,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -1933,6 +2048,7 @@ pub const Editor = struct {
             .@"qa!" => ctx.quit = true,
             .w => {
                 if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
+                if (it.next()) |path| try self.cur().setPath(path);
                 self.save();
             },
             .wq, .x => {
@@ -1951,6 +2067,7 @@ pub const Editor = struct {
             .ls => self.openPopup(.buffers),
             .theme => try self.switchTheme(it.next()),
             .themes => self.setStatus("themes: {s}", .{themes.names}),
+            .noh => self.search_hl = false,
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
@@ -1974,6 +2091,14 @@ pub const Editor = struct {
             lo = 0;
             hi = b.lines.items.len - 1;
             i += 1;
+        } else if (std.mem.startsWith(u8, s, "'<,'>")) {
+            // Range from the last visual selection.
+            const lt = b.mark_lt orelse return false;
+            const gt = b.mark_gt orelse return false;
+            lo = @min(lt.row, b.lines.items.len - 1);
+            hi = @min(gt.row, b.lines.items.len - 1);
+            if (lo > hi) std.mem.swap(usize, &lo, &hi);
+            i += 5;
         } else if (i < s.len and std.ascii.isDigit(s[i])) {
             var j = i;
             while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
@@ -1991,10 +2116,14 @@ pub const Editor = struct {
         if (i + 1 >= s.len or s[i] != 's' or s[i + 1] != '/') return false;
 
         var parts = std.mem.splitScalar(u8, s[i + 2 ..], '/');
-        const pat_raw = parts.next() orelse return false;
+        var pat_raw = parts.next() orelse return false;
         if (pat_raw.len == 0) {
-            self.setStatus("empty substitute pattern", .{});
-            return true;
+            // `:s//rep/` — reuse the last search pattern, like vim.
+            if (self.search.items.len == 0) {
+                self.setStatus("empty substitute pattern", .{});
+                return true;
+            }
+            pat_raw = self.search.items;
         }
         const rep_raw = parts.next() orelse "";
         const flags = parts.next() orelse "";
@@ -2033,6 +2162,12 @@ pub const Editor = struct {
             b.clampCol(false);
             b.goal_col = b.col;
             self.setStatus("{d} substitution{s}", .{ count, if (count == 1) "" else "s" });
+            // The substitute pattern becomes the search pattern (vim behavior),
+            // unless we already borrowed it from the search register.
+            if (pat.ptr != self.search.items.ptr) {
+                self.search.clearRetainingCapacity();
+                self.search.appendSlice(self.alloc, pat) catch {};
+            }
         } else {
             self.setStatus("pattern not found: {s}", .{pat});
         }
@@ -2099,6 +2234,7 @@ pub const Editor = struct {
         const word = text[lo..hi];
         self.search.clearRetainingCapacity();
         self.search.appendSlice(self.alloc, word) catch return;
+        self.search_hl = true;
         const hit = findWordHit(text, self.search.items, lo, dir) orelse
             return self.setStatus("pattern not found: {s}", .{self.search.items});
         self.pushJump();
@@ -2609,7 +2745,7 @@ pub const Editor = struct {
             const pat = self.search.items;
             const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
             const sel = self.selRange();
-            var match: ?usize = if (pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
+            var match: ?usize = if (self.search_hl and pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
             var cspan: ?ColorSpan = findColorSpan(text, 0);
             var col: u16 = x0 + gutter;
             var i: usize = 0;
@@ -2954,7 +3090,17 @@ pub const Editor = struct {
         if (self.mode == .command) {
             const prefix: []const u8 = if (self.cmd_is_search) "/" else ":";
             const cmdline = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ prefix, self.cmd.items }) catch return;
-            _ = writeText(surface, ctx, 0, status_row, cmdline, bar_style);
+            const end = writeText(surface, ctx, 0, status_row, cmdline, bar_style);
+            // Completion candidates (set by completeCmdline), right-aligned.
+            if (self.status_len > 0) {
+                const msg = self.status_buf[0..self.status_len];
+                const w: u16 = @min(@as(u16, @intCast(ctx.stringWidth(msg))), width -| (end + 2));
+                if (w > 0) {
+                    const x: u16 = width - w;
+                    const dim_style: vaxis.Style = .{ .fg = th.gutter, .bg = th.bar_bg };
+                    _ = writeText(surface, ctx, x, status_row, msg, dim_style);
+                }
+            }
             return;
         }
 
