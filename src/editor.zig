@@ -793,6 +793,45 @@ pub const Editor = struct {
         return @min(prev, next);
     }
 
+    /// nvim-colorizer: a `#RGB`, `#RRGGBB`, or `#RRGGBBAA` literal in the text.
+    const ColorSpan = struct { s: usize, e: usize, r: u8, g: u8, b: u8 };
+
+    fn nib(ch: u8) u8 {
+        return switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => 0,
+        };
+    }
+
+    fn findColorSpan(text: []const u8, from: usize) ?ColorSpan {
+        var idx = from;
+        while (idx < text.len) {
+            const h = std.mem.indexOfScalarPos(u8, text, idx, '#') orelse return null;
+            var n: usize = 0;
+            while (h + 1 + n < text.len and n < 9 and std.ascii.isHex(text[h + 1 + n])) n += 1;
+            if (n == 3 or n == 6 or n == 8) {
+                const d = text[h + 1 ..];
+                var r: u8 = undefined;
+                var g: u8 = undefined;
+                var b: u8 = undefined;
+                if (n == 3) {
+                    r = nib(d[0]) * 17;
+                    g = nib(d[1]) * 17;
+                    b = nib(d[2]) * 17;
+                } else {
+                    r = nib(d[0]) * 16 + nib(d[1]);
+                    g = nib(d[2]) * 16 + nib(d[3]);
+                    b = nib(d[4]) * 16 + nib(d[5]);
+                }
+                return .{ .s = h, .e = h + 1 + n, .r = r, .g = g, .b = b };
+            }
+            idx = h + 1;
+        }
+        return null;
+    }
+
     /// gitsigns-style `]c` / `[c`: jump to the next/previous hunk start, wrapping.
     fn jumpHunk(self: *Editor, dir: i2) void {
         const b = self.cur();
@@ -2187,6 +2226,7 @@ pub const Editor = struct {
             const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
             const sel = self.selRange();
             var match: ?usize = if (pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
+            var cspan: ?ColorSpan = findColorSpan(text, 0);
             var col: u16 = x0 + gutter;
             var i: usize = 0;
             while (i < text.len and col < text_right) {
@@ -2194,6 +2234,17 @@ pub const Editor = struct {
                 const end = @min(i + cp_len, text.len);
                 const slice = text[i..end];
                 var style = b.hl.styleAt(line.start + i);
+                if (cspan) |c| {
+                    if (i >= c.e) cspan = findColorSpan(text, i);
+                }
+                if (cspan) |c| {
+                    if (i >= c.s and i < c.e) {
+                        // Paint the literal in its own color, contrast-picked fg.
+                        const lum: u32 = 299 * @as(u32, c.r) + 587 * @as(u32, c.g) + 114 * @as(u32, c.b);
+                        style.bg = .{ .rgb = .{ c.r, c.g, c.b } };
+                        style.fg = if (lum > 140_000) .{ .rgb = .{ 0, 0, 0 } } else .{ .rgb = .{ 255, 255, 255 } };
+                    }
+                }
                 if (match) |m| {
                     if (i >= m + pat.len) match = std.mem.indexOfPos(u8, text, i, pat);
                 }
