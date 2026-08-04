@@ -26,6 +26,9 @@ pub const Editor = struct {
     cmd_is_search: bool = false,
     /// Search-match highlighting toggle — `:noh` turns it off until the next search.
     search_hl: bool = true,
+    /// Last f/F/t/T target for `;` and `,` repeat (0 = none yet).
+    last_find_kind: u8 = 0,
+    last_find_cp: u21 = 0,
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
     popup: Popup = .{},
@@ -95,7 +98,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -685,6 +688,66 @@ pub const Editor = struct {
         return st.kind == .file;
     }
 
+    fn reverseFind(kind: u8) u8 {
+        return switch (kind) {
+            'f' => 'F',
+            'F' => 'f',
+            't' => 'T',
+            else => 't',
+        };
+    }
+
+    /// f/F/t/T motion: move to (or till) the nth occurrence of `cp` on the
+    /// current line. `t`/`T` skip a zero-progress target so repeats advance.
+    fn findChar(self: *Editor, kind: u8, cp: u21, count: u32) void {
+        const b = self.cur();
+        const line = b.lineText(b.row);
+        if (line.len == 0) return;
+        var ebuf: [4]u8 = undefined;
+        const elen = std.unicode.utf8Encode(cp, &ebuf) catch return;
+        const needle = ebuf[0..elen];
+        const n: usize = if (count == 0) 1 else count;
+        const col = b.col;
+        var left = n;
+        var target: ?usize = null;
+        switch (kind) {
+            'f', 't' => {
+                var i: usize = col + 1;
+                while (i < line.len) : (i += 1) {
+                    if (std.mem.startsWith(u8, line[i..], needle)) {
+                        const cand = if (kind == 't') i - 1 else i;
+                        if (cand <= col) continue; // `t` needs forward progress
+                        left -= 1;
+                        if (left == 0) {
+                            target = cand;
+                            break;
+                        }
+                    }
+                }
+            },
+            'F', 'T' => {
+                var i: usize = col;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.startsWith(u8, line[i..], needle)) {
+                        const cand = if (kind == 'T') i + 1 else i;
+                        if (cand >= col) continue; // `T` needs backward progress
+                        left -= 1;
+                        if (left == 0) {
+                            target = cand;
+                            break;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        if (target) |tc| {
+            b.col = Buffer.snapToCp(line, tc);
+            b.goal_col = @intCast(b.col);
+        }
+    }
+
     /// `gf`: open the file path under the cursor. Tries the token as-is
     /// (cwd-relative or absolute), then relative to the current file's dir.
     fn gotoFile(self: *Editor) !void {
@@ -1050,6 +1113,20 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .find_f, .find_t, .find_F, .find_T => {
+                const kind: u8 = switch (self.pending) {
+                    .find_f => 'f',
+                    .find_t => 't',
+                    .find_F => 'F',
+                    else => 'T',
+                };
+                self.pending = .none;
+                if (key.matches(vaxis.Key.escape, .{})) return ctx.consumeAndRedraw();
+                self.last_find_kind = kind;
+                self.last_find_cp = cp;
+                self.findChar(kind, cp, self.takeCount());
+                return ctx.consumeAndRedraw();
+            },
             .d => {
                 self.pending = .none;
                 const n = self.takeCount();
@@ -1372,6 +1449,14 @@ pub const Editor = struct {
                 b.goal_col = std.math.maxInt(u32);
             },
             'g' => self.pending = .g,
+            'f' => self.pending = .find_f,
+            'F' => self.pending = .find_F,
+            't' => self.pending = .find_t,
+            'T' => self.pending = .find_T,
+            ';' => if (self.last_find_kind != 0)
+                self.findChar(self.last_find_kind, self.last_find_cp, self.takeCount()),
+            ',' => if (self.last_find_kind != 0)
+                self.findChar(reverseFind(self.last_find_kind), self.last_find_cp, self.takeCount()),
             'G' => {
                 // `nG` jumps to line n; bare G goes to the last line.
                 self.pushJump();
