@@ -44,11 +44,12 @@ pub const Editor = struct {
     reg_linewise: bool = false,
     /// NvTerm-style bottom terminal split (Alt-h toggles it).
     term: ?Term = null,
-    term_open: bool = false,
-    /// Alt-i: same shell, but shown as a centered floating window instead.
-    term_float: bool = false,
+    /// Which view shows the shared shell: Alt-h split, Alt-v vertical, Alt-i float.
+    term_view: TermView = .none,
     term_h: u16 = 10,
     term_cols: u16 = 80,
+
+    const TermView = enum { none, split, vert, float };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
     const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b };
@@ -88,6 +89,7 @@ pub const Editor = struct {
         "Space t      theme picker",
         "Space x      close buffer",
         "Alt-h        terminal split",
+        "Alt-v        vertical terminal",
         "Alt-i        floating terminal",
         "Ctrl-n       toggle tree",
         "Ctrl-h       focus tree",
@@ -480,7 +482,7 @@ pub const Editor = struct {
         switch (event) {
             .init => return ctx.requestFocus(self.widget()),
             .tick => {
-                if (self.term_open or self.term_float) {
+                if (self.term_view != .none) {
                     if (self.term) |*t| {
                         if (t.poll()) ctx.redraw = true;
                     }
@@ -491,11 +493,13 @@ pub const Editor = struct {
             .key_press => |key| {
                 self.status_len = 0;
                 if (self.popup.kind != .none) return self.handlePopup(ctx, key);
-                // NvTerm: Alt-h toggles the bottom split, Alt-i the float.
+                // NvTerm: Alt-h bottom split, Alt-v vertical split, Alt-i float.
                 if (key.mods.alt and (key.codepoint == 'h' or key.codepoint == 'H'))
-                    return self.toggleTerm(ctx, false);
+                    return self.toggleTerm(ctx, .split);
+                if (key.mods.alt and (key.codepoint == 'v' or key.codepoint == 'V'))
+                    return self.toggleTerm(ctx, .vert);
                 if (key.mods.alt and (key.codepoint == 'i' or key.codepoint == 'I'))
-                    return self.toggleTerm(ctx, true);
+                    return self.toggleTerm(ctx, .float);
                 if (self.focus == .term)
                     return self.handleTerm(ctx, key);
                 if (self.focus == .tree and self.mode != .command)
@@ -1276,18 +1280,15 @@ pub const Editor = struct {
 
     // ---- integrated terminal (NvTerm-style) -------------------------------
 
-    /// Alt-h (split) / Alt-i (float): show/hide the terminal, spawning the
-    /// shell lazily. Both views share the same underlying PTY session.
-    fn toggleTerm(self: *Editor, ctx: *vxfw.EventContext, float: bool) !void {
-        const open = if (float) &self.term_float else &self.term_open;
-        const other = if (float) &self.term_open else &self.term_float;
-        if (open.*) {
-            open.* = false;
+    /// Alt-h (split) / Alt-v (vertical) / Alt-i (float): show/hide the
+    /// terminal, spawning the shell lazily. All views share one PTY session.
+    fn toggleTerm(self: *Editor, ctx: *vxfw.EventContext, view: TermView) !void {
+        if (self.term_view == view) {
+            self.term_view = .none;
             if (self.focus == .term) self.focus = .editor;
             ctx.consumeAndRedraw();
             return;
         }
-        other.* = false; // only one view at a time
         if (self.term == null) {
             self.term = Term.spawn(self.alloc, self.term_cols, self.term_h) catch {
                 self.setStatus("terminal: failed to spawn shell", .{});
@@ -1303,7 +1304,7 @@ pub const Editor = struct {
                 return;
             };
         }
-        open.* = true;
+        self.term_view = view;
         self.focus = .term;
         try ctx.tick(80, self.widget());
         ctx.consumeAndRedraw();
@@ -1367,12 +1368,19 @@ pub const Editor = struct {
         while (c < width) : (c += 1) surface.writeCell(x0 + c, top, .{ .style = bar_style });
         // NOTE: must be static strings — surface cells keep grapheme slices
         // alive until render, so stack-formatted labels would dangle.
-        const label = if (self.focus == .term)
-            (if (self.term_float) "  Terminal — Ctrl-x: editor · Alt-i: hide " else "  Terminal — Ctrl-x: editor · Alt-h: hide ")
-        else if (t.exited)
-            (if (self.term_float) "  Terminal [exited] — Alt-i: hide " else "  Terminal [exited] — Alt-h: hide ")
-        else
-            (if (self.term_float) "  Terminal — Alt-i: focus/hide " else "  Terminal — Alt-h: focus/hide ");
+        const label = if (self.focus == .term) switch (self.term_view) {
+            .float => "  Terminal — Ctrl-x: editor · Alt-i: hide ",
+            .vert => "  Terminal — Ctrl-x: editor · Alt-v: hide ",
+            else => "  Terminal — Ctrl-x: editor · Alt-h: hide ",
+        } else if (t.exited) switch (self.term_view) {
+            .float => "  Terminal [exited] — Alt-i: hide ",
+            .vert => "  Terminal [exited] — Alt-v: hide ",
+            else => "  Terminal [exited] — Alt-h: hide ",
+        } else switch (self.term_view) {
+            .float => "  Terminal — Alt-i: focus/hide ",
+            .vert => "  Terminal — Alt-v: focus/hide ",
+            else => "  Terminal — Alt-h: focus/hide ",
+        };
         _ = writeText(surface, ctx, x0, top, label[0..@min(label.len, width)], bar_style);
 
         // Output: last `rows` lines, cursor line last.
@@ -1512,9 +1520,15 @@ pub const Editor = struct {
         const th = self.theme.p;
         const text_top: u16 = 1; // row 0 is the tabline
         // Reserve the bottom split (title row + term_h) when the terminal is open.
-        const term_rows: u16 = if (self.term_open) @min(self.term_h, (max.height - 3) -| 1) else 0;
-        const term_total: u16 = if (self.term_open and term_rows > 0) term_rows + 1 else 0;
+        const term_rows: u16 = if (self.term_view == .split) @min(self.term_h, (max.height - 3) -| 1) else 0;
+        const term_total: u16 = if (self.term_view == .split and term_rows > 0) term_rows + 1 else 0;
         const text_rows: u16 = max.height - 2 - term_total;
+        // Alt-v: vertical terminal pane on the right edge of the text area.
+        const term_w: u16 = if (self.term_view == .vert and max.width > 40)
+            @min(max.width * 2 / 5, max.width - 30)
+        else
+            0;
+        const text_right: u16 = max.width - term_w;
         self.last_height = text_rows;
 
         // Keep the cursor visible.
@@ -1534,7 +1548,7 @@ pub const Editor = struct {
         var fill_row: u16 = text_top;
         while (fill_row < text_top + text_rows) : (fill_row += 1) {
             var fill_col: u16 = 0;
-            while (fill_col < max.width) : (fill_col += 1) {
+            while (fill_col < text_right) : (fill_col += 1) {
                 surface.writeCell(fill_col, fill_row, .{ .style = base });
             }
         }
@@ -1564,7 +1578,7 @@ pub const Editor = struct {
             var match: ?usize = if (pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
             var col: u16 = x0 + gutter;
             var i: usize = 0;
-            while (i < text.len and col < max.width) {
+            while (i < text.len and col < text_right) {
                 const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
                 const end = @min(i + cp_len, text.len);
                 const slice = text[i..end];
@@ -1581,13 +1595,13 @@ pub const Editor = struct {
                 }
                 if (slice[0] == '\t') {
                     const stop = x0 + gutter + (((col - x0 - gutter) / 4) + 1) * 4;
-                    while (col < stop and col < max.width) : (col += 1) {
+                    while (col < stop and col < text_right) : (col += 1) {
                         surface.writeCell(col, draw_row, .{ .style = style });
                     }
                 } else {
                     const w: u16 = @intCast(@min(ctx.stringWidth(slice), 4));
                     if (w > 0) {
-                        if (col + w > max.width) break;
+                        if (col + w > text_right) break;
                         surface.writeCell(col, draw_row, .{
                             .char = .{ .grapheme = slice, .width = @intCast(w) },
                             .style = style,
@@ -1606,7 +1620,7 @@ pub const Editor = struct {
             const guide_w = guideWidthFor(b, li);
             while (g < guide_w) : (g += 4) {
                 const cx = x0 + gutter + g;
-                if (cx >= max.width) break;
+                if (cx >= text_right) break;
                 surface.writeCell(cx, draw_row, .{
                     .char = .{ .grapheme = "▏", .width = 1 },
                     .style = gstyle,
@@ -1616,8 +1630,9 @@ pub const Editor = struct {
 
         if (tree_w > 0) self.drawTree(surface, ctx, text_top, text_rows, tree_w);
         if (term_total > 0) self.drawTerm(surface, ctx, 0, text_top + text_rows, term_rows, max.width);
+        if (term_w > 0) self.drawTerm(surface, ctx, text_right, text_top, text_rows - 1, term_w);
         self.drawStatus(surface, ctx, max.height - 1, max.width);
-        if (self.term_float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
+        if (self.term_view == .float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
             return surface;
@@ -1639,7 +1654,17 @@ pub const Editor = struct {
                     .shape = .block,
                 };
             }
-        } else if (self.focus == .term and self.term_float) {
+        } else if (self.focus == .term and term_w > 0) {
+            if (self.term) |*t| {
+                const rows = text_rows - 1;
+                const cur_row: u16 = @intCast(@min(t.lines.items.len -| 1, rows -| 1));
+                surface.cursor = .{
+                    .row = text_top + 1 + cur_row,
+                    .col = @intCast(@min(text_right + t.col, max.width - 1)),
+                    .shape = .block,
+                };
+            }
+        } else if (self.focus == .term and self.term_view == .float) {
             if (self.term) |*t| {
                 if (termFloatRect(max.width, max.height - 1)) |rect| {
                     const rows = rect.h - 1;
