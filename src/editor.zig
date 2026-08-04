@@ -623,6 +623,41 @@ pub const Editor = struct {
         b.goal_col = @intCast(b.col);
     }
 
+    /// `%`: jump to the matching bracket. Vim-style: scan right from the
+    /// cursor to the first bracket on the line, then walk the buffer with a
+    /// nesting depth counter. Pushes the jumplist on success.
+    fn matchPair(self: *Editor) void {
+        const b = self.cur();
+        const text = b.buf.items;
+        const pairs = "()[]{}";
+        const line_start = b.lines.items[b.row].start;
+        const line_end = line_start + b.lineLen(b.row);
+        var pos = line_start + @min(b.col, b.lineLen(b.row));
+        while (pos < line_end and std.mem.indexOfScalar(u8, pairs, text[pos]) == null) pos += 1;
+        if (pos >= line_end) return self.setStatus("no matching pair", .{});
+        const c = text[pos];
+        const idx = std.mem.indexOfScalar(u8, pairs, c).?;
+        const fwd = idx % 2 == 0;
+        const other = if (fwd) pairs[idx + 1] else pairs[idx - 1];
+        var depth: u32 = 0;
+        var p = pos;
+        while (true) {
+            if (text[p] == c) depth += 1 else if (text[p] == other) {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+            if (fwd) {
+                p += 1;
+                if (p >= text.len) return self.setStatus("no matching pair", .{});
+            } else {
+                if (p == 0) return self.setStatus("no matching pair", .{});
+                p -= 1;
+            }
+        }
+        self.pushJump();
+        b.setCursorFromByte(p);
+    }
+
     /// Consume the pending count prefix (defaults to 1).
     fn takeCount(self: *Editor) u32 {
         const n = if (self.count == 0) 1 else self.count;
@@ -972,6 +1007,7 @@ pub const Editor = struct {
                 b.col = b.firstNonWs(b.row);
                 b.goal_col = b.col;
             },
+            '%' => self.matchPair(),
             '$', vaxis.Key.end => {
                 const len = b.lineLen(b.row);
                 b.col = if (len == 0) 0 else Buffer.snapToCp(b.lineText(b.row), len - 1);
@@ -1265,6 +1301,7 @@ pub const Editor = struct {
                 b.col = b.firstNonWs(b.row);
                 b.goal_col = @intCast(b.col);
             },
+            '%' => self.matchPair(),
             '$', vaxis.Key.end => {
                 const len = b.lineLen(b.row);
                 b.col = if (len == 0) 0 else Buffer.snapToCp(b.lineText(b.row), len - 1);
