@@ -40,6 +40,7 @@ pub const Editor = struct {
     recording: ?u8 = null,
     /// Last register replayed with `@`, reused by `@@`.
     last_macro: ?u8 = null,
+    surround_from: u8 = 0,
     /// Replay re-entrancy depth; guards runaway recursive macros.
     replay_depth: u8 = 0,
     /// Dot-repeat: keys of the last completed change (`.` replays them).
@@ -89,7 +90,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -141,6 +142,9 @@ pub const Editor = struct {
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
+        "cs \" '       change surround",
+        "ds ( \" ...   delete surround",
+        "S( (visual)  wrap selection",
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
     };
@@ -900,7 +904,37 @@ pub const Editor = struct {
             .d => {
                 self.pending = .none;
                 const n = self.takeCount();
-                if (cp == 'd') for (0..n) |_| try b.deleteLine();
+                if (cp == 'd') {
+                    for (0..n) |_| try b.deleteLine();
+                } else if (cp == 's') {
+                    self.pending = .surround_del;
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .c_op => {
+                self.pending = if (cp == 's') .surround_old else .none;
+                return ctx.consumeAndRedraw();
+            },
+            .surround_old => {
+                self.pending = .none;
+                if (cp < 0x80) {
+                    self.surround_from = @intCast(cp);
+                    self.pending = .surround_new;
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .surround_new => {
+                self.pending = .none;
+                if (cp < 0x80) try self.changeSurround(self.surround_from, @intCast(cp));
+                return ctx.consumeAndRedraw();
+            },
+            .surround_del => {
+                self.pending = .none;
+                if (cp < 0x80) try self.changeSurround(@intCast(cp), 0);
+                return ctx.consumeAndRedraw();
+            },
+            .surround_vis => {
+                self.pending = .none;
                 return ctx.consumeAndRedraw();
             },
             .mark_set => {
@@ -1069,6 +1103,7 @@ pub const Editor = struct {
                 }
             },
             'd' => self.pending = .d,
+            'c' => self.pending = .c_op,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
             'm' => self.pending = .mark_set,
@@ -1180,6 +1215,92 @@ pub const Editor = struct {
     }
 
     /// Byte range [start, end) of the current selection, or null.
+    // ---- surround (cs / ds / visual S) --------------------------------
+    fn surroundPair(ch: u8) ?[2]u8 {
+        return switch (ch) {
+            '(', ')', 'b' => .{ '(', ')' },
+            '[', ']' => .{ '[', ']' },
+            '{', '}', 'B' => .{ '{', '}' },
+            '<', '>' => .{ '<', '>' },
+            '"' => .{ '"', '"' },
+            '\'' => .{ '\'', '\'' },
+            '`' => .{ '`', '`' },
+            else => null,
+        };
+    }
+
+    /// Byte offsets of the enclosing open/close delimiters, or null.
+    /// Quotes pair up sequentially on the current line; brackets scan the
+    /// whole buffer nesting-aware.
+    fn findSurround(b: *Buffer, open: u8, close: u8) ?[2]usize {
+        const text = b.buf.items;
+        const cpos = b.cursorByte();
+        if (open == close) {
+            const line = b.lines.items[b.row];
+            var fallback: ?[2]usize = null;
+            var o: ?usize = null;
+            var i = line.start;
+            while (i < line.end) : (i += 1) {
+                if (text[i] != open) continue;
+                if (o) |op| {
+                    if (cpos >= op and cpos <= i) return .{ op, i };
+                    if (fallback == null and op > cpos) fallback = .{ op, i };
+                    o = null;
+                } else o = i;
+            }
+            return fallback;
+        }
+        // Bracket: walk back to the unmatched opener, then forward to its match.
+        var o: ?usize = null;
+        if (cpos < text.len and text[cpos] == open) {
+            o = cpos;
+        } else {
+            var depth: usize = 0;
+            var i = @min(cpos, text.len);
+            while (i > 0) {
+                i -= 1;
+                if (text[i] == close) {
+                    depth += 1;
+                } else if (text[i] == open) {
+                    if (depth == 0) {
+                        o = i;
+                        break;
+                    }
+                    depth -= 1;
+                }
+            }
+        }
+        const oo = o orelse return null;
+        var depth: usize = 0;
+        var j = oo + 1;
+        while (j < text.len) : (j += 1) {
+            if (text[j] == open) {
+                depth += 1;
+            } else if (text[j] == close) {
+                if (depth == 0) return .{ oo, j };
+                depth -= 1;
+            }
+        }
+        return null;
+    }
+
+    /// `to == 0` deletes the surrounding pair (ds); otherwise replaces it (cs).
+    fn changeSurround(self: *Editor, from: u8, to: u8) !void {
+        const b = self.cur();
+        const old = surroundPair(from) orelse return self.setStatus("unknown pair: {c}", .{from});
+        const pos = findSurround(b, old[0], old[1]) orelse
+            return self.setStatus("no surrounding {c}", .{old[0]});
+        if (to == 0) {
+            try b.replaceRange(pos[1], pos[1] + 1, "");
+            try b.replaceRange(pos[0], pos[0] + 1, "");
+        } else {
+            const new = surroundPair(to) orelse return self.setStatus("unknown pair: {c}", .{to});
+            try b.replaceRange(pos[1], pos[1] + 1, &.{new[1]});
+            try b.replaceRange(pos[0], pos[0] + 1, &.{new[0]});
+        }
+        b.setCursorFromByte(pos[0]);
+    }
+
     fn selRange(self: *Editor) ?[2]usize {
         if (self.mode != .visual and self.mode != .visual_line) return null;
         if (self.buffers.items.len == 0) return null;
@@ -1220,6 +1341,19 @@ pub const Editor = struct {
         const cp = key.shifted_codepoint orelse key.codepoint;
         const half: i64 = @max(1, self.last_height / 2);
 
+        if (self.pending == .surround_vis) {
+            self.pending = .none;
+            if (cp < 0x80) if (surroundPair(@intCast(cp))) |p| {
+                if (self.selRange()) |r| {
+                    try b.replaceRange(r[1], r[1], &.{p[1]});
+                    try b.replaceRange(r[0], r[0], &.{p[0]});
+                    self.exitVisual();
+                    b.setCursorFromByte(r[0]);
+                }
+            };
+            return ctx.consumeAndRedraw();
+        }
+
         if (self.pending == .leader) {
             self.pending = .none;
             if (cp == '/') {
@@ -1257,6 +1391,7 @@ pub const Editor = struct {
             } else {
                 self.mode = .visual_line;
             },
+            'S' => self.pending = .surround_vis,
             'J' => {
                 const lo = @min(self.vis_row, b.row);
                 const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
