@@ -34,9 +34,21 @@ pub const Editor = struct {
     focus: Focus = .editor,
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
+    /// Macro registers: `q{a-z}` records raw key events, `@{a-z}` replays.
+    macros: [26]std.ArrayListUnmanaged(vaxis.Key) = [_]std.ArrayListUnmanaged(vaxis.Key){.{}} ** 26,
+    /// Register char ('a'..'z') currently being recorded into, if any.
+    recording: ?u8 = null,
+    /// Last register replayed with `@`, reused by `@@`.
+    last_macro: ?u8 = null,
+    /// Replay re-entrancy depth; guards runaway recursive macros.
+    replay_depth: u8 = 0,
     /// Visual-mode anchor (the end of the selection that does not move).
     vis_row: usize = 0,
     vis_col: usize = 0,
+    /// Double-click detection: time + position of the previous text-area click.
+    last_click_ms: i64 = 0,
+    last_click_row: usize = 0,
+    last_click_col: usize = 0,
     /// Last visual selection, for `gv` reselect: mode + anchor + cursor.
     last_vis: ?struct { mode: Mode, ar: usize, ac: usize, cr: usize, cc: usize } = null,
     /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
@@ -48,11 +60,26 @@ pub const Editor = struct {
     term_view: TermView = .none,
     term_h: u16 = 10,
     term_cols: u16 = 80,
+    /// mouse=a: layout snapshot + tabline hit spans from the last draw.
+    mlay: MouseLayout = .{},
+    tab_spans: [32]TabSpan = undefined,
+    tab_span_count: usize = 0,
 
     const TermView = enum { none, split, vert, float };
 
+    /// Geometry captured during draw so mouse clicks can be hit-tested.
+    const MouseLayout = struct {
+        tree_w: u16 = 0,
+        gutter: u16 = 0,
+        text_top: u16 = 1,
+        text_rows: u16 = 0,
+        text_right: u16 = 0,
+        valid: bool = false,
+    };
+    const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
+
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play };
     const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
 
@@ -191,6 +218,7 @@ pub const Editor = struct {
         self.clearGrep();
         self.grep_hits.deinit(self.alloc);
         self.tree.deinit();
+        for (&self.macros) |*m| m.deinit(self.alloc);
         if (self.term) |*t| t.deinit();
     }
 
@@ -490,8 +518,22 @@ pub const Editor = struct {
                 }
                 return;
             },
+            .mouse => |m| return self.handleMouse(ctx, m),
             .key_press => |key| {
                 self.status_len = 0;
+                // Record live keys into the active macro register. The `q`
+                // that stops recording is popped again in handleNormal.
+                if (self.recording != null and self.replay_depth == 0)
+                    try self.macros[self.recording.? - 'a'].append(self.alloc, key);
+                try self.dispatchKey(ctx, key);
+            },
+            else => {},
+        }
+    }
+
+    /// Route one key press by focus/mode; shared by live input and macro replay.
+    fn dispatchKey(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) anyerror!void {
+        {
                 if (self.popup.kind != .none) return self.handlePopup(ctx, key);
                 // NvTerm: Alt-h bottom split, Alt-v vertical split, Alt-i float.
                 if (key.mods.alt and (key.codepoint == 'h' or key.codepoint == 'H'))
@@ -512,9 +554,19 @@ pub const Editor = struct {
                     .command => try self.handleCommand(ctx, key),
                     .visual, .visual_line => try self.handleVisual(ctx, key),
                 }
-            },
-            else => {},
         }
+    }
+
+    /// Replay a recorded macro register through the normal key dispatch path.
+    fn playMacro(self: *Editor, ctx: *vxfw.EventContext, idx: u8) !void {
+        if (self.replay_depth >= 8) return; // recursion guard for @-in-macro
+        self.replay_depth += 1;
+        defer self.replay_depth -= 1;
+        // Replay a copy: dispatched keys could start a re-record (`q`) that
+        // clears the very register we are iterating.
+        const keys = try self.alloc.dupe(vaxis.Key, self.macros[idx].items);
+        defer self.alloc.free(keys);
+        for (keys) |k| try self.dispatchKey(ctx, k);
     }
 
     /// Keys on the NvDash-style start screen (no buffers open).
@@ -654,6 +706,46 @@ pub const Editor = struct {
                 if (cp == 'd') try b.deleteLine();
                 return ctx.consumeAndRedraw();
             },
+            .mark_set => {
+                self.pending = .none;
+                if (cp >= 'a' and cp <= 'z')
+                    b.marks[@intCast(cp - 'a')] = .{ .row = b.row, .col = b.col };
+                return ctx.consumeAndRedraw();
+            },
+            .mark_exact, .mark_line => {
+                const line_only = self.pending == .mark_line;
+                self.pending = .none;
+                if (cp >= 'a' and cp <= 'z') {
+                    if (b.marks[@intCast(cp - 'a')]) |mk| {
+                        b.row = @min(mk.row, b.lastRow());
+                        b.col = mk.col;
+                        b.clampCol(false);
+                        if (line_only) b.col = b.firstNonWs(b.row);
+                        b.goal_col = b.col;
+                    } else self.setStatus("mark not set", .{});
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .macro_rec => {
+                self.pending = .none;
+                if (cp >= 'a' and cp <= 'z') {
+                    self.recording = @intCast(cp);
+                    self.macros[@intCast(cp - 'a')].clearRetainingCapacity();
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .macro_play => {
+                self.pending = .none;
+                const reg: u21 = if (cp == '@') (self.last_macro orelse {
+                    self.setStatus("no previous macro", .{});
+                    return ctx.consumeAndRedraw();
+                }) else cp;
+                if (reg >= 'a' and reg <= 'z') {
+                    self.last_macro = @intCast(reg);
+                    try self.playMacro(ctx, @intCast(reg - 'a'));
+                }
+                return ctx.consumeAndRedraw();
+            },
             .leader => {
                 self.pending = .none;
                 switch (cp) {
@@ -753,6 +845,18 @@ pub const Editor = struct {
             'd' => self.pending = .d,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
+            'm' => self.pending = .mark_set,
+            '`' => self.pending = .mark_exact,
+            '\'' => self.pending = .mark_line,
+            'q' => {
+                if (self.recording) |r| {
+                    // Drop the just-recorded stop key, then finish.
+                    _ = self.macros[r - 'a'].pop();
+                    self.recording = null;
+                    self.setStatus("recorded @{c}", .{r});
+                } else self.pending = .macro_rec;
+            },
+            '@' => self.pending = .macro_play,
             '/' => {
                 self.mode = .command;
                 self.cmd_is_search = true;
@@ -1456,6 +1560,166 @@ pub const Editor = struct {
 
     /// NvimTree-ish keys: j/k move, Enter/l open or toggle dir, h collapse /
     /// jump to parent, R refresh, q or C-n close, C-l back to the editor.
+    /// mouse=a: clicks focus panes / place the cursor, tab clicks switch
+    /// (and close on the ×), tree clicks select then open, wheel scrolls.
+    fn handleMouse(self: *Editor, ctx: *vxfw.EventContext, m: vaxis.Mouse) !void {
+        if (!self.mlay.valid) return;
+        if (self.popup.kind != .none) return; // popups stay keyboard-driven
+        if (self.buffers.items.len == 0) return;
+        const L = self.mlay;
+        const b = self.cur();
+
+        // Wheel: scroll whichever pane is under the pointer.
+        if (m.button == .wheel_up or m.button == .wheel_down) {
+            const down = m.button == .wheel_down;
+            if (L.tree_w > 0 and m.col < L.tree_w) {
+                const t = &self.tree;
+                if (down) {
+                    t.selected = @min(t.selected + 3, t.entries.items.len -| 1);
+                } else {
+                    t.selected -|= 3;
+                }
+            } else {
+                const rows: usize = @max(1, L.text_rows);
+                if (down) {
+                    b.scroll = @min(b.scroll + 3, b.lines.items.len -| 1);
+                } else {
+                    b.scroll -|= 3;
+                }
+                // vim-style: the cursor trails the viewport
+                if (b.row < b.scroll) b.row = b.scroll;
+                if (b.row >= b.scroll + rows) b.row = b.scroll + rows - 1;
+                b.row = @min(b.row, b.lines.items.len -| 1);
+                b.col = @min(b.col, b.lineLen(b.row));
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        // Drag with the left button: extend a (charwise) visual selection.
+        if (m.type == .drag and m.button == .left) {
+            if (self.focus != .editor) return;
+            if (m.row >= L.text_top and m.row < L.text_top + L.text_rows and
+                m.col >= L.tree_w and m.col < L.text_right)
+            {
+                if (self.mode != .visual and self.mode != .visual_line)
+                    self.enterVisual(.visual);
+                const li = @min(b.scroll + (m.row - L.text_top), b.lines.items.len -| 1);
+                b.row = li;
+                b.col = byteColForWidth(b.lineText(li), m.col -| (L.tree_w + L.gutter));
+                return ctx.consumeAndRedraw();
+            }
+            return;
+        }
+
+        if (m.type != .press or m.button != .left) return;
+
+        // Tabline: click switches, click on the active tab's × closes.
+        if (m.row == 0) {
+            for (self.tab_spans[0..self.tab_span_count]) |sp| {
+                if (m.col >= sp.start and m.col < sp.end) {
+                    if (m.col == sp.close and sp.idx == self.active) {
+                        self.closeBuffer(ctx, false);
+                    } else {
+                        self.active = sp.idx;
+                        self.focus = .editor;
+                    }
+                    return ctx.consumeAndRedraw();
+                }
+            }
+            return;
+        }
+
+        // File tree: first click selects, click on the selection activates.
+        if (L.tree_w > 0 and m.col < L.tree_w and
+            m.row >= L.text_top and m.row < L.text_top + L.text_rows)
+        {
+            const t = &self.tree;
+            const idx = t.scroll + (m.row - L.text_top);
+            if (idx < t.entries.items.len) {
+                const again = self.focus == .tree and idx == t.selected;
+                self.focus = .tree;
+                t.selected = idx;
+                if (again) {
+                    const e = t.entries.items[idx];
+                    if (e.is_dir) {
+                        t.toggle(idx) catch {};
+                    } else {
+                        self.openFile(e.path) catch {
+                            self.setStatus("could not open {s}", .{e.path});
+                            return ctx.consumeAndRedraw();
+                        };
+                        self.focus = .editor;
+                    }
+                }
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        // Text area: focus + place the cursor.
+        if (m.row >= L.text_top and m.row < L.text_top + L.text_rows and
+            m.col >= L.tree_w and m.col < L.text_right)
+        {
+            self.focus = .editor;
+            // A plain click cancels any active visual selection (vim mouse=a).
+            if (self.mode == .visual or self.mode == .visual_line)
+                self.exitVisual();
+            const li = b.scroll + (m.row - L.text_top);
+            if (li < b.lines.items.len) {
+                b.row = li;
+                const want: u16 = m.col -| (L.tree_w + L.gutter);
+                b.col = byteColForWidth(b.lineText(li), want);
+                b.goal_col = b.col;
+                // Double-click on the same spot selects the word under it.
+                const now = std.time.milliTimestamp();
+                if (now - self.last_click_ms < 400 and
+                    b.row == self.last_click_row and b.col == self.last_click_col)
+                {
+                    self.selectWordAt(b);
+                    self.last_click_ms = 0; // triple-click starts over
+                } else {
+                    self.last_click_ms = now;
+                    self.last_click_row = b.row;
+                    self.last_click_col = b.col;
+                }
+            }
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    /// Double-click: visually select the word (or symbol run) under the cursor.
+    fn selectWordAt(self: *Editor, b: *Buffer) void {
+        const line = b.lineText(b.row);
+        if (line.len == 0) return;
+        const at = @min(b.col, line.len - 1);
+        const cls = Buffer.wordClass(line[at]);
+        if (cls == 0) return; // whitespace: nothing to select
+        var s = at;
+        var e = at;
+        while (s > 0 and Buffer.wordClass(line[s - 1]) == cls) s -= 1;
+        while (e + 1 < line.len and Buffer.wordClass(line[e + 1]) == cls) e += 1;
+        self.mode = .visual;
+        self.vis_row = b.row;
+        self.vis_col = s;
+        b.col = Buffer.snapToCp(line, e);
+    }
+
+    /// Inverse of displayCol: byte offset whose display column reaches `want`.
+    fn byteColForWidth(text: []const u8, want: u16) usize {
+        var disp: u16 = 0;
+        var i: usize = 0;
+        while (i < text.len and disp < want) {
+            const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            const end = @min(i + cp_len, text.len);
+            if (text[i] == '\t') {
+                disp = (disp / 4 + 1) * 4;
+            } else {
+                disp += 1;
+            }
+            i = end;
+        }
+        return i;
+    }
+
     fn handleTree(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const t = &self.tree;
         const cp = key.shifted_codepoint orelse key.codepoint;
@@ -1513,6 +1777,8 @@ pub const Editor = struct {
         const self: *Editor = @ptrCast(@alignCast(ptr));
         const max = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), max);
+        self.mlay.valid = false;
+        self.tab_span_count = 0;
         if (max.width == 0 or max.height < 3) return surface;
         if (self.buffers.items.len == 0) return self.drawDash(surface, ctx, max);
 
@@ -1540,6 +1806,15 @@ pub const Editor = struct {
         const gutter: u16 = @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 3); // sign col + digits + pad
         const gutter_style: vaxis.Style = .{ .fg = th.gutter, .bg = th.bg };
         const cursor_ln_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bg };
+
+        self.mlay = .{
+            .tree_w = tree_w,
+            .gutter = gutter,
+            .text_top = text_top,
+            .text_rows = text_rows,
+            .text_right = text_right,
+            .valid = true,
+        };
 
         self.drawTabline(surface, ctx, max.width);
 
@@ -1834,6 +2109,16 @@ pub const Editor = struct {
         col = 0;
         for (self.buffers.items[first..], first..) |*b, i| {
             if (col >= avail) break;
+            if (self.tab_span_count < self.tab_spans.len) {
+                const tab_end = @min(col + widths[i], avail);
+                self.tab_spans[self.tab_span_count] = .{
+                    .start = col,
+                    .end = tab_end,
+                    .close = tab_end -| 2,
+                    .idx = i,
+                };
+                self.tab_span_count += 1;
+            }
             const is_active = i == self.active;
             const bg = if (is_active) th.bg else th.bar_bg;
             const icon = fileIcon(b.file_name, th);
@@ -1916,6 +2201,12 @@ pub const Editor = struct {
             .command => unreachable,
         };
         var end = writeText(surface, ctx, 0, status_row, mode_txt, mode_style);
+
+        if (self.recording) |r| {
+            const seg = std.fmt.allocPrint(ctx.arena, " REC @{c} ", .{r}) catch return;
+            const rec_style: vaxis.Style = .{ .fg = th.badge_fg, .bg = th.red, .bold = true };
+            end = writeText(surface, ctx, end, status_row, seg, rec_style);
+        }
 
         if (self.git_branch_len > 0) {
             const seg = std.fmt.allocPrint(ctx.arena, "  {s} ", .{

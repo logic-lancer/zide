@@ -25,6 +25,11 @@ pub const Buffer = struct {
     /// Refreshed on open/save; may be shorter than `lines` after edits.
     git_signs: std.ArrayListUnmanaged(Sign) = .{},
 
+    /// a-z vim marks (`m{a-z}`); positions are clamped when jumped to, so
+    /// stale marks after edits degrade gracefully instead of invalidating.
+    marks: [26]?Mark = [_]?Mark{null} ** 26,
+
+    pub const Mark = struct { row: usize, col: usize };
     pub const Sign = enum(u8) { none, add, change, delete };
 
     pub const Line = struct { start: u32, end: u32 };
@@ -333,7 +338,7 @@ pub const Buffer = struct {
         self.clampCol(insert);
     }
 
-    fn wordClass(b: u8) u8 {
+    pub fn wordClass(b: u8) u8 {
         if (b == ' ' or b == '\t' or b == '\n' or b == '\r') return 0;
         if (std.ascii.isAlphanumeric(b) or b == '_' or b >= 0x80) return 1;
         return 2;
