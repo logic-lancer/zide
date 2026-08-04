@@ -145,6 +145,7 @@ pub const Editor = struct {
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
         "gg / G       top / bottom",
+        "gf           goto file under cursor",
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
@@ -672,6 +673,50 @@ pub const Editor = struct {
         }
     }
 
+    fn isPathChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or switch (c) {
+            '_', '-', '.', '/', '~', '+', '@' => true,
+            else => false,
+        };
+    }
+
+    fn fileExists(path: []const u8) bool {
+        const st = std.fs.cwd().statFile(path) catch return false;
+        return st.kind == .file;
+    }
+
+    /// `gf`: open the file path under the cursor. Tries the token as-is
+    /// (cwd-relative or absolute), then relative to the current file's dir.
+    fn gotoFile(self: *Editor) !void {
+        const b = self.cur();
+        const line = b.lineText(b.row);
+        if (line.len == 0) return self.setStatus("no file name under cursor", .{});
+        const col = @min(b.col, line.len - 1);
+        if (!isPathChar(line[col])) return self.setStatus("no file name under cursor", .{});
+        var s = col;
+        while (s > 0 and isPathChar(line[s - 1])) s -= 1;
+        var e = col + 1;
+        while (e < line.len and isPathChar(line[e])) e += 1;
+        // Trim leading '@' (Zig builtins like @import) and stray trailing dots.
+        var tok = line[s..e];
+        while (tok.len > 0 and tok[0] == '@') tok = tok[1..];
+        while (tok.len > 0 and tok[tok.len - 1] == '.') tok = tok[0 .. tok.len - 1];
+        if (tok.len == 0) return self.setStatus("no file name under cursor", .{});
+        if (fileExists(tok)) {
+            self.pushJump();
+            return self.openFile(tok);
+        }
+        if (std.fs.path.dirname(b.file_name)) |dir| {
+            const joined = try std.fs.path.join(self.alloc, &.{ dir, tok });
+            defer self.alloc.free(joined);
+            if (fileExists(joined)) {
+                self.pushJump();
+                return self.openFile(joined);
+            }
+        }
+        self.setStatus("E447: can't find file \"{s}\"", .{tok});
+    }
+
     /// Record the current position before a "big" jump (G/gg, n/N, marks,
     /// file switches). Truncates any forward (Ctrl-i) history, vim-style.
     fn pushJump(self: *Editor) void {
@@ -1000,6 +1045,8 @@ pub const Editor = struct {
                     b.goal_col = @intCast(b.col);
                 } else if (cp == 'v') {
                     self.reselectVisual();
+                } else if (cp == 'f') {
+                    self.gotoFile() catch {};
                 }
                 return ctx.consumeAndRedraw();
             },
