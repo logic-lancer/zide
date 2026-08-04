@@ -100,7 +100,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -147,6 +147,9 @@ pub const Editor = struct {
         "Ctrl-l       focus editor",
         "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-d/u     half-page down/up",
+        "Ctrl-e/y     scroll line down/up",
+        "zz/zt/zb     center/top/bottom",
+        "H / M / L    screen top/mid/bottom",
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
         "gg / G       top / bottom",
@@ -1157,6 +1160,17 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .z => {
+                self.pending = .none;
+                const h: usize = @max(1, self.last_height);
+                switch (cp) {
+                    'z' => b.scroll = b.row -| (h / 2),
+                    't' => b.scroll = b.row,
+                    'b' => b.scroll = b.row -| (h -| 1),
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
             .find_f, .find_t, .find_F, .find_T => {
                 const kind: u8 = switch (self.pending) {
                     .find_f => 'f',
@@ -1463,6 +1477,21 @@ pub const Editor = struct {
                 'c' => ctx.quit = true,
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
+                'e' => {
+                    b.scroll = @min(b.scroll + 1, b.lastRow());
+                    if (b.row < b.scroll) {
+                        b.row = b.scroll;
+                        b.clampCol(false);
+                    }
+                },
+                'y' => {
+                    b.scroll -|= 1;
+                    const vh: usize = @max(1, self.last_height);
+                    if (b.row >= b.scroll + vh) {
+                        b.row = b.scroll + vh - 1;
+                        b.clampCol(false);
+                    }
+                },
                 'n' => self.toggleTree(),
                 'o' => self.jumpBack(),
                 'i' => self.jumpFwd(),
@@ -1511,6 +1540,19 @@ pub const Editor = struct {
                 b.goal_col = std.math.maxInt(u32);
             },
             'g' => self.pending = .g,
+            'z' => self.pending = .z,
+            'H' => {
+                b.row = @min(b.scroll, b.lastRow());
+                b.clampCol(false);
+            },
+            'M' => {
+                b.row = @min(b.scroll + self.last_height / 2, b.lastRow());
+                b.clampCol(false);
+            },
+            'L' => {
+                b.row = @min(b.scroll + @max(@as(usize, self.last_height), 1) - 1, b.lastRow());
+                b.clampCol(false);
+            },
             'f' => self.pending = .find_f,
             'F' => self.pending = .find_F,
             't' => self.pending = .find_t,
@@ -1931,6 +1973,21 @@ pub const Editor = struct {
                 'c' => ctx.quit = true,
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
+                'e' => {
+                    b.scroll = @min(b.scroll + 1, b.lastRow());
+                    if (b.row < b.scroll) {
+                        b.row = b.scroll;
+                        b.clampCol(false);
+                    }
+                },
+                'y' => {
+                    b.scroll -|= 1;
+                    const vh: usize = @max(1, self.last_height);
+                    if (b.row >= b.scroll + vh) {
+                        b.row = b.scroll + vh - 1;
+                        b.clampCol(false);
+                    }
+                },
                 else => return,
             }
             return ctx.consumeAndRedraw();
