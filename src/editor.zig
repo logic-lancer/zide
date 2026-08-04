@@ -1365,15 +1365,89 @@ pub const Editor = struct {
                 b.goal_col = b.col;
             },
             vaxis.Key.enter => try b.insertText("\n"),
-            vaxis.Key.backspace => try b.backspace(),
+            vaxis.Key.backspace => try backspacePair(b),
             vaxis.Key.tab => try b.insertText("    "),
             else => {
                 if (key.mods.ctrl or key.mods.alt) return;
                 const text = key.text orelse return;
+                if (text.len == 1 and try autoPair(b, text[0])) {
+                    ctx.consumeAndRedraw();
+                    return;
+                }
                 try b.insertText(text);
             },
         }
         ctx.consumeAndRedraw();
+    }
+
+    /// nvim-autopairs behavior for a single typed byte. Returns true when the
+    /// key was fully handled (pair inserted or closer skipped).
+    fn autoPair(b: *Buffer, ch: u8) !bool {
+        const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+        const text = b.buf.items;
+        const at: u8 = if (pos < text.len) text[pos] else '\n';
+        switch (ch) {
+            '(', '[', '{' => {
+                const close: u8 = switch (ch) {
+                    '(' => ')',
+                    '[' => ']',
+                    else => '}',
+                };
+                try b.insertText(&.{ ch, close });
+                b.col -= 1;
+                b.goal_col = b.col;
+                return true;
+            },
+            ')', ']', '}' => {
+                if (at != ch) return false;
+                b.col += 1;
+                b.goal_col = b.col;
+                return true;
+            },
+            '"', '\'', '`' => {
+                if (at == ch) {
+                    b.col += 1;
+                    b.goal_col = b.col;
+                    return true;
+                }
+                // No `'` pairing right after a word char (it's, lifetimes).
+                if (ch == '\'' and pos > 0 and Buffer.wordClass(text[pos - 1]) == 1)
+                    return false;
+                try b.insertText(&.{ ch, ch });
+                b.col -= 1;
+                b.goal_col = b.col;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Backspace between the two halves of an empty pair removes both.
+    fn backspacePair(b: *Buffer) !void {
+        const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+        const text = b.buf.items;
+        var kill_mate = false;
+        if (pos > 0 and pos < text.len) {
+            const mate: u8 = switch (text[pos - 1]) {
+                '(' => ')',
+                '[' => ']',
+                '{' => '}',
+                '"', '\'', '`' => text[pos - 1],
+                else => 0,
+            };
+            kill_mate = mate != 0 and text[pos] == mate;
+        }
+        // Opener first: deleting the closer while the cursor sits at line end
+        // would let the EOL clamp drag the cursor before backspace runs.
+        try b.backspace();
+        if (kill_mate) {
+            // deleteCharAtCursor applies the normal-mode EOL clamp; restore
+            // the insert-mode column so later typing stays put.
+            const keep = b.col;
+            try b.deleteCharAtCursor();
+            b.col = @min(keep, b.lineLen(b.row));
+            b.goal_col = b.col;
+        }
     }
 
     fn handleCommand(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {

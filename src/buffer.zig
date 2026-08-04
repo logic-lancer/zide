@@ -428,7 +428,15 @@ pub const Buffer = struct {
     pub fn insertText(self: *Buffer, text: []const u8) !void {
         const pos = self.cursorByte();
         try self.replaceRange(pos, pos, text);
-        self.setCursorFromByte(pos + text.len);
+        // Insert-mode clamp: the cursor may rest at line end (col == len),
+        // unlike setCursorFromByte's normal-mode clamp which would pull an
+        // end-of-line insert back one column.
+        const target = @min(pos + text.len, self.buf.items.len);
+        const li = self.lineOfByte(target);
+        self.row = li;
+        self.col = target - self.lines.items[li].start;
+        self.clampCol(true);
+        self.goal_col = self.col;
     }
 
     pub fn backspace(self: *Buffer) !void {
