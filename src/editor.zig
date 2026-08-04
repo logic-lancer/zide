@@ -91,7 +91,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -989,6 +989,18 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .indent_gt, .indent_lt => {
+                const dedent = self.pending == .indent_lt;
+                self.pending = .none;
+                if ((dedent and cp == '<') or (!dedent and cp == '>')) {
+                    const n = self.takeCount();
+                    const hi = @min(b.row + n - 1, b.lines.items.len - 1);
+                    try b.indentRows(b.row, hi, dedent);
+                    b.col = b.firstNonWs(b.row);
+                    b.goal_col = @intCast(b.col);
+                }
+                return ctx.consumeAndRedraw();
+            },
             .y_op => {
                 self.pending = .none;
                 const n = self.takeCount();
@@ -1227,6 +1239,8 @@ pub const Editor = struct {
             'd' => self.pending = .d,
             'c' => self.pending = .c_op,
             'y' => self.pending = .y_op,
+            '>' => self.pending = .indent_gt,
+            '<' => self.pending = .indent_lt,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
             'm' => self.pending = .mark_set,
@@ -1579,6 +1593,12 @@ pub const Editor = struct {
             return ctx.consumeAndRedraw();
         }
 
+        // Count prefix for visual operators (e.g. `3>`).
+        if (!key.mods.ctrl and cp >= '0' and cp <= '9' and (cp != '0' or self.count > 0)) {
+            self.count = @min(self.count * 10 + @as(u32, @intCast(cp - '0')), 99999);
+            return ctx.consumeAndRedraw();
+        }
+
         if (key.mods.ctrl) {
             switch (cp) {
                 'c' => ctx.quit = true,
@@ -1620,7 +1640,9 @@ pub const Editor = struct {
             '<', '>' => {
                 const lo = @min(self.vis_row, b.row);
                 const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
-                b.indentRows(lo, hi, cp == '<') catch {};
+                var steps = self.takeCount();
+                while (steps > 0) : (steps -= 1)
+                    b.indentRows(lo, hi, cp == '<') catch {};
                 self.exitVisual();
                 b.row = @min(lo, b.lines.items.len - 1);
                 b.col = b.firstNonWs(b.row);
