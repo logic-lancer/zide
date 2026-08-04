@@ -29,6 +29,8 @@ pub const Editor = struct {
     /// Last f/F/t/T target for `;` and `,` repeat (0 = none yet).
     last_find_kind: u8 = 0,
     last_find_cp: u21 = 0,
+    /// Operator awaiting a find-char target (`dfx`/`ctx`/`ytx`), else 0.
+    find_op: u8 = 0,
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
     popup: Popup = .{},
@@ -688,6 +690,43 @@ pub const Editor = struct {
         return st.kind == .file;
     }
 
+    /// Apply operator `op` ('d'/'c'/'y') over a find-char motion. `f`/`t`
+    /// are inclusive (through the target char); `F`/`T` are exclusive.
+    fn opFindChar(self: *Editor, op: u8, kind: u8, cp: u21, count: u32) !void {
+        const b = self.cur();
+        const line = b.lineText(b.row);
+        const tc = findCharTarget(line, b.col, kind, cp, count) orelse return;
+        const lstart = b.lines.items[b.row].start;
+        var s: usize = undefined;
+        var e: usize = undefined;
+        if (kind == 'f' or kind == 't') {
+            s = lstart + b.col;
+            const chl = std.unicode.utf8ByteSequenceLength(line[tc]) catch 1;
+            e = lstart + tc + chl;
+        } else {
+            s = lstart + tc;
+            e = lstart + b.col;
+        }
+        if (e <= s) return;
+        try self.yankRange(s, e);
+        if (op == 'y') {
+            b.setCursorFromByte(s);
+            return;
+        }
+        try b.replaceRange(s, e, "");
+        b.setCursorFromByte(s);
+        if (op == 'c') self.mode = .insert else b.clampCol(false);
+    }
+
+    fn findPending(kind: u8) Pending {
+        return switch (kind) {
+            'f' => .find_f,
+            'F' => .find_F,
+            't' => .find_t,
+            else => .find_T,
+        };
+    }
+
     fn reverseFind(kind: u8) u8 {
         return switch (kind) {
             'f' => 'F',
@@ -702,12 +741,20 @@ pub const Editor = struct {
     fn findChar(self: *Editor, kind: u8, cp: u21, count: u32) void {
         const b = self.cur();
         const line = b.lineText(b.row);
-        if (line.len == 0) return;
+        if (findCharTarget(line, b.col, kind, cp, count)) |tc| {
+            b.col = Buffer.snapToCp(line, tc);
+            b.goal_col = @intCast(b.col);
+        }
+    }
+
+    /// Search half of the f/F/t/T motion: returns the destination column in
+    /// `line` relative to `col`, or null when there is no such occurrence.
+    fn findCharTarget(line: []const u8, col: usize, kind: u8, cp: u21, count: u32) ?usize {
+        if (line.len == 0) return null;
         var ebuf: [4]u8 = undefined;
-        const elen = std.unicode.utf8Encode(cp, &ebuf) catch return;
+        const elen = std.unicode.utf8Encode(cp, &ebuf) catch return null;
         const needle = ebuf[0..elen];
         const n: usize = if (count == 0) 1 else count;
-        const col = b.col;
         var left = n;
         var target: ?usize = null;
         switch (kind) {
@@ -742,10 +789,7 @@ pub const Editor = struct {
             },
             else => {},
         }
-        if (target) |tc| {
-            b.col = Buffer.snapToCp(line, tc);
-            b.goal_col = @intCast(b.col);
-        }
+        return target;
     }
 
     /// `gf`: open the file path under the cursor. Tries the token as-is
@@ -1121,10 +1165,14 @@ pub const Editor = struct {
                     else => 'T',
                 };
                 self.pending = .none;
+                const op = self.find_op;
+                self.find_op = 0;
                 if (key.matches(vaxis.Key.escape, .{})) return ctx.consumeAndRedraw();
                 self.last_find_kind = kind;
                 self.last_find_cp = cp;
-                self.findChar(kind, cp, self.takeCount());
+                if (op == 0) {
+                    self.findChar(kind, cp, self.takeCount());
+                } else try self.opFindChar(op, kind, cp, self.takeCount());
                 return ctx.consumeAndRedraw();
             },
             .d => {
@@ -1132,6 +1180,11 @@ pub const Editor = struct {
                 const n = self.takeCount();
                 switch (cp) {
                     'd' => for (0..n) |_| try b.deleteLine(),
+                    'f', 'F', 't', 'T' => {
+                        self.count = n; // restore count for the find stage
+                        self.find_op = 'd';
+                        self.pending = findPending(@intCast(cp));
+                    },
                     's' => self.pending = .surround_del,
                     'i' => {
                         self.obj_op = 'd';
@@ -1167,6 +1220,10 @@ pub const Editor = struct {
             .c_op => {
                 self.pending = .none;
                 switch (cp) {
+                    'f', 'F', 't', 'T' => {
+                        self.find_op = 'c';
+                        self.pending = findPending(@intCast(cp));
+                    },
                     's' => self.pending = .surround_old,
                     'i' => {
                         self.obj_op = 'c';
@@ -1232,6 +1289,11 @@ pub const Editor = struct {
                 self.pending = .none;
                 const n = self.takeCount();
                 switch (cp) {
+                    'f', 'F', 't', 'T' => {
+                        self.count = n; // restore count for the find stage
+                        self.find_op = 'y';
+                        self.pending = findPending(@intCast(cp));
+                    },
                     'y' => {
                         const lo = b.lines.items[b.row].start;
                         const last = @min(b.row + n - 1, b.lines.items.len - 1);
@@ -1825,6 +1887,25 @@ pub const Editor = struct {
             return ctx.consumeAndRedraw();
         }
 
+        switch (self.pending) {
+            .find_f, .find_t, .find_F, .find_T => {
+                const kind: u8 = switch (self.pending) {
+                    .find_f => 'f',
+                    .find_t => 't',
+                    .find_F => 'F',
+                    else => 'T',
+                };
+                self.pending = .none;
+                if (cp != vaxis.Key.escape) {
+                    self.last_find_kind = kind;
+                    self.last_find_cp = cp;
+                    self.findChar(kind, cp, self.takeCount());
+                }
+                return ctx.consumeAndRedraw();
+            },
+            else => {},
+        }
+
         if (self.pending == .leader) {
             self.pending = .none;
             if (cp == '/') {
@@ -1962,6 +2043,14 @@ pub const Editor = struct {
             'w' => b.wordForward(),
             'b' => b.wordBackward(),
             'e' => b.wordEnd(),
+            'f' => self.pending = .find_f,
+            'F' => self.pending = .find_F,
+            't' => self.pending = .find_t,
+            'T' => self.pending = .find_T,
+            ';' => if (self.last_find_kind != 0)
+                self.findChar(self.last_find_kind, self.last_find_cp, self.takeCount()),
+            ',' => if (self.last_find_kind != 0)
+                self.findChar(reverseFind(self.last_find_kind), self.last_find_cp, self.takeCount()),
             '0', vaxis.Key.home => {
                 b.col = 0;
                 b.goal_col = 0;
