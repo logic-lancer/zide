@@ -30,6 +30,8 @@ pub const Editor = struct {
     status_len: usize = 0,
     popup: Popup = .{},
     files: std.ArrayListUnmanaged([]u8) = .{},
+    /// Recently opened files, most recent first (persisted, NvDash "recent").
+    oldfiles: std.ArrayListUnmanaged([]u8) = .{},
     grep_hits: std.ArrayListUnmanaged(GrepHit) = .{},
     tree: Tree,
     tree_open: bool = false,
@@ -106,7 +108,7 @@ pub const Editor = struct {
         filter: std.ArrayListUnmanaged(u8) = .{},
         selected: usize = 0,
 
-        const Kind = enum { none, buffers, themes, files, keys, grep };
+        const Kind = enum { none, buffers, themes, files, keys, grep, recent };
         const max_items = 64;
         const max_files = 2000;
         const max_file_size = 1024 * 1024;
@@ -129,6 +131,7 @@ pub const Editor = struct {
         "Space e      focus/toggle tree",
         "Space f f    find files",
         "Space f w    live grep",
+        "Space f o    recent files",
         "Space t      theme picker",
         "Space x      close buffer",
         "Alt-h        terminal split",
@@ -161,7 +164,72 @@ pub const Editor = struct {
     pub fn init(alloc: std.mem.Allocator) Editor {
         var self: Editor = .{ .alloc = alloc, .tree = Tree.init(alloc) };
         self.loadGitBranch();
+        self.loadOldfiles();
         return self;
+    }
+
+    const oldfiles_max = 20;
+
+    /// `$HOME/.cache/zide/oldfiles` — one absolute path per line.
+    fn oldfilesPath(self: *Editor, buf: []u8) ?[]u8 {
+        _ = self;
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/.cache/zide/oldfiles", .{home}) catch null;
+    }
+
+    fn loadOldfiles(self: *Editor) void {
+        var pbuf: [512]u8 = undefined;
+        const path = self.oldfilesPath(&pbuf) orelse return;
+        const data = std.fs.cwd().readFileAlloc(self.alloc, path, 64 * 1024) catch return;
+        defer self.alloc.free(data);
+        var it = std.mem.tokenizeScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0 or self.oldfiles.items.len >= oldfiles_max) continue;
+            const copy = self.alloc.dupe(u8, line) catch return;
+            self.oldfiles.append(self.alloc, copy) catch {
+                self.alloc.free(copy);
+                return;
+            };
+        }
+    }
+
+    fn saveOldfiles(self: *Editor) void {
+        var pbuf: [512]u8 = undefined;
+        const path = self.oldfilesPath(&pbuf) orelse return;
+        if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch return;
+        var f = std.fs.cwd().createFile(path, .{}) catch return;
+        defer f.close();
+        for (self.oldfiles.items) |p| {
+            f.writeAll(p) catch return;
+            f.writeAll("\n") catch return;
+        }
+    }
+
+    /// Move `path` (as absolute) to the front of the recent-files list.
+    fn recordOldfile(self: *Editor, path: []const u8) void {
+        var abuf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = std.fs.cwd().realpath(path, &abuf) catch path;
+        for (self.oldfiles.items, 0..) |p, i| {
+            if (std.mem.eql(u8, p, abs)) {
+                const hit = self.oldfiles.orderedRemove(i);
+                self.oldfiles.insert(self.alloc, 0, hit) catch {
+                    self.alloc.free(hit);
+                    return;
+                };
+                self.saveOldfiles();
+                return;
+            }
+        }
+        const copy = self.alloc.dupe(u8, abs) catch return;
+        self.oldfiles.insert(self.alloc, 0, copy) catch {
+            self.alloc.free(copy);
+            return;
+        };
+        while (self.oldfiles.items.len > oldfiles_max) {
+            const last = self.oldfiles.pop() orelse break;
+            self.alloc.free(last);
+        }
+        self.saveOldfiles();
     }
 
     /// Read the current branch from .git/HEAD (NvChad statusline segment).
@@ -242,6 +310,8 @@ pub const Editor = struct {
         self.popup.filter.deinit(self.alloc);
         self.clearFiles();
         self.files.deinit(self.alloc);
+        for (self.oldfiles.items) |p| self.alloc.free(p);
+        self.oldfiles.deinit(self.alloc);
         self.clearGrep();
         self.grep_hits.deinit(self.alloc);
         self.tree.deinit();
@@ -287,6 +357,7 @@ pub const Editor = struct {
         try self.buffers.append(self.alloc, buffer);
         self.active = self.buffers.items.len - 1;
         self.refreshGitSigns(self.cur());
+        self.recordOldfile(path);
     }
 
     fn cycleBuffer(self: *Editor, delta: isize) void {
@@ -436,6 +507,7 @@ pub const Editor = struct {
             .files => " Find Files ",
             .keys => " Cheatsheet ",
             .grep => " Live Grep ",
+            .recent => " Recent Files ",
             .none => "",
         };
     }
@@ -447,6 +519,7 @@ pub const Editor = struct {
             .files => self.files.items.len,
             .keys => cheats.len,
             .grep => self.grep_hits.items.len,
+            .recent => self.oldfiles.items.len,
             .none => 0,
         };
     }
@@ -458,6 +531,7 @@ pub const Editor = struct {
             .files => self.files.items[i],
             .keys => cheats[i],
             .grep => self.grep_hits.items[i].disp,
+            .recent => self.oldfiles.items[i],
             .none => "",
         };
     }
@@ -508,6 +582,14 @@ pub const Editor = struct {
                     .grep => {
                         const h = self.grep_hits.items[idx];
                         self.jumpTo(h.path, h.line);
+                    },
+                    .recent => {
+                        // openFile mutates oldfiles; work from a stable copy.
+                        const path = self.alloc.dupe(u8, self.oldfiles.items[idx]) catch return;
+                        defer self.alloc.free(path);
+                        self.openFile(path) catch {
+                            self.setStatus("could not open {s}", .{path});
+                        };
                     },
                     .keys => {},
                     .none => {},
@@ -756,6 +838,14 @@ pub const Editor = struct {
             'h' => self.openPopup(.keys),
             'e' => self.toggleTree(),
             'q' => ctx.quit = true,
+            '1'...'5' => {
+                const idx: usize = @intCast(cp - '1');
+                if (idx >= self.oldfiles.items.len) return;
+                // openFile mutates oldfiles; work from a stable copy.
+                const path = self.alloc.dupe(u8, self.oldfiles.items[idx]) catch return;
+                defer self.alloc.free(path);
+                self.openFile(path) catch return;
+            },
             ':' => {
                 self.mode = .command;
                 self.cmd_is_search = false;
@@ -1154,6 +1244,7 @@ pub const Editor = struct {
                 switch (cp) {
                     'f' => self.openPopup(.files),
                     'w' => self.openPopup(.grep),
+                    'o' => self.openPopup(.recent),
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -2907,7 +2998,9 @@ pub const Editor = struct {
             .{ .icon = "\u{f011}", .label = "Quit", .key = "q" },
         };
         const btn_w: u16 = 26;
-        const total_h: u16 = logo.len + 1 + (@as(u16, btns.len) * 2 - 1) + 2;
+        const n_recent: u16 = @intCast(@min(self.oldfiles.items.len, 5));
+        const recent_h: u16 = if (n_recent > 0) n_recent + 1 else 0;
+        const total_h: u16 = @as(u16, logo.len) + 1 + (@as(u16, btns.len) * 2 - 1) + 2 + recent_h;
         var y: u16 = if (max.height > total_h + 1) (max.height - 1 - total_h) / 2 else 0;
 
         // Logo.
@@ -2933,6 +3026,27 @@ pub const Editor = struct {
             col = writeText(surface, ctx, col, y, btn.label, .{ .fg = th.fg, .bg = th.bar_bg });
             _ = writeText(surface, ctx, bx + btn_w - 3, y, btn.key, .{ .fg = th.yellow, .bg = th.bar_bg, .bold = true });
             y += 2;
+        }
+        // Recent files (NvDash-style), opened with 1-5.
+        if (n_recent > 0) {
+            var ri: u16 = 0;
+            while (ri < n_recent and y < max.height -| 1) : (ri += 1) {
+                const full = self.oldfiles.items[ri];
+                // Show a path tail that fits the button column width.
+                var tail = full;
+                const fit: usize = btn_w - 6;
+                if (tail.len > fit) {
+                    tail = tail[tail.len - fit ..];
+                    if (std.mem.indexOfScalar(u8, tail, '/')) |sl| tail = tail[sl + 1 ..];
+                }
+                const bx: u16 = x_off + (area_w -| btn_w) / 2;
+                const digit = std.fmt.allocPrint(ctx.arena, "{d}", .{ri + 1}) catch "?";
+                var col = writeText(surface, ctx, bx, y, digit, .{ .fg = th.yellow, .bold = true });
+                col = writeText(surface, ctx, col, y, "  ", .{});
+                _ = writeText(surface, ctx, col, y, tail, .{ .fg = th.fg });
+                y += 1;
+            }
+            y += 1;
         }
         if (y < max.height -| 1) {
             const hint = "zide — :e <path> to open a file";
