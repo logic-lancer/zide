@@ -41,6 +41,7 @@ pub const Editor = struct {
     /// Last register replayed with `@`, reused by `@@`.
     last_macro: ?u8 = null,
     surround_from: u8 = 0,
+    obj_op: u8 = 'd',
     /// Replay re-entrancy depth; guards runaway recursive macros.
     replay_depth: u8 = 0,
     /// Dot-repeat: keys of the last completed change (`.` replays them).
@@ -90,7 +91,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -142,6 +143,10 @@ pub const Editor = struct {
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
+        "ciw ci( ca\"  change text object",
+        "diw di( da\"  delete text object",
+        "cw cc c$     change word/line/eol",
+        "dw d$        delete word/eol",
         "cs \" '       change surround",
         "ds ( \" ...   delete surround",
         "S( (visual)  wrap selection",
@@ -904,15 +909,88 @@ pub const Editor = struct {
             .d => {
                 self.pending = .none;
                 const n = self.takeCount();
-                if (cp == 'd') {
-                    for (0..n) |_| try b.deleteLine();
-                } else if (cp == 's') {
-                    self.pending = .surround_del;
+                switch (cp) {
+                    'd' => for (0..n) |_| try b.deleteLine(),
+                    's' => self.pending = .surround_del,
+                    'i' => {
+                        self.obj_op = 'd';
+                        self.pending = .obj_i;
+                    },
+                    'a' => {
+                        self.obj_op = 'd';
+                        self.pending = .obj_a;
+                    },
+                    'w' => {
+                        const s = b.cursorByte();
+                        const e = nextWordByte(b, s);
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            try b.replaceRange(s, e, "");
+                            b.setCursorFromByte(s);
+                        }
+                    },
+                    '$' => {
+                        const s = b.cursorByte();
+                        const e = b.lines.items[b.row].end;
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            try b.replaceRange(s, e, "");
+                            b.setCursorFromByte(s);
+                            b.clampCol(false);
+                        }
+                    },
+                    else => {},
                 }
                 return ctx.consumeAndRedraw();
             },
             .c_op => {
-                self.pending = if (cp == 's') .surround_old else .none;
+                self.pending = .none;
+                switch (cp) {
+                    's' => self.pending = .surround_old,
+                    'i' => {
+                        self.obj_op = 'c';
+                        self.pending = .obj_i;
+                    },
+                    'a' => {
+                        self.obj_op = 'c';
+                        self.pending = .obj_a;
+                    },
+                    'c' => {
+                        const line = b.lines.items[b.row];
+                        try self.yankRange(line.start, line.end);
+                        try b.replaceRange(line.start, line.end, "");
+                        b.col = 0;
+                        b.goal_col = 0;
+                        self.mode = .insert;
+                    },
+                    'w', 'e' => {
+                        const s = b.cursorByte();
+                        const e = wordEndByte(b, s);
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            try b.replaceRange(s, e, "");
+                        }
+                        b.setCursorFromByte(s);
+                        self.mode = .insert;
+                    },
+                    '$' => {
+                        const s = b.cursorByte();
+                        const e = b.lines.items[b.row].end;
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            try b.replaceRange(s, e, "");
+                        }
+                        b.setCursorFromByte(s);
+                        self.mode = .insert;
+                    },
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .obj_i, .obj_a => {
+                const around = self.pending == .obj_a;
+                self.pending = .none;
+                if (cp < 0x80) try self.doTextObject(@intCast(cp), around);
                 return ctx.consumeAndRedraw();
             },
             .surround_old => {
@@ -1282,6 +1360,89 @@ pub const Editor = struct {
             }
         }
         return null;
+    }
+
+    // ---- text objects (ciw / di( / ca" ...) ---------------------------
+    /// End (exclusive) of the word-class run at `s`; whitespace runs span
+    /// spaces/tabs only, never the newline.
+    fn wordEndByte(b: *Buffer, s: usize) usize {
+        const text = b.buf.items;
+        if (s >= text.len) return s;
+        const cls = Buffer.wordClass(text[s]);
+        var e = s;
+        if (cls == 0) {
+            while (e < text.len and (text[e] == ' ' or text[e] == '\t')) e += 1;
+        } else {
+            while (e < text.len and Buffer.wordClass(text[e]) == cls) e += 1;
+        }
+        return @max(e, s + 1);
+    }
+
+    /// Start of the next word on the current line (vim `dw` target).
+    fn nextWordByte(b: *Buffer, s: usize) usize {
+        const text = b.buf.items;
+        const line_end = b.lines.items[b.row].end;
+        var i = s;
+        if (i < line_end) {
+            const cls = Buffer.wordClass(text[i]);
+            if (cls != 0) while (i < line_end and Buffer.wordClass(text[i]) == cls) {
+                i += 1;
+            };
+            while (i < line_end and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        }
+        return i;
+    }
+
+    /// Byte range [start, end) of a text object, or null.
+    fn objectRange(b: *Buffer, kind: u8, around: bool) ?[2]usize {
+        const text = b.buf.items;
+        if (kind == 'w') {
+            const cpos = b.cursorByte();
+            if (cpos >= text.len or text[cpos] == '\n') return null;
+            const cls = Buffer.wordClass(text[cpos]);
+            var s = cpos;
+            var e = cpos;
+            if (cls == 0) {
+                while (s > 0 and (text[s - 1] == ' ' or text[s - 1] == '\t')) s -= 1;
+                while (e < text.len and (text[e] == ' ' or text[e] == '\t')) e += 1;
+                return .{ s, e };
+            }
+            while (s > 0 and Buffer.wordClass(text[s - 1]) == cls) s -= 1;
+            while (e < text.len and Buffer.wordClass(text[e]) == cls) e += 1;
+            if (around) {
+                const e0 = e;
+                while (e < text.len and (text[e] == ' ' or text[e] == '\t')) e += 1;
+                if (e == e0) // no trailing ws: take leading instead
+                    while (s > 0 and (text[s - 1] == ' ' or text[s - 1] == '\t')) {
+                        s -= 1;
+                    };
+            }
+            return .{ s, e };
+        }
+        const pair = surroundPair(kind) orelse return null;
+        const pos = findSurround(b, pair[0], pair[1]) orelse return null;
+        return if (around)
+            .{ pos[0], pos[1] + 1 }
+        else
+            .{ pos[0] + 1, pos[1] };
+    }
+
+    /// Charwise copy into the unnamed register.
+    fn yankRange(self: *Editor, s: usize, e: usize) !void {
+        const b = self.cur();
+        self.reg.clearRetainingCapacity();
+        try self.reg.appendSlice(self.alloc, b.buf.items[s..e]);
+        self.reg_linewise = false;
+    }
+
+    fn doTextObject(self: *Editor, kind: u8, around: bool) !void {
+        const b = self.cur();
+        const r = objectRange(b, kind, around) orelse
+            return self.setStatus("no object: {c}", .{kind});
+        try self.yankRange(r[0], r[1]);
+        try b.replaceRange(r[0], r[1], "");
+        b.setCursorFromByte(r[0]);
+        if (self.obj_op == 'c') self.mode = .insert else b.clampCol(false);
     }
 
     /// `to == 0` deletes the surrounding pair (ds); otherwise replaces it (cs).
