@@ -42,6 +42,11 @@ pub const Editor = struct {
     last_macro: ?u8 = null,
     /// Replay re-entrancy depth; guards runaway recursive macros.
     replay_depth: u8 = 0,
+    /// Dot-repeat: keys of the last completed change (`.` replays them).
+    dot: std.ArrayListUnmanaged(vaxis.Key) = .{},
+    /// In-progress change capture (from change-starting key until normal mode).
+    dot_rec: std.ArrayListUnmanaged(vaxis.Key) = .{},
+    dot_capturing: bool = false,
     /// Visual-mode anchor (the end of the selection that does not move).
     vis_row: usize = 0,
     vis_col: usize = 0,
@@ -79,7 +84,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char };
     const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
 
@@ -219,6 +224,8 @@ pub const Editor = struct {
         self.grep_hits.deinit(self.alloc);
         self.tree.deinit();
         for (&self.macros) |*m| m.deinit(self.alloc);
+        self.dot.deinit(self.alloc);
+        self.dot_rec.deinit(self.alloc);
         if (self.term) |*t| t.deinit();
     }
 
@@ -525,7 +532,9 @@ pub const Editor = struct {
                 // that stops recording is popped again in handleNormal.
                 if (self.recording != null and self.replay_depth == 0)
                     try self.macros[self.recording.? - 'a'].append(self.alloc, key);
+                if (self.replay_depth == 0) self.dotWatch(key);
                 try self.dispatchKey(ctx, key);
+                if (self.replay_depth == 0) self.dotSettle();
             },
             else => {},
         }
@@ -555,6 +564,44 @@ pub const Editor = struct {
                     .visual, .visual_line => try self.handleVisual(ctx, key),
                 }
         }
+    }
+
+    /// Dot-repeat capture: when a change-starting key arrives in plain normal
+    /// mode, start recording keys until the editor settles back into normal
+    /// mode (covers single-key edits and whole insert sessions alike).
+    fn dotWatch(self: *Editor, key: vaxis.Key) void {
+        if (!self.dot_capturing) {
+            if (self.focus != .editor or self.mode != .normal) return;
+            if (self.pending != .none or self.popup.kind != .none) return;
+            if (self.buffers.items.len == 0) return;
+            if (key.mods.ctrl or key.mods.alt) return;
+            const cp = key.shifted_codepoint orelse key.codepoint;
+            switch (cp) {
+                'x', 'r', '~', 'J', 'p', 'o', 'O', 'i', 'a', 'A', 'I', 'd' => {},
+                else => return,
+            }
+            self.dot_capturing = true;
+            self.dot_rec.clearRetainingCapacity();
+        }
+        self.dot_rec.append(self.alloc, key) catch {};
+    }
+
+    /// Commit the in-progress dot capture once a change has completed.
+    fn dotSettle(self: *Editor) void {
+        if (!self.dot_capturing) return;
+        if (self.mode != .normal or self.pending != .none) return;
+        self.dot_capturing = false;
+        std.mem.swap(std.ArrayListUnmanaged(vaxis.Key), &self.dot, &self.dot_rec);
+    }
+
+    /// Replay the last change (`.`).
+    fn playDot(self: *Editor, ctx: *vxfw.EventContext) !void {
+        if (self.dot.items.len == 0 or self.replay_depth >= 8) return;
+        self.replay_depth += 1;
+        defer self.replay_depth -= 1;
+        const keys = try self.alloc.dupe(vaxis.Key, self.dot.items);
+        defer self.alloc.free(keys);
+        for (keys) |k| try self.dispatchKey(ctx, k);
     }
 
     /// Replay a recorded macro register through the normal key dispatch path.
@@ -746,6 +793,16 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .replace_char => {
+                self.pending = .none;
+                if (cp != vaxis.Key.escape and cp >= 0x20) {
+                    var utf8_buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &utf8_buf) catch
+                        return ctx.consumeAndRedraw();
+                    try b.replaceCharAtCursor(utf8_buf[0..n]);
+                }
+                return ctx.consumeAndRedraw();
+            },
             .leader => {
                 self.pending = .none;
                 switch (cp) {
@@ -865,6 +922,9 @@ pub const Editor = struct {
             'n' => self.findNext(1),
             'N' => self.findNext(-1),
             'x' => try b.deleteCharAtCursor(),
+            'r' => self.pending = .replace_char,
+            '~' => try b.toggleCaseAtCursor(),
+            '.' => try self.playDot(ctx),
             'v' => self.enterVisual(.visual),
             'V' => self.enterVisual(.visual_line),
             'p' => try self.pasteAfter(),

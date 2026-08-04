@@ -389,6 +389,28 @@ pub const Buffer = struct {
         self.clampCol(false);
     }
 
+    /// Replace the codepoint under the cursor with `text` (vim `r`).
+    pub fn replaceCharAtCursor(self: *Buffer, text: []const u8) !void {
+        if (self.lineLen(self.row) == 0) return;
+        const pos = self.cursorByte();
+        try self.replaceRange(pos, pos + self.cpLenAt(self.row, self.col), text);
+    }
+
+    /// Toggle ASCII case under the cursor, then advance (vim `~`).
+    pub fn toggleCaseAtCursor(self: *Buffer) !void {
+        if (self.lineLen(self.row) == 0) return;
+        const pos = self.cursorByte();
+        const c = self.buf.items[pos];
+        if (std.ascii.isAlphabetic(c)) {
+            const flipped = [1]u8{if (std.ascii.isLower(c))
+                std.ascii.toUpper(c)
+            else
+                std.ascii.toLower(c)};
+            try self.replaceRange(pos, pos + 1, &flipped);
+        }
+        self.moveRight(false);
+    }
+
     pub fn deleteLine(self: *Buffer) !void {
         const line = self.lines.items[self.row];
         var start: usize = line.start;
