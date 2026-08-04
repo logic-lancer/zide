@@ -91,7 +91,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -143,6 +143,8 @@ pub const Editor = struct {
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
+        "yiw yi( yy   yank object/line",
+        "yw y$ Nyy    yank word/eol/N lines",
         "ciw ci( ca\"  change text object",
         "diw di( da\"  delete text object",
         "cw cc c$     change word/line/eol",
@@ -987,6 +989,48 @@ pub const Editor = struct {
                 }
                 return ctx.consumeAndRedraw();
             },
+            .y_op => {
+                self.pending = .none;
+                const n = self.takeCount();
+                switch (cp) {
+                    'y' => {
+                        const lo = b.lines.items[b.row].start;
+                        const last = @min(b.row + n - 1, b.lines.items.len - 1);
+                        const hi = @min(b.lines.items[last].end + 1, b.buf.items.len);
+                        try self.yankRange(lo, hi);
+                        self.reg_linewise = true;
+                        if (self.reg.items.len == 0 or
+                            self.reg.items[self.reg.items.len - 1] != '\n')
+                            try self.reg.append(self.alloc, '\n');
+                        self.setStatus("{d} line{s} yanked", .{ n, if (n == 1) "" else "s" });
+                    },
+                    'i' => {
+                        self.obj_op = 'y';
+                        self.pending = .obj_i;
+                    },
+                    'a' => {
+                        self.obj_op = 'y';
+                        self.pending = .obj_a;
+                    },
+                    'w' => {
+                        const s = b.cursorByte();
+                        const e = nextWordByte(b, s);
+                        if (e > s) try self.yankRange(s, e);
+                    },
+                    'e' => {
+                        const s = b.cursorByte();
+                        const e = wordEndByte(b, s);
+                        if (e > s) try self.yankRange(s, e);
+                    },
+                    '$' => {
+                        const s = b.cursorByte();
+                        const e = b.lines.items[b.row].end;
+                        if (e > s) try self.yankRange(s, e);
+                    },
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
             .obj_i, .obj_a => {
                 const around = self.pending == .obj_a;
                 self.pending = .none;
@@ -1182,6 +1226,7 @@ pub const Editor = struct {
             },
             'd' => self.pending = .d,
             'c' => self.pending = .c_op,
+            'y' => self.pending = .y_op,
             ']' => self.pending = .bracket_f,
             '[' => self.pending = .bracket_b,
             'm' => self.pending = .mark_set,
@@ -1440,6 +1485,11 @@ pub const Editor = struct {
         const r = objectRange(b, kind, around) orelse
             return self.setStatus("no object: {c}", .{kind});
         try self.yankRange(r[0], r[1]);
+        if (self.obj_op == 'y') {
+            b.setCursorFromByte(r[0]);
+            b.clampCol(false);
+            return;
+        }
         try b.replaceRange(r[0], r[1], "");
         b.setCursorFromByte(r[0]);
         if (self.obj_op == 'c') self.mode = .insert else b.clampCol(false);
