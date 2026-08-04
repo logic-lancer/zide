@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 const themes = @import("theme.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const Tree = @import("tree.zig").Tree;
+const Term = @import("term.zig").Term;
 
 /// Modal (vim-style) editor widget multiplexing several buffers.
 /// Layout: tabline on top, text area, status line at the bottom.
@@ -41,10 +42,17 @@ pub const Editor = struct {
     /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
     reg: std.ArrayListUnmanaged(u8) = .{},
     reg_linewise: bool = false,
+    /// NvTerm-style bottom terminal split (Alt-h toggles it).
+    term: ?Term = null,
+    term_open: bool = false,
+    /// Alt-i: same shell, but shown as a centered floating window instead.
+    term_float: bool = false,
+    term_h: u16 = 10,
+    term_cols: u16 = 80,
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
     const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b };
-    const Focus = enum { editor, tree };
+    const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
 
     /// Floating picker overlay (buffers / themes), telescope-flavored:
@@ -79,6 +87,8 @@ pub const Editor = struct {
         "Space f w    live grep",
         "Space t      theme picker",
         "Space x      close buffer",
+        "Alt-h        terminal split",
+        "Alt-i        floating terminal",
         "Ctrl-n       toggle tree",
         "Ctrl-h       focus tree",
         "Ctrl-l       focus editor",
@@ -179,6 +189,7 @@ pub const Editor = struct {
         self.clearGrep();
         self.grep_hits.deinit(self.alloc);
         self.tree.deinit();
+        if (self.term) |*t| t.deinit();
     }
 
     pub fn widget(self: *Editor) vxfw.Widget {
@@ -468,9 +479,25 @@ pub const Editor = struct {
         const self: *Editor = @ptrCast(@alignCast(ptr));
         switch (event) {
             .init => return ctx.requestFocus(self.widget()),
+            .tick => {
+                if (self.term_open or self.term_float) {
+                    if (self.term) |*t| {
+                        if (t.poll()) ctx.redraw = true;
+                    }
+                    try ctx.tick(80, self.widget());
+                }
+                return;
+            },
             .key_press => |key| {
                 self.status_len = 0;
                 if (self.popup.kind != .none) return self.handlePopup(ctx, key);
+                // NvTerm: Alt-h toggles the bottom split, Alt-i the float.
+                if (key.mods.alt and (key.codepoint == 'h' or key.codepoint == 'H'))
+                    return self.toggleTerm(ctx, false);
+                if (key.mods.alt and (key.codepoint == 'i' or key.codepoint == 'I'))
+                    return self.toggleTerm(ctx, true);
+                if (self.focus == .term)
+                    return self.handleTerm(ctx, key);
                 if (self.focus == .tree and self.mode != .command)
                     return self.handleTree(ctx, key);
                 if (self.buffers.items.len == 0 and self.mode != .command)
@@ -1247,6 +1274,162 @@ pub const Editor = struct {
         }
     }
 
+    // ---- integrated terminal (NvTerm-style) -------------------------------
+
+    /// Alt-h (split) / Alt-i (float): show/hide the terminal, spawning the
+    /// shell lazily. Both views share the same underlying PTY session.
+    fn toggleTerm(self: *Editor, ctx: *vxfw.EventContext, float: bool) !void {
+        const open = if (float) &self.term_float else &self.term_open;
+        const other = if (float) &self.term_open else &self.term_float;
+        if (open.*) {
+            open.* = false;
+            if (self.focus == .term) self.focus = .editor;
+            ctx.consumeAndRedraw();
+            return;
+        }
+        other.* = false; // only one view at a time
+        if (self.term == null) {
+            self.term = Term.spawn(self.alloc, self.term_cols, self.term_h) catch {
+                self.setStatus("terminal: failed to spawn shell", .{});
+                ctx.consumeAndRedraw();
+                return;
+            };
+        } else if (self.term.?.exited) {
+            self.term.?.deinit();
+            self.term = Term.spawn(self.alloc, self.term_cols, self.term_h) catch {
+                self.term = null;
+                self.setStatus("terminal: failed to spawn shell", .{});
+                ctx.consumeAndRedraw();
+                return;
+            };
+        }
+        open.* = true;
+        self.focus = .term;
+        try ctx.tick(80, self.widget());
+        ctx.consumeAndRedraw();
+    }
+
+    /// Keys while the terminal owns focus: everything is forwarded to the
+    /// shell except Ctrl-x (back to the editor, NvChad's terminal escape).
+    fn handleTerm(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (self.term == null) return;
+        const t = &self.term.?;
+        if (key.mods.ctrl and key.codepoint == 'x') {
+            self.focus = .editor;
+            ctx.consumeAndRedraw();
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            t.write("\r");
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            t.write("\x7f");
+        } else if (key.matches(vaxis.Key.tab, .{})) {
+            t.write("\t");
+        } else if (key.matches(vaxis.Key.escape, .{})) {
+            t.write("\x1b");
+        } else if (key.matches(vaxis.Key.up, .{})) {
+            t.write("\x1b[A");
+        } else if (key.matches(vaxis.Key.down, .{})) {
+            t.write("\x1b[B");
+        } else if (key.matches(vaxis.Key.right, .{})) {
+            t.write("\x1b[C");
+        } else if (key.matches(vaxis.Key.left, .{})) {
+            t.write("\x1b[D");
+        } else if (key.mods.ctrl and key.codepoint >= 'a' and key.codepoint <= 'z') {
+            t.write(&[_]u8{@intCast(key.codepoint - 'a' + 1)});
+        } else if (key.text) |txt| {
+            t.write(txt);
+        } else if (key.codepoint >= 0x20 and key.codepoint < 0x110000) {
+            var utf8: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(key.codepoint), &utf8) catch return;
+            t.write(utf8[0..n]);
+        }
+        _ = t.poll();
+        ctx.consumeAndRedraw();
+    }
+
+    /// Terminal pane: title row + the last N output lines. `x0` lets the
+    /// same renderer back both the bottom split and the Alt-i float.
+    fn drawTerm(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, x0: u16, top: u16, rows: u16, width: u16) void {
+        const th = self.theme.p;
+        if (self.term == null) return;
+        const t = &self.term.?;
+        if (t.exited and self.focus == .term) self.focus = .editor;
+
+        if (self.term_cols != width) {
+            self.term_cols = width;
+            t.resize(width, rows);
+        }
+
+        // Title bar.
+        const bar_style: vaxis.Style = .{ .fg = th.fg, .bg = th.bar_bg, .bold = true };
+        var c: u16 = 0;
+        while (c < width) : (c += 1) surface.writeCell(x0 + c, top, .{ .style = bar_style });
+        // NOTE: must be static strings — surface cells keep grapheme slices
+        // alive until render, so stack-formatted labels would dangle.
+        const label = if (self.focus == .term)
+            (if (self.term_float) "  Terminal — Ctrl-x: editor · Alt-i: hide " else "  Terminal — Ctrl-x: editor · Alt-h: hide ")
+        else if (t.exited)
+            (if (self.term_float) "  Terminal [exited] — Alt-i: hide " else "  Terminal [exited] — Alt-h: hide ")
+        else
+            (if (self.term_float) "  Terminal — Alt-i: focus/hide " else "  Terminal — Alt-h: focus/hide ");
+        _ = writeText(surface, ctx, x0, top, label[0..@min(label.len, width)], bar_style);
+
+        // Output: last `rows` lines, cursor line last.
+        const base: vaxis.Style = .{ .fg = th.fg, .bg = th.bg };
+        const total = t.lines.items.len;
+        const first = total -| rows;
+        var r: u16 = 0;
+        while (r < rows) : (r += 1) {
+            var fc: u16 = 0;
+            while (fc < width) : (fc += 1) surface.writeCell(x0 + fc, top + 1 + r, .{ .style = base });
+            const li = first + r;
+            if (li >= total) break;
+            const line = t.lines.items[li].items;
+            _ = writeText(surface, ctx, x0, top + 1 + r, line[0..@min(line.len, width)], base);
+        }
+    }
+
+    const FloatRect = struct { x0: u16, y0: u16, w: u16, h: u16 };
+
+    /// Geometry of the Alt-i float: centered, 80% wide, 60% tall.
+    fn termFloatRect(max_w: u16, max_h: u16) ?FloatRect {
+        if (max_w < 20 or max_h < 8) return null;
+        const w: u16 = @max(20, max_w * 4 / 5);
+        const h: u16 = @max(6, max_h * 3 / 5);
+        return .{ .x0 = (max_w - w) / 2, .y0 = (max_h - h) / 2, .w = w, .h = h };
+    }
+
+    /// Alt-i: centered floating terminal (NvChad float style), drawn as an
+    /// overlay on top of everything with a one-cell border frame.
+    fn drawTermFloat(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, max_w: u16, max_h: u16) void {
+        const th = self.theme.p;
+        const rect = termFloatRect(max_w, max_h) orelse return;
+        const x0 = rect.x0;
+        const y0 = rect.y0;
+        const w = rect.w;
+        const h = rect.h;
+
+        // Border frame around the float.
+        const border: vaxis.Style = .{ .fg = th.blue, .bg = th.bg };
+        var bx: u16 = 0;
+        while (bx < w + 2) : (bx += 1) {
+            surface.writeCell(x0 - 1 + bx, y0 - 1, .{ .char = .{ .grapheme = "─" }, .style = border });
+            surface.writeCell(x0 - 1 + bx, y0 + h, .{ .char = .{ .grapheme = "─" }, .style = border });
+        }
+        var by: u16 = 0;
+        while (by < h) : (by += 1) {
+            surface.writeCell(x0 - 1, y0 + by, .{ .char = .{ .grapheme = "│" }, .style = border });
+            surface.writeCell(x0 + w, y0 + by, .{ .char = .{ .grapheme = "│" }, .style = border });
+        }
+        surface.writeCell(x0 - 1, y0 - 1, .{ .char = .{ .grapheme = "╭" }, .style = border });
+        surface.writeCell(x0 + w, y0 - 1, .{ .char = .{ .grapheme = "╮" }, .style = border });
+        surface.writeCell(x0 - 1, y0 + h, .{ .char = .{ .grapheme = "╰" }, .style = border });
+        surface.writeCell(x0 + w, y0 + h, .{ .char = .{ .grapheme = "╯" }, .style = border });
+
+        self.drawTerm(surface, ctx, x0, y0, h - 1, w);
+    }
+
     // ---- file tree --------------------------------------------------------
 
     fn toggleTree(self: *Editor) void {
@@ -1328,7 +1511,10 @@ pub const Editor = struct {
         const b = self.cur();
         const th = self.theme.p;
         const text_top: u16 = 1; // row 0 is the tabline
-        const text_rows: u16 = max.height - 2;
+        // Reserve the bottom split (title row + term_h) when the terminal is open.
+        const term_rows: u16 = if (self.term_open) @min(self.term_h, (max.height - 3) -| 1) else 0;
+        const term_total: u16 = if (self.term_open and term_rows > 0) term_rows + 1 else 0;
+        const text_rows: u16 = max.height - 2 - term_total;
         self.last_height = text_rows;
 
         // Keep the cursor visible.
@@ -1429,7 +1615,9 @@ pub const Editor = struct {
         }
 
         if (tree_w > 0) self.drawTree(surface, ctx, text_top, text_rows, tree_w);
+        if (term_total > 0) self.drawTerm(surface, ctx, 0, text_top + text_rows, term_rows, max.width);
         self.drawStatus(surface, ctx, max.height - 1, max.width);
+        if (self.term_float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
             return surface;
@@ -1442,6 +1630,27 @@ pub const Editor = struct {
                 .col = @intCast(@min(1 + self.cmd.items.len, max.width - 1)),
                 .shape = .beam,
             };
+        } else if (self.focus == .term and term_total > 0) {
+            if (self.term) |*t| {
+                const cur_row: u16 = @intCast(@min(t.lines.items.len -| 1, term_rows - 1));
+                surface.cursor = .{
+                    .row = text_top + text_rows + 1 + cur_row,
+                    .col = @intCast(@min(t.col, max.width - 1)),
+                    .shape = .block,
+                };
+            }
+        } else if (self.focus == .term and self.term_float) {
+            if (self.term) |*t| {
+                if (termFloatRect(max.width, max.height - 1)) |rect| {
+                    const rows = rect.h - 1;
+                    const cur_row: u16 = @intCast(@min(t.lines.items.len -| 1, rows - 1));
+                    surface.cursor = .{
+                        .row = rect.y0 + 1 + cur_row,
+                        .col = @intCast(@min(rect.x0 + t.col, max.width - 1)),
+                        .shape = .block,
+                    };
+                }
+            }
         } else if (self.focus == .editor and b.row >= b.scroll and b.row < b.scroll + text_rows) {
             surface.cursor = .{
                 .row = @intCast(text_top + b.row - b.scroll),
