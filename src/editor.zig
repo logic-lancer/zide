@@ -1051,6 +1051,8 @@ pub const Editor = struct {
             },
             'n' => self.findNext(1),
             'N' => self.findNext(-1),
+            '*' => self.searchWord(1),
+            '#' => self.searchWord(-1),
             'x' => for (0..n) |_| try b.deleteCharAtCursor(),
             'r' => self.pending = .replace_char,
             '~' => for (0..n) |_| try b.toggleCaseAtCursor(),
@@ -1542,6 +1544,71 @@ pub const Editor = struct {
 
     /// Jump to the next/previous occurrence of the last `/` pattern, wrapping
     /// around the buffer like vim (with a "search hit BOTTOM/TOP" status).
+    /// True when the match at `p` is a whole word (vim `\<pat\>` semantics).
+    fn wordBounded(text: []const u8, p: usize, len: usize) bool {
+        if (p > 0 and Buffer.wordClass(text[p - 1]) == 1) return false;
+        const e = p + len;
+        if (e < text.len and Buffer.wordClass(text[e]) == 1) return false;
+        return true;
+    }
+
+    /// Next whole-word occurrence of `pat`, wrapping. Terminates because the
+    /// word under the cursor is itself always a bounded match.
+    fn findWordHit(text: []const u8, pat: []const u8, start: usize, dir: i2) ?usize {
+        if (dir > 0) {
+            var i = start + 1;
+            var wrapped = false;
+            while (true) {
+                if (std.mem.indexOfPos(u8, text, @min(i, text.len), pat)) |p| {
+                    if (wordBounded(text, p, pat.len)) return p;
+                    i = p + 1;
+                    continue;
+                }
+                if (wrapped) return null;
+                wrapped = true;
+                i = 0;
+            }
+        } else {
+            var end = start;
+            var wrapped = false;
+            while (true) {
+                if (std.mem.lastIndexOf(u8, text[0..end], pat)) |p| {
+                    if (wordBounded(text, p, pat.len)) return p;
+                    end = p;
+                    continue;
+                }
+                if (wrapped) return null;
+                wrapped = true;
+                end = text.len;
+            }
+        }
+    }
+
+    /// `*` / `#`: whole-word search for the identifier under (or right of)
+    /// the cursor. Loads the search register so n/N continue the hunt.
+    fn searchWord(self: *Editor, dir: i2) void {
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const text = b.buf.items;
+        const line_start = b.lines.items[b.row].start;
+        const line_end = line_start + b.lineLen(b.row);
+        var pos = line_start + @min(b.col, b.lineLen(b.row));
+        while (pos < line_end and Buffer.wordClass(text[pos]) != 1) pos += 1;
+        if (pos >= line_end) return self.setStatus("no word under cursor", .{});
+        var lo = pos;
+        while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
+        var hi = pos;
+        while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
+        const word = text[lo..hi];
+        self.search.clearRetainingCapacity();
+        self.search.appendSlice(self.alloc, word) catch return;
+        const hit = findWordHit(text, self.search.items, lo, dir) orelse
+            return self.setStatus("pattern not found: {s}", .{self.search.items});
+        self.pushJump();
+        b.setCursorFromByte(hit);
+        self.setStatus("/{s}", .{self.search.items});
+    }
+
     fn findNext(self: *Editor, dir: i2) void {
         const pat = self.search.items;
         if (pat.len == 0) return self.setStatus("no previous search", .{});
