@@ -885,8 +885,20 @@ pub const Editor = struct {
         var pos = line_start + @min(b.col, b.lineLen(b.row));
         while (pos < line_end and std.mem.indexOfScalar(u8, pairs, text[pos]) == null) pos += 1;
         if (pos >= line_end) return self.setStatus("no matching pair", .{});
+        const p = bracketMatchAt(text, pos) orelse
+            return self.setStatus("no matching pair", .{});
+        self.pushJump();
+        b.setCursorFromByte(p);
+    }
+
+    /// Byte index of the bracket matching the one *at* `pos`, or null when
+    /// `pos` is not on a bracket / the pair is unbalanced. Shared by `%` and
+    /// the matchparen highlight in the draw pass.
+    fn bracketMatchAt(text: []const u8, pos: usize) ?usize {
+        if (pos >= text.len) return null;
+        const pairs = "()[]{}";
         const c = text[pos];
-        const idx = std.mem.indexOfScalar(u8, pairs, c).?;
+        const idx = std.mem.indexOfScalar(u8, pairs, c) orelse return null;
         const fwd = idx % 2 == 0;
         const other = if (fwd) pairs[idx + 1] else pairs[idx - 1];
         var depth: u32 = 0;
@@ -894,18 +906,47 @@ pub const Editor = struct {
         while (true) {
             if (text[p] == c) depth += 1 else if (text[p] == other) {
                 depth -= 1;
-                if (depth == 0) break;
+                if (depth == 0) return p;
             }
             if (fwd) {
                 p += 1;
-                if (p >= text.len) return self.setStatus("no matching pair", .{});
+                if (p >= text.len) return null;
             } else {
-                if (p == 0) return self.setStatus("no matching pair", .{});
+                if (p == 0) return null;
                 p -= 1;
             }
         }
+    }
+
+    /// `gd`: goto local definition, vim-flavored — jump to the first
+    /// whole-word occurrence of the identifier under the cursor, loading
+    /// the search register so n/N continue from there.
+    fn gotoDef(self: *Editor) void {
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const text = b.buf.items;
+        const line_start = b.lines.items[b.row].start;
+        const line_end = line_start + b.lineLen(b.row);
+        var pos = line_start + @min(b.col, b.lineLen(b.row));
+        while (pos < line_end and Buffer.wordClass(text[pos]) != 1) pos += 1;
+        if (pos >= line_end) return self.setStatus("no word under cursor", .{});
+        var lo = pos;
+        while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
+        var hi = pos;
+        while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
+        const word = text[lo..hi];
+        var i: usize = 0;
+        const hit: ?usize = while (std.mem.indexOfPos(u8, text, i, word)) |p| {
+            if (wordBounded(text, p, word.len)) break p;
+            i = p + 1;
+        } else null;
+        const p = hit orelse return self.setStatus("gd: not found", .{});
+        self.search.clearRetainingCapacity();
+        self.search.appendSlice(self.alloc, word) catch return;
+        self.search_hl = true;
         self.pushJump();
         b.setCursorFromByte(p);
+        self.setStatus("gd: {s}", .{word});
     }
 
     /// Consume the pending count prefix (defaults to 1).
@@ -1157,6 +1198,8 @@ pub const Editor = struct {
                     self.reselectVisual();
                 } else if (cp == 'f') {
                     self.gotoFile() catch {};
+                } else if (cp == 'd') {
+                    self.gotoDef();
                 }
                 return ctx.consumeAndRedraw();
             },
@@ -3092,6 +3135,18 @@ pub const Editor = struct {
             }
         }
 
+        // matchparen: when the cursor rests on a bracket, passively
+        // highlight it and its partner (NvChad-style).
+        var mp_a: usize = std.math.maxInt(usize);
+        var mp_b: usize = std.math.maxInt(usize);
+        if (self.focus == .editor) {
+            const cur_abs = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+            if (bracketMatchAt(b.buf.items, cur_abs)) |m| {
+                mp_a = cur_abs;
+                mp_b = m;
+            }
+        }
+
         var row: u16 = 0;
         while (row < text_rows) : (row += 1) {
             const li = b.scroll + row;
@@ -3143,6 +3198,14 @@ pub const Editor = struct {
                 if (sel) |s| {
                     const abs = line.start + i;
                     if (abs >= s[0] and abs < s[1]) style.bg = th.bar_bg;
+                }
+                {
+                    const abs = line.start + i;
+                    if (abs == mp_a or abs == mp_b) {
+                        style.fg = th.cyan;
+                        style.bg = th.bar_bg;
+                        style.bold = true;
+                    }
                 }
                 if (slice[0] == '\t') {
                     const stop = x0 + gutter + (((col - x0 - gutter) / 4) + 1) * 4;
