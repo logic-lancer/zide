@@ -341,9 +341,11 @@ pub const Editor = struct {
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
         "]d / [d      next/prev diagnostic",
-        "]q / [q      next/prev grep hit",
+        "]q / [q      next/prev quickfix",
         "gg / G       top / bottom",
         "gf           goto file under cursor",
+        "gd           goto definition",
+        "gr           references (LSP)",
         "K            hover (LSP)",
         "gcc / Ngcc   toggle comment",
         "gc (visual)  comment selection",
@@ -377,7 +379,7 @@ pub const Editor = struct {
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
-            .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
+            .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "r  references", "c  +comment" },
             .g_comment => &.{ "c / 0  this line", "j / k  cursor+N lines", "G  to last line", "g  +to line", "i  +text object" },
             .g_comment_g => &.{ "g  comment to first line" },
             .g_comment_i => &.{ "p  comment paragraph" },
@@ -1225,6 +1227,21 @@ pub const Editor = struct {
         l.hover(uri, b.row, b.col);
     }
 
+    /// `gr`: every reference to the symbol under the cursor, loaded into the
+    /// quickfix list (]q / [q) — the same backing store as live grep, so a
+    /// later `Space f w` replaces them, vim's single-list rule.
+    fn lspReferences(self: *Editor) void {
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        if (!b.isZig()) return self.setStatus("no language server for this file", .{});
+        const l = self.ensureLsp() orelse return self.setStatus("LSP is not running", .{});
+        if (!l.initialized or !b.lsp_opened) return self.setStatus("zls: not ready yet", .{});
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        l.references(uri, b.row, b.col);
+        self.setStatus("gr: searching...", .{});
+    }
+
     /// Pump the client from the poll tick: I/O, deferred didOpen, debounced
     /// didChange, diagnostics, hover. Returns true when the screen must repaint.
     fn lspTick(self: *Editor) bool {
@@ -1307,6 +1324,13 @@ pub const Editor = struct {
             self.applyDefinition(loc);
             changed = true;
         }
+        if (l.refs_done) {
+            l.refs_done = false;
+            const locs = l.refs;
+            l.refs = &.{};
+            self.applyReferences(locs);
+            changed = true;
+        }
         return changed;
     }
 
@@ -1335,6 +1359,61 @@ pub const Editor = struct {
         b.goal_col = b.col;
         b.clampCol(false);
         self.setStatus("{s}:{d}:{d}", .{ name, l.line + 1, l.col + 1 });
+    }
+
+    /// Load reference locations into the quickfix list. No jump and no picker:
+    /// ]q / [q already walk this list, and opening the grep popup would let the
+    /// next filter keystroke re-grep straight over the results.
+    fn applyReferences(self: *Editor, locs: []Lsp.Loc) void {
+        defer Lsp.freeLocs(self.alloc, locs);
+        if (locs.len == 0) return self.setStatus("gr: no references found", .{});
+        self.clearGrep();
+        // locs are sorted by path, so one cached file read covers each file.
+        var cache_path: ?[]u8 = null;
+        var cache_data: ?[]u8 = null;
+        defer {
+            if (cache_path) |p| self.alloc.free(p);
+            if (cache_data) |d| self.alloc.free(d);
+        }
+        for (locs) |loc| {
+            if (self.grep_hits.items.len >= Popup.max_items) break;
+            const name = self.lspLocalPath(loc.path) orelse continue;
+            // Source text: an open buffer wins (it may be newer than disk).
+            var text: []const u8 = "";
+            var found = false;
+            for (self.buffers.items) |*b| {
+                if (!std.mem.eql(u8, b.file_name, name)) continue;
+                if (loc.line < b.lines.items.len) { text = b.lineText(loc.line); found = true; }
+                break;
+            }
+            if (!found) {
+                if (cache_path == null or !std.mem.eql(u8, cache_path.?, name)) {
+                    if (cache_path) |p| self.alloc.free(p);
+                    if (cache_data) |d| self.alloc.free(d);
+                    cache_path = self.alloc.dupe(u8, name) catch null;
+                    cache_data = std.fs.cwd().readFileAlloc(self.alloc, name, Popup.max_file_size) catch null;
+                }
+                if (cache_data) |d| {
+                    var it = std.mem.splitScalar(u8, d, '\n');
+                    var i: u32 = 0;
+                    while (it.next()) |ln| : (i += 1) if (i == loc.line) { text = ln; break; };
+                }
+            }
+            text = std.mem.trim(u8, text, " \t\r");
+            var end: usize = @min(text.len, 80);
+            while (end > 0 and end < text.len and (text[end] & 0xC0) == 0x80) end -= 1; // utf-8 boundary
+            const disp = std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ name, loc.line + 1, text[0..end] }) catch {
+                self.alloc.free(name);
+                continue;
+            };
+            self.grep_hits.append(self.alloc, .{ .path = name, .line = loc.line + 1, .disp = disp }) catch {
+                self.alloc.free(name);
+                self.alloc.free(disp);
+                break;
+            };
+        }
+        const n = self.grep_hits.items.len;
+        self.setStatus("{d} reference{s} - ]q / [q to navigate", .{ n, if (n == 1) "" else "s" });
     }
 
     // ---- status line ------------------------------------------------------
@@ -2428,6 +2507,8 @@ pub const Editor = struct {
                     self.gotoDefinition();
                 } else if (cp == 'c') {
                     self.pending = .g_comment;
+                } else if (cp == 'r') {
+                    self.lspReferences();
                 }
                 return ctx.consumeAndRedraw();
             },

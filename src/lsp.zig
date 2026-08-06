@@ -26,6 +26,11 @@ pub const Lsp = struct {
     /// the flag is what distinguishes "no answer yet" from "answer: nothing".
     def_done: bool = false,
     def_loc: ?Loc = null,
+    refs_id: i64 = 0,
+    /// A references response landed; `refs` is its payload (empty when the
+    /// server answered null). Taken and freed by the editor.
+    refs_done: bool = false,
+    refs: []Loc = &.{},
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -116,6 +121,7 @@ pub const Lsp = struct {
         self.publishes.deinit(self.alloc);
         if (self.hover_text) |t| self.alloc.free(t);
         if (self.def_loc) |l| self.alloc.free(l.path);
+        freeLocs(self.alloc, self.refs);
         self.* = undefined;
     }
 
@@ -211,6 +217,19 @@ pub const Lsp = struct {
         });
     }
 
+    pub fn references(self: *Lsp, uri: []const u8, line: usize, col: usize) void {
+        self.refs_id = self.request("textDocument/references", .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = @as(i64, @intCast(line)), .character = @as(i64, @intCast(col)) },
+            .context = .{ .includeDeclaration = true },
+        });
+    }
+
+    pub fn freeLocs(alloc: std.mem.Allocator, locs: []Loc) void {
+        for (locs) |l| alloc.free(l.path);
+        alloc.free(locs);
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -299,6 +318,11 @@ pub const Lsp = struct {
         if (self.def_id != 0 and id == self.def_id) {
             self.def_id = 0;
             self.onDefinition(root);
+            return;
+        }
+        if (self.refs_id != 0 and id == self.refs_id) {
+            self.refs_id = 0;
+            self.onReferences(root);
             return;
         }
     }
@@ -406,6 +430,41 @@ pub const Lsp = struct {
         const ch = getInt(start, "character") orelse 0;
         const path = pathFromUri(self.alloc, uri) catch return null;
         return .{ .path = path, .line = @intCast(@max(line, 0)), .col = @intCast(@max(ch, 0)) };
+    }
+
+    // ---- references ---------------------------------------------------------
+
+    fn onReferences(self: *Lsp, root: std.json.Value) void {
+        freeLocs(self.alloc, self.refs);
+        self.refs = &.{};
+        self.refs_done = true;
+        const arr = switch (objGet(root, "result") orelse return) {
+            .array => |a| a,
+            else => return, // null: not on a symbol
+        };
+        var list: std.ArrayListUnmanaged(Loc) = .{};
+        errdefer {
+            for (list.items) |l| self.alloc.free(l.path);
+            list.deinit(self.alloc);
+        }
+        for (arr.items) |item| {
+            const loc = self.parseLoc(item) orelse continue;
+            list.append(self.alloc, loc) catch {
+                self.alloc.free(loc.path);
+                break;
+            };
+        }
+        // zls returns them in analysis order; sort so the quickfix list groups
+        // by file and the caller's one-slot file cache is exact.
+        std.mem.sort(Loc, list.items, {}, lessLoc);
+        self.refs = list.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    fn lessLoc(_: void, a: Loc, b: Loc) bool {
+        const c = std.mem.order(u8, a.path, b.path);
+        if (c != .eq) return c == .lt;
+        if (a.line != b.line) return a.line < b.line;
+        return a.col < b.col;
     }
 
     // ---- json helpers (switch-based: no tagged-union equality) ------------
