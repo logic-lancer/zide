@@ -206,7 +206,7 @@ pub const Editor = struct {
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
-            .g_comment => &.{ "c  line (Ngcc)", "j / k  cursor+N lines", "G  to last line", "g  +to line", "i  +text object" },
+            .g_comment => &.{ "c / 0  this line", "j / k  cursor+N lines", "G  to last line", "g  +to line", "i  +text object" },
             .g_comment_g => &.{ "g  comment to first line" },
             .g_comment_i => &.{ "p  comment paragraph" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
@@ -631,9 +631,15 @@ pub const Editor = struct {
         try patch.appendSlice(self.alloc, text[0 .. hdr_nl + 1]);
         // Rebuilt from the parsed Hunk: git omits a ",1" count and appends
         // function context, both of which apply cleanly when normalized.
+        // CRITICAL: the diff's new-side start is worktree-relative, but this
+        // single-hunk patch is applied to the index — git seeks pure-add
+        // hunks (no '-' anchor lines) from the new-side start, so an earlier
+        // unstaged hunk would silently shift the insertion point. Derive the
+        // new-side start from the old side, the only index-true base.
+        const new_start = if (h.old_count == 0) h.old_start + 1 else h.old_start;
         var hbuf: [80]u8 = undefined;
         try patch.appendSlice(self.alloc, std.fmt.bufPrint(&hbuf, "@@ -{d},{d} +{d},{d} @@\n", .{
-            h.old_start, h.old_count, h.new_start, h.new_count,
+            h.old_start, h.old_count, new_start, h.new_count,
         }) catch return self.setStatus("hunk header too long", .{}));
         // Body verbatim, "\ No newline at end of file" markers included.
         try patch.appendSlice(self.alloc, h.body(text));
