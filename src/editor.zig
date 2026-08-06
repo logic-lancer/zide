@@ -1391,7 +1391,11 @@ pub const Editor = struct {
                         const h = self.grep_hits.items[idx];
                         self.qf_idx = idx;
                         self.qf_seen = true;
-                        _ = self.jumpTo(h.path, h.line);
+                        // Same honesty as ]q: a vanished file must not
+                        // fabricate an empty buffer named after it.
+                        if (!fileExists(h.path)) {
+                            self.setStatus("{s} is gone", .{h.path});
+                        } else _ = self.jumpTo(h.path, h.line);
                     },
                     .recent => {
                         // openFile mutates oldfiles; work from a stable copy.
