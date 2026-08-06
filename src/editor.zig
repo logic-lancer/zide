@@ -129,7 +129,7 @@ pub const Editor = struct {
     /// later, so the request's region start (a byte offset — later typing
     /// only shifts bytes *after* it) is remembered to validate and re-filter
     /// it. `back` replays the Ctrl-p direction into whichever menu opens.
-    cmp_req: ?struct { buf: usize, start: usize, back: bool } = null,
+    cmp_req: ?struct { buf: usize, start: usize, back: bool, had_prefix: bool } = null,
     /// Ticks currently in flight. The terminal/LSP poll chain re-arms only at
     /// zero, so overlapping arm sites can never multiply into extra chains.
     ticks: u8 = 0,
@@ -1598,6 +1598,11 @@ pub const Editor = struct {
         // typing the same word". Enter moves ls past start; backspacing out
         // of the word pulls cur before start; a space or dot fails the scan.
         if (req.start < ls or req.start > cpos) return;
+        // A request made WITH a prefix whose prefix was then erased is an
+        // abandoned completion — resurrecting it as an unfiltered popup a
+        // tick later would be surprising. A request that started with an
+        // empty prefix (vim's bare Ctrl-n) legitimately matches all.
+        if (req.had_prefix and cpos == req.start) return;
         for (b.buf.items[req.start..cpos]) |c| if (Buffer.wordClass(c) != 1) return;
         const prefix = b.buf.items[req.start..cpos];
 
@@ -1620,6 +1625,9 @@ pub const Editor = struct {
             // Empty or null response: the pre-LSP behavior, one tick late.
             // Same shape as applyDefinition -> gotoDefLocal.
             self.cmpClose();
+            // Replace the stale "zls: completing..." before the word menu
+            // takes over the screen.
+            self.setStatus("no zls completions - buffer words", .{});
             self.cmpOpenWords(req.back) catch {};
             return;
         }
@@ -4195,7 +4203,7 @@ pub const Editor = struct {
         const pos = b.lines.items[b.row].start + col;
         var s = pos;
         while (s > 0 and Buffer.wordClass(text[s - 1]) == 1) s -= 1;
-        self.cmp_req = .{ .buf = self.active, .start = s, .back = back };
+        self.cmp_req = .{ .buf = self.active, .start = s, .back = back, .had_prefix = pos > s };
         self.setStatus("zls: completing...", .{});
         return true;
     }
