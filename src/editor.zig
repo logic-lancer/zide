@@ -337,6 +337,7 @@ pub const Editor = struct {
         "H / M / L    screen top/mid/bottom",
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
+        "]d / [d      next/prev diagnostic",
         "]q / [q      next/prev grep hit",
         "gg / G       top / bottom",
         "gf           goto file under cursor",
@@ -380,8 +381,8 @@ pub const Editor = struct {
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
             .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "e  yank to word end", "f F t T  find-char", "i  +inner object", "a  +around object" },
-            .bracket_f => &.{ "c  next git hunk", "q  next grep hit" },
-            .bracket_b => &.{ "c  prev git hunk", "q  prev grep hit" },
+            .bracket_f => &.{ "c  next git hunk", "d  next diagnostic", "q  next grep hit" },
+            .bracket_b => &.{ "c  prev git hunk", "d  prev diagnostic", "q  prev grep hit" },
             else => null,
         };
     }
@@ -2212,6 +2213,48 @@ pub const Editor = struct {
         self.setStatus("hunk {d}/{d}", .{ n, total });
     }
 
+    fn diagAtCursor(self: *Editor) ?*const Lsp.Diag {
+        if (self.buffers.items.len == 0) return null;
+        const b = self.cur();
+        for (b.diags.items) |*d| {
+            if (d.line == b.row) return d;
+        }
+        return null;
+    }
+
+    /// ]d / [d over the sorted diagnostic list, wrapping like ]c.
+    fn jumpDiag(self: *Editor, dir: i2) void {
+        const b = self.cur();
+        const ds = b.diags.items;
+        if (ds.len == 0) return self.setStatus("no diagnostics", .{});
+        var idx: usize = if (dir > 0) 0 else ds.len - 1; // wrap targets
+        if (dir > 0) {
+            for (ds, 0..) |d, i| {
+                if (@as(usize, d.line) > b.row) {
+                    idx = i;
+                    break;
+                }
+            }
+        } else {
+            var i = ds.len;
+            while (i > 0) : (i -= 1) {
+                if (@as(usize, ds[i - 1].line) < b.row) {
+                    idx = i - 1;
+                    break;
+                }
+            }
+        }
+        self.pushJump();
+        b.row = @min(@as(usize, ds[idx].line), b.lastRow()); // list may be stale
+        b.col = @min(@as(usize, ds[idx].col), b.lineLen(b.row));
+        b.clampCol(false);
+        b.goal_col = b.col;
+        // Cap: setStatus silently shows nothing when the format overflows 256 B.
+        const msg = ds[idx].message;
+        const cut = msg[0..Buffer.snapToCp(msg, @min(msg.len, 180))];
+        self.setStatus("diag {d}/{d}: {s}", .{ idx + 1, ds.len, cut });
+    }
+
     fn handleNormal(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
         // Any normal-mode key starts a fresh undo group, so a command's
@@ -2667,6 +2710,7 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'c' => self.jumpHunk(1),
+                    'd' => self.jumpDiag(1),
                     'q' => self.jumpQuickfix(1),
                     else => {},
                 }
@@ -2676,6 +2720,7 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'c' => self.jumpHunk(-1),
+                    'd' => self.jumpDiag(-1),
                     'q' => self.jumpQuickfix(-1),
                     else => {},
                 }
@@ -4702,8 +4747,17 @@ pub const Editor = struct {
                 _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
             }
 
-            // gitsigns-style hunk marker in the leftmost gutter column
-            switch (b.signFor(li)) {
+            // Diagnostics own the sign cell when present; the git sign shows through
+            // only on lines zls has nothing to say about.
+            if (b.diagFor(li)) |sev| {
+                const dc = switch (sev) {
+                    1 => th.red,
+                    2 => th.orange,
+                    3 => th.blue,
+                    else => th.gray,
+                };
+                _ = writeText(surface, ctx, x0, draw_row, "●", .{ .fg = dc, .bg = th.bg });
+            } else switch (b.signFor(li)) {
                 .none => {},
                 .add => _ = writeText(surface, ctx, x0, draw_row, "▎", .{ .fg = th.green, .bg = th.bg }),
                 .change => _ = writeText(surface, ctx, x0, draw_row, "▎", .{ .fg = th.orange, .bg = th.bg }),
@@ -5162,8 +5216,28 @@ pub const Editor = struct {
             end = writeText(surface, ctx, end, status_row, seg, branch_style);
         }
 
+        if (b) |buf| {
+            var errs: usize = 0;
+            var warns: usize = 0;
+            for (buf.diags.items) |d| {
+                if (d.severity == 1) errs += 1 else if (d.severity == 2) warns += 1;
+            }
+            if (errs + warns > 0) {
+                const seg = std.fmt.allocPrint(ctx.arena, " E:{d} W:{d} ", .{ errs, warns }) catch return;
+                const dstyle: vaxis.Style = .{
+                    .fg = if (errs > 0) th.red else th.orange,
+                    .bg = th.bar_bg,
+                    .bold = true,
+                };
+                end = writeText(surface, ctx, end, status_row, seg, dstyle);
+            }
+        }
+
+        const diag_at_cursor = if (self.status_len == 0) self.diagAtCursor() else null;
         const left = if (self.status_len > 0)
             std.fmt.allocPrint(ctx.arena, " {s}", .{self.status_buf[0..self.status_len]}) catch return
+        else if (diag_at_cursor) |d|
+            std.fmt.allocPrint(ctx.arena, " ● {s}", .{d.message}) catch return
         else if (b) |buf|
             std.fmt.allocPrint(ctx.arena, " {s}{s}", .{
                 buf.file_name,
@@ -5171,7 +5245,8 @@ pub const Editor = struct {
             }) catch return
         else
             " dashboard";
-        end = writeText(surface, ctx, end, status_row, left, bar_style);
+        const left_style: vaxis.Style = if (diag_at_cursor != null) .{ .fg = th.gutter, .bg = th.bar_bg } else bar_style;
+        end = writeText(surface, ctx, end, status_row, left, left_style);
 
         if (b) |buf| {
             var crumbs: [4]Crumb = undefined;
