@@ -2774,7 +2774,24 @@ pub const Editor = struct {
             return self.setStatus("pattern not found: {s}", .{self.search.items});
         self.pushJump();
         b.setCursorFromByte(hit);
-        self.setStatus("/{s}", .{self.search.items});
+        const st = searchStats(text, self.search.items, hit);
+        self.setStatus("/{s} [{d}/{d}]", .{ self.search.items, st.idx, st.total });
+    }
+
+    /// Match count for the status line: total plain occurrences of `pat` and
+    /// the 1-based index of the one at `pos`. Steps by 1 (overlapping) so the
+    /// count matches exactly the set of positions n/N walks.
+    fn searchStats(text: []const u8, pat: []const u8, pos: usize) struct { idx: usize, total: usize } {
+        if (pat.len == 0) return .{ .idx = 0, .total = 0 };
+        var total: usize = 0;
+        var idx: usize = 0;
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, pat)) |p| {
+            total += 1;
+            if (p == pos) idx = total;
+            i = p + 1;
+        }
+        return .{ .idx = idx, .total = total };
     }
 
     fn findNext(self: *Editor, dir: i2) void {
@@ -2800,13 +2817,16 @@ pub const Editor = struct {
         if (hit) |pos| {
             self.pushJump();
             b.setCursorFromByte(pos);
+            const st = searchStats(text, pat, pos);
             if (wrapped)
-                self.setStatus("search hit {s}, continuing at {s}", .{
+                self.setStatus("search hit {s}, continuing at {s} [{d}/{d}]", .{
                     if (dir > 0) "BOTTOM" else "TOP",
                     if (dir > 0) "TOP" else "BOTTOM",
+                    st.idx,
+                    st.total,
                 })
             else
-                self.setStatus("/{s}", .{pat});
+                self.setStatus("/{s} [{d}/{d}]", .{ pat, st.idx, st.total });
         } else {
             self.setStatus("pattern not found: {s}", .{pat});
         }
