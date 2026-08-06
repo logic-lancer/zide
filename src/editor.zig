@@ -1450,8 +1450,11 @@ pub const Editor = struct {
             self.setStatus("{d} reference{s} - ]q / [q to navigate", .{ n, if (n == 1) "" else "s" });
         }
         // NvChad shows references in a picker immediately; Esc keeps them
-        // in the quickfix list for ]q / [q.
-        self.openPopup(.qf);
+        // in the quickfix list for ]q / [q. Guarded: the reply lands on a
+        // tick, and opening mid-insert (or over another picker) would
+        // reroute in-flight keystrokes into the filter — or worse, let a
+        // race-timed Enter jump somewhere the user never chose.
+        if (self.popup.kind == .none and self.mode == .normal) self.openPopup(.qf);
     }
 
     // ---- status line ------------------------------------------------------
@@ -5696,7 +5699,12 @@ pub const Editor = struct {
             }
             const marker = if (self.popup.kind == .buffers and idx == self.active) "● " else if (self.popup.kind == .themes and &themes.list[idx] == self.theme) "● " else "  ";
             const name = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ marker, self.popupItemName(idx) }) catch return;
-            _ = writeText(surface.*, ctx, x0 + 2, item_row, name, if (is_sel) sel_style else body);
+            // Clip to the inner width (codepoint-safe): grep/quickfix rows
+            // can be far wider than the frame and were eating the border.
+            const inner: usize = w -| 3; // left pad 2 + right border 1
+            var cap = @min(name.len, inner);
+            while (cap > 0 and cap < name.len and (name[cap] & 0xC0) == 0x80) cap -= 1;
+            _ = writeText(surface.*, ctx, x0 + 2, item_row, name[0..cap], if (is_sel) sel_style else body);
         }
 
         surface.cursor = .{
