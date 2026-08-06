@@ -196,9 +196,11 @@ pub const Editor = struct {
 
     fn nodeText(src: []const u8, node: ts.Node) []const u8 {
         const s = @min(@as(usize, node.startByte()), src.len);
-        var e = @min(@as(usize, node.endByte()), src.len);
-        if (e > s + 64) e = s + 64;
-        while (e > s and (src[e - 1] & 0xC0) == 0x80) e -= 1; // utf-8 boundary
+        const full = @min(@as(usize, node.endByte()), src.len);
+        var e = @min(full, s + 64);
+        // Back off to the start of a partially-cut codepoint: stopping on
+        // continuation bytes alone would leave the dangling lead byte in.
+        while (e > s and e < full and (src[e] & 0xC0) == 0x80) e -= 1;
         return src[s..e];
     }
 
@@ -247,8 +249,16 @@ pub const Editor = struct {
         }
         const nm = name orelse return null;
         if (std.mem.eql(u8, kw, "const")) {
+            // Whole-word scan: a bare indexOf would hit e.g. the library
+            // string in `extern "varlib" const C` and mislabel it `var`.
             const head = src[@min(@as(usize, node.startByte()), src.len)..@min(@as(usize, nm.startByte()), src.len)];
-            if (std.mem.indexOf(u8, head, "var") != null) kw = "var";
+            var scan: usize = 0;
+            while (std.mem.indexOfPos(u8, head, scan, "var")) |p| : (scan = p + 1) {
+                if (wordBounded(head, p, 3)) {
+                    kw = "var";
+                    break;
+                }
+            }
         }
         return .{ .kw = kw, .name = nodeText(src, nm) };
     }
@@ -259,7 +269,11 @@ pub const Editor = struct {
         if (self.buffers.items.len == 0) return 0;
         const b = self.cur();
         const tree = b.hl.tree orelse return 0;
-        const byte: u32 = @intCast(@min(b.cursorByte(), b.buf.items.len));
+        // Probe from the first non-blank column when the cursor sits in the
+        // leading indentation — otherwise `0` on a fn's signature line makes
+        // the crumb flicker from `fn x` to just the enclosing container.
+        const fnw = b.lines.items[b.row].start + b.firstNonWs(b.row);
+        const byte: u32 = @intCast(@min(@max(b.cursorByte(), fnw), b.buf.items.len));
         var node = tree.rootNode().descendantForByteRange(byte, byte) orelse return 0;
         var n: usize = 0;
         while (true) {
@@ -1246,18 +1260,24 @@ pub const Editor = struct {
     }
 
     /// Open `path` and place the cursor on `line` (1-based), roughly centered.
-    fn jumpTo(self: *Editor, path: []const u8, line: usize) void {
+    /// Returns false when the target could not actually be focused —
+    /// openFile soft-fails (setStatus + plain return) on read errors, and
+    /// moving the cursor in whatever buffer is current would silently jump
+    /// the wrong file to the hit's line number.
+    fn jumpTo(self: *Editor, path: []const u8, line: usize) bool {
         self.openFile(path) catch {
             self.setStatus("could not open {s}", .{path});
-            return;
+            return false;
         };
-        if (self.buffers.items.len == 0) return; // open failed softly
+        if (self.buffers.items.len == 0) return false; // open failed softly
         const b = self.cur();
+        if (!std.mem.eql(u8, b.file_name, path)) return false; // soft-fail kept old buffer
         b.row = @min(line -| 1, b.lines.items.len -| 1);
         b.col = b.firstNonWs(b.row);
         b.goal_col = b.col;
         b.clampCol(false);
         b.scroll = b.row -| (self.last_height / 2);
+        return true;
     }
 
     /// vim quickfix analog over the last `Space f w` results, which outlive
@@ -1271,7 +1291,12 @@ pub const Editor = struct {
         } else self.qf_seen = true;
         if (self.qf_idx >= n) self.qf_idx = 0;
         const h = self.grep_hits.items[self.qf_idx];
-        self.jumpTo(h.path, h.line);
+        // Files can vanish or become unreadable between the grep and now:
+        // never report success over a jump that didn't happen (and keep
+        // qf_idx advanced so ]q can step past dead entries).
+        if (!fileExists(h.path))
+            return self.setStatus("quickfix {d}/{d}: {s} is gone", .{ self.qf_idx + 1, n, h.path });
+        if (!self.jumpTo(h.path, h.line)) return; // jumpTo's error status stands
         self.setStatus("quickfix {d}/{d}: {s}:{d}", .{ self.qf_idx + 1, n, h.path, h.line });
     }
 
@@ -1366,7 +1391,7 @@ pub const Editor = struct {
                         const h = self.grep_hits.items[idx];
                         self.qf_idx = idx;
                         self.qf_seen = true;
-                        self.jumpTo(h.path, h.line);
+                        _ = self.jumpTo(h.path, h.line);
                     },
                     .recent => {
                         // openFile mutates oldfiles; work from a stable copy.
