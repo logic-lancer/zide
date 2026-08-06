@@ -520,13 +520,27 @@ pub const Editor = struct {
     const preview_max_rows = 12;
     const preview_max_cols = 72;
 
-    /// Append one row, truncated on a codepoint boundary.
+    /// Append one row, truncated on a codepoint boundary. Tabs expand to
+    /// 4-space stops first: writeText renders a raw '\t' as zero-width,
+    /// which would strip the indentation of previewed code.
     fn appendPreviewLine(self: *Editor, line: []const u8) void {
-        var n = @min(line.len, preview_max_cols);
-        while (n > 0 and n < line.len and (line[n] & 0xC0) == 0x80) n -= 1;
-        if (self.preview_len + n + 1 > self.preview_buf.len) return;
-        @memcpy(self.preview_buf[self.preview_len..][0..n], line[0..n]);
-        self.preview_len += n;
+        var ex: [preview_max_cols + 4]u8 = undefined;
+        var n: usize = 0;
+        for (line) |ch| {
+            if (n >= ex.len) break;
+            if (ch == '\t') {
+                const stop = @min(((n / 4) + 1) * 4, ex.len);
+                while (n < stop) : (n += 1) ex[n] = ' ';
+            } else {
+                ex[n] = ch;
+                n += 1;
+            }
+        }
+        var w = @min(n, preview_max_cols);
+        while (w > 0 and w < n and (ex[w] & 0xC0) == 0x80) w -= 1;
+        if (self.preview_len + w + 1 > self.preview_buf.len) return;
+        @memcpy(self.preview_buf[self.preview_len..][0..w], ex[0..w]);
+        self.preview_len += w;
         self.preview_buf[self.preview_len] = '\n';
         self.preview_len += 1;
     }
@@ -3440,6 +3454,7 @@ pub const Editor = struct {
         // Any click or wheel dismisses the hunk preview — the buffer may
         // scroll or change underneath it (keys clear it in the event loop,
         // but mouse events branch off before that reset).
+        const had_preview = m.type == .press and self.preview_len != 0;
         if (m.type == .press) self.preview_len = 0;
         if (!self.mlay.valid) return;
         if (self.popup.kind != .none) return; // popups stay keyboard-driven
@@ -3518,7 +3533,7 @@ pub const Editor = struct {
             }
             // Miss (right of the last tab): still repaint a stale which-key
             // panel away, since the prefix was cleared above.
-            if (had_pending) ctx.consumeAndRedraw();
+            if (had_pending or had_preview) ctx.consumeAndRedraw();
             return;
         }
 
@@ -3578,9 +3593,10 @@ pub const Editor = struct {
             return ctx.consumeAndRedraw();
         }
 
-        // Press on dead space (status row, splits): nothing to do, but the
-        // cleared prefix means a visible which-key panel must be redrawn away.
-        if (had_pending) ctx.consumeAndRedraw();
+        // Press on dead space (status row, splits): nothing to do, but a
+        // cleared prefix or hunk preview means a visible panel must be
+        // redrawn away.
+        if (had_pending or had_preview) ctx.consumeAndRedraw();
     }
 
     /// Double-click: visually select the word (or symbol run) under the cursor.
