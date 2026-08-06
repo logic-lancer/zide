@@ -200,7 +200,7 @@ pub const Editor = struct {
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
-            .leader_g => &.{ "r  reset hunk", "p  preview hunk", "b  blame line" },
+            .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
             .g_comment => &.{ "c  toggle comment line" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
@@ -397,6 +397,10 @@ pub const Editor = struct {
         if (new_raw.len < 2 or new_raw[0] != '+') return null;
         const o = parseSpec(old_spec) orelse return null;
         const n = parseSpec(new_raw[1..]) orelse return null;
+        // Git only emits +0 with an explicit 0 count (pure deletions);
+        // reject +0 with a nonzero count so covers() can safely compute
+        // new_start - 1 instead of trusting that invariant blindly.
+        if (n[0] == 0 and n[1] != 0) return null;
         return .{ .old_start = o[0], .old_count = o[1], .new_start = n[0], .new_count = n[1] };
     }
 
@@ -464,16 +468,31 @@ pub const Editor = struct {
             return self.setStatus("no hunk under cursor", .{});
 
         // Old side of the hunk: the '-' body lines, each re-terminated.
+        // A "\ No newline at end of file" marker right after a '-' line
+        // means HEAD's side lacked the final newline — trust the marker,
+        // not the buffer's EOF state (they differ in exactly the
+        // trailing-newline-only hunks that made the old heuristic a no-op).
         var old: std.ArrayListUnmanaged(u8) = .{};
         defer old.deinit(self.alloc);
+        var old_no_nl = false;
+        var last_sign: u8 = 0;
         var it = std.mem.splitScalar(u8, h.body(text), '\n');
         while (it.next()) |ln| {
-            if (ln.len == 0 or ln[0] != '-') continue;
+            if (ln.len == 0) continue;
+            if (ln[0] == '\\') {
+                if (last_sign == '-') old_no_nl = true;
+                continue;
+            }
+            last_sign = ln[0];
+            if (ln[0] != '-') continue;
             try old.appendSlice(self.alloc, ln[1..]);
             try old.append(self.alloc, '\n');
         }
+        if (old_no_nl and old.items.len > 0) _ = old.pop();
 
-        b.undo_new_group = true; // one command = one undo group
+        // (Redundant arming — the keypress already did it — kept in case
+        // this is ever called outside the key path.)
+        b.undo_new_group = true;
         if (h.new_count == 0) {
             // Pure deletion: put the old lines back after row new_start-1
             // (new_start == 0 means they were deleted from the very top).
@@ -488,11 +507,7 @@ pub const Editor = struct {
             const last = @min(first + h.new_count - 1, b.lines.items.len - 1);
             const start = b.lines.items[first].start;
             var end: usize = b.lines.items[last].end;
-            if (end < b.buf.items.len) {
-                end += 1; // take the trailing newline, like Buffer.deleteLine
-            } else if (old.items.len > 0) {
-                _ = old.pop(); // replacing through EOF: no trailing newline
-            }
+            if (end < b.buf.items.len) end += 1; // take the trailing newline
             try b.replaceRange(start, end, old.items); // "" for a pure-add hunk
             b.row = @min(first, b.lastRow());
         }
@@ -602,8 +617,11 @@ pub const Editor = struct {
     /// cursor line, in the status line.
     fn blameLine(self: *Editor) void {
         const b = self.gitTarget() orelse return;
+        // A mouse click can park the cursor on the phantom last line; git
+        // would answer "file has only N lines".
+        const row = @min(b.row, b.lastRow());
         var lbuf: [40]u8 = undefined;
-        const spec = std.fmt.bufPrint(&lbuf, "{d},{d}", .{ b.row + 1, b.row + 1 }) catch return;
+        const spec = std.fmt.bufPrint(&lbuf, "{d},{d}", .{ row + 1, row + 1 }) catch return;
         const res = std.process.Child.run(.{
             .allocator = self.alloc,
             .argv = &.{ "git", "blame", "-L", spec, "--line-porcelain", "--", b.file_name },
@@ -629,11 +647,14 @@ pub const Editor = struct {
             } else if (std.mem.startsWith(u8, ln, "\t")) break; // line content ends the header
         }
         if (std.mem.eql(u8, author, "Not Committed Yet"))
-            return self.setStatus("line {d}: not committed yet", .{b.row + 1});
+            return self.setStatus("line {d}: not committed yet", .{row + 1});
         var dbuf: [16]u8 = undefined;
         const date = fmtDate(&dbuf, when);
-        const sum = summary[0..@min(summary.len, 120)];
-        self.setStatus("{s}, {s}: {s}", .{ author, date, sum });
+        // Codepoint-safe caps keep the total under status_buf's 256 bytes
+        // (a too-long line makes setStatus silently show nothing).
+        const a = author[0..Buffer.snapToCp(author, @min(author.len, 80))];
+        const sum = summary[0..Buffer.snapToCp(summary, @min(summary.len, 120))];
+        self.setStatus("{s}, {s}: {s}", .{ a, date, sum });
     }
 
     pub fn deinit(self: *Editor) void {
@@ -3416,6 +3437,10 @@ pub const Editor = struct {
     /// mouse=a: clicks focus panes / place the cursor, tab clicks switch
     /// (and close on the ×), tree clicks select then open, wheel scrolls.
     fn handleMouse(self: *Editor, ctx: *vxfw.EventContext, m: vaxis.Mouse) !void {
+        // Any click or wheel dismisses the hunk preview — the buffer may
+        // scroll or change underneath it (keys clear it in the event loop,
+        // but mouse events branch off before that reset).
+        if (m.type == .press) self.preview_len = 0;
         if (!self.mlay.valid) return;
         if (self.popup.kind != .none) return; // popups stay keyboard-driven
         if (self.buffers.items.len == 0) return;
