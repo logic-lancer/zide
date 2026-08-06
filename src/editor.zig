@@ -1193,7 +1193,8 @@ pub const Editor = struct {
     fn lspHover(self: *Editor) void {
         const b = self.cur();
         if (!b.isZig()) return self.setStatus("no language server for this file", .{});
-        const l = self.ensureLsp() orelse return;
+        const l = self.ensureLsp() orelse
+            return self.setStatus("LSP is not running", .{});
         if (!l.initialized or !b.lsp_opened) return self.setStatus("zls: not ready yet", .{});
         const uri = self.bufUri(b) orelse return;
         defer self.alloc.free(uri);
@@ -1210,6 +1211,13 @@ pub const Editor = struct {
             self.lsp.?.deinit();
             self.lsp = null;
             self.lsp_failed = true; // report once, never respawn
+            // Nothing will ever update or clear these again — stale marks
+            // would otherwise outlive the server (and the buffer contents).
+            for (self.buffers.items) |*b| {
+                for (b.diags.items) |d| self.alloc.free(d.message);
+                b.diags.clearRetainingCapacity();
+                b.lsp_opened = false;
+            }
             self.setStatus("zls exited — LSP off", .{});
             return true;
         }
@@ -1229,8 +1237,10 @@ pub const Editor = struct {
                 b.lsp_dirty = false;
             }
         }
-        while (l.publishes.pop()) |p| {
-            defer self.alloc.free(p.path);
+        // FIFO: pop() would apply the OLDEST publish last, resurrecting
+        // diagnostics that an immediately-following empty publish had
+        // already cleared (last publish must win per LSP semantics).
+        for (l.publishes.items) |p| {
             var owner: ?*Buffer = null;
             for (self.buffers.items) |*b| {
                 const abs = self.absPath(b) orelse continue;
@@ -1244,7 +1254,9 @@ pub const Editor = struct {
                 b.setDiags(self.alloc, p.diags);
                 changed = true;
             } else Lsp.freeDiags(self.alloc, p.diags);
+            self.alloc.free(p.path);
         }
+        l.publishes.clearRetainingCapacity();
         if (l.hover_text) |txt| {
             defer self.alloc.free(txt);
             l.hover_text = null;
@@ -1645,7 +1657,15 @@ pub const Editor = struct {
                     self.armTick(ctx, poll_tick_ms);
                 return;
             },
-            .mouse => |m| return self.handleMouse(ctx, m),
+            .mouse => |m| {
+                try self.handleMouse(ctx, m);
+                // A tree double-click can open the first zig buffer and
+                // spawn zls; without this the poll chain would only start
+                // on the next keypress.
+                if (self.lspAlive() and self.ticks == 0)
+                    self.armTick(ctx, poll_tick_ms);
+                return;
+            },
             .key_press => |key| {
                 self.status_len = 0;
                 self.preview_len = 0;

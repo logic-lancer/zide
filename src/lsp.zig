@@ -92,6 +92,10 @@ pub const Lsp = struct {
             f.close(); // EOF makes zls exit on its own
             self.child.stdin = null;
         }
+        if (self.child.stdout) |f| {
+            f.close(); // otherwise the read end leaks one fd per teardown
+            self.child.stdout = null;
+        }
         _ = self.child.kill() catch {}; // SIGTERM + reap
         self.in.deinit(self.alloc);
         self.out.deinit(self.alloc);

@@ -129,8 +129,12 @@ pub const Buffer = struct {
     pub fn setDiags(self: *Buffer, alloc: std.mem.Allocator, diags: []lsp.Lsp.Diag) void {
         for (self.diags.items) |d| self.alloc.free(d.message);
         self.diags.clearRetainingCapacity();
-        self.diags.appendSlice(self.alloc, diags) catch {};
-        alloc.free(diags); // the elements moved; only the slice is released
+        self.diags.appendSlice(self.alloc, diags) catch {
+            // The elements didn't move after all: their messages are still
+            // ours to free, or they leak.
+            for (diags) |d| self.alloc.free(d.message);
+        };
+        alloc.free(diags); // the slice itself is always released
     }
 
     /// Highest-priority (lowest) severity on `row`, or null.
