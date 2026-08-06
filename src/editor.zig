@@ -341,6 +341,7 @@ pub const Editor = struct {
         "]q / [q      next/prev grep hit",
         "gg / G       top / bottom",
         "gf           goto file under cursor",
+        "K            hover (LSP)",
         "gcc / Ngcc   toggle comment",
         "gc (visual)  comment selection",
         "gcj gck gcG  comment motion",
@@ -1187,6 +1188,19 @@ pub const Editor = struct {
         l.didSave(uri);
     }
 
+    /// K: ask zls about the identifier under the cursor. The answer arrives on
+    /// a later poll tick and lands in the preview panel.
+    fn lspHover(self: *Editor) void {
+        const b = self.cur();
+        if (!b.isZig()) return self.setStatus("no language server for this file", .{});
+        const l = self.ensureLsp() orelse return;
+        if (!l.initialized or !b.lsp_opened) return self.setStatus("zls: not ready yet", .{});
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        // utf-8 position encoding was negotiated: byte columns go over as-is.
+        l.hover(uri, b.row, b.col);
+    }
+
     /// Pump the client from the poll tick: I/O, deferred didOpen, debounced
     /// didChange, diagnostics, hover. Returns true when the screen must repaint.
     fn lspTick(self: *Editor) bool {
@@ -1231,8 +1245,25 @@ pub const Editor = struct {
                 changed = true;
             } else Lsp.freeDiags(self.alloc, p.diags);
         }
-        // hover drain: placeholder in commit 1, filled by commit 3:
-        // if (l.hover_text) |txt| { ... }
+        if (l.hover_text) |txt| {
+            defer self.alloc.free(txt);
+            l.hover_text = null;
+            self.preview_len = 0;
+            var rows: usize = 0;
+            var it = std.mem.splitScalar(u8, txt, '\n');
+            while (it.next()) |ln| {
+                const t = std.mem.trim(u8, ln, " \t\r");
+                if (std.mem.startsWith(u8, t, "```")) continue; // markdown fences
+                if (t.len == 0 and rows == 0) continue;
+                if (rows >= preview_max_rows) {
+                    self.appendPreviewLine("...");
+                    break;
+                }
+                self.appendPreviewLine(ln);
+                rows += 1;
+            }
+            changed = true;
+        }
         return changed;
     }
 
@@ -2850,6 +2881,7 @@ pub const Editor = struct {
                     } else break;
                 }
             },
+            'K' => self.lspHover(),
             'd' => self.pending = .d,
             'c' => self.pending = .c_op,
             'y' => self.pending = .y_op,
