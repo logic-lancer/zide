@@ -366,6 +366,7 @@ pub const Editor = struct {
         "u / Ctrl-r   undo / redo",
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
+        ":LspRestart  restart zls",
         "s (on dash)  restore session",
     };
 
@@ -1149,6 +1150,30 @@ pub const Editor = struct {
         };
         self.lsp_root = root; // owned, freed in deinit
         return &self.lsp.?;
+    }
+
+    /// `:LspRestart` — tear the client down, dead or alive, and let ensureLsp
+    /// spawn a fresh one. Every zig buffer is re-opened by the next poll tick's
+    /// deferred-didOpen pass, so nothing here has to send didOpen itself.
+    fn lspRestart(self: *Editor) void {
+        if (self.lsp) |*l| l.deinit();
+        self.lsp = null;
+        // ensureLsp allocates a fresh root; overwriting the old pointer leaks it.
+        if (self.lsp_root) |r| self.alloc.free(r);
+        self.lsp_root = null;
+        self.lsp_failed = false; // the whole point: undo the permanent-death flag
+        self.lsp_req = null;
+        for (self.buffers.items) |*b| {
+            for (b.diags.items) |d| self.alloc.free(d.message);
+            b.diags.clearRetainingCapacity();
+            b.lsp_opened = false;
+            b.lsp_dirty = false;
+            b.lsp_version = 0;
+        }
+        if (self.ensureLsp() == null) return; // its own status stands ("zls not found")
+        // The poll chain is re-armed by the key_press handler on the way out
+        // (it checks lspAlive after dispatchKey, which is what ran this).
+        self.setStatus("zls restarted", .{});
     }
 
     /// Absolute path for a buffer (file_name may be relative to the cwd).
@@ -4009,7 +4034,7 @@ pub const Editor = struct {
                 return self.completePath(arg, sp + 1);
             return;
         }
-        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename" };
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart" };
         return self.completeFrom(&cmds, s, 0);
     }
 
@@ -4110,6 +4135,7 @@ pub const Editor = struct {
             themes,
             noh,
             rename,
+            LspRestart,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -4145,6 +4171,7 @@ pub const Editor = struct {
             .themes => self.setStatus("themes: {s}", .{themes.names}),
             .noh => self.search_hl = false,
             .rename => try self.renameWord(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
+            .LspRestart => self.lspRestart(),
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
@@ -5435,6 +5462,11 @@ pub const Editor = struct {
             }) catch return;
             const branch_style: vaxis.Style = .{ .fg = th.blue, .bg = th.bar_bg, .bold = true };
             end = writeText(surface, ctx, end, status_row, seg, branch_style);
+        }
+
+        if (self.lspAlive()) {
+            const lsp_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bar_bg };
+            end = writeText(surface, ctx, end, status_row, " zls ", lsp_style);
         }
 
         if (b) |buf| {
