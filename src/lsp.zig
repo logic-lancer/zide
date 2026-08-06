@@ -41,6 +41,15 @@ pub const Lsp = struct {
     /// the server answered null). Taken and freed by the editor.
     rename_done: bool = false,
     rename_edits: []TextEdit = &.{},
+    sig_id: i64 = 0,
+    /// A signatureHelp response landed. `sig_label` is null when the server
+    /// answered null — the cursor is not inside a call, which is what closes
+    /// the panel. Both strings owned; taken and freed by the editor.
+    sig_done: bool = false,
+    sig_label: ?[]u8 = null,
+    sig_param: ?[]u8 = null, // active parameter's label, when there is one
+    sig_active: i64 = -1, // activeParameter index, -1 when absent
+    sig_total: usize = 0, // parameters.len
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -125,6 +134,15 @@ pub const Lsp = struct {
                         .contextSupport = false,
                     },
                     .rename = .{ .dynamicRegistration = false, .prepareSupport = false },
+                    // labelOffsetSupport is deliberately false: zls sends
+                    // parameters[].label as a plain string either way.
+                    .signatureHelp = .{
+                        .dynamicRegistration = false,
+                        .signatureInformation = .{
+                            .documentationFormat = [_][]const u8{"plaintext"},
+                            .activeParameterSupport = true,
+                        },
+                    },
                 },
             },
         });
@@ -160,6 +178,8 @@ pub const Lsp = struct {
         freeLocs(self.alloc, self.refs);
         freeItems(self.alloc, self.cmp_items);
         freeEdits(self.alloc, self.rename_edits);
+        if (self.sig_label) |t| self.alloc.free(t);
+        if (self.sig_param) |t| self.alloc.free(t);
         self.* = undefined;
     }
 
@@ -299,6 +319,13 @@ pub const Lsp = struct {
         });
     }
 
+    pub fn signatureHelp(self: *Lsp, uri: []const u8, line: usize, col: usize) void {
+        self.sig_id = self.request("textDocument/signatureHelp", .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = @as(i64, @intCast(line)), .character = @as(i64, @intCast(col)) },
+        });
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -402,6 +429,11 @@ pub const Lsp = struct {
         if (self.rename_id != 0 and id == self.rename_id) {
             self.rename_id = 0;
             self.onRename(root);
+            return;
+        }
+        if (self.sig_id != 0 and id == self.sig_id) {
+            self.sig_id = 0;
+            self.onSignatureHelp(root);
             return;
         }
     }
@@ -681,6 +713,46 @@ pub const Lsp = struct {
         if (c != .eq) return c == .lt;
         if (a.line != b.line) return a.line < b.line;
         return a.col < b.col;
+    }
+
+    // ---- signature help ---------------------------------------------------
+
+    /// zls 0.14 answers with exactly one signature: `label` is the full
+    /// `fn name(a: T, b: U) R` text and `parameters[].label` is a STRING (it
+    /// ignores labelOffsetSupport). activeParameter appears both on the
+    /// result and on the signature, identical in every probe, and is derived
+    /// from the comma count — which is why the editor only re-asks on
+    /// '(' ',' ')'. Positions past the closing paren answer null.
+    fn onSignatureHelp(self: *Lsp, root: std.json.Value) void {
+        if (self.sig_label) |t| self.alloc.free(t);
+        if (self.sig_param) |t| self.alloc.free(t);
+        self.sig_label = null;
+        self.sig_param = null;
+        self.sig_active = -1;
+        self.sig_total = 0;
+        self.sig_done = true;
+        const res = objGet(root, "result") orelse return; // null: not in a call
+        const sigs = switch (objGet(res, "signatures") orelse return) {
+            .array => |a| a.items,
+            else => return,
+        };
+        if (sigs.len == 0) return;
+        const ai: usize = @intCast(@max(getInt(res, "activeSignature") orelse 0, 0));
+        const sig = sigs[@min(ai, sigs.len - 1)];
+        const label = getStr(sig, "label") orelse return;
+        self.sig_label = self.alloc.dupe(u8, label) catch return;
+        var params: []const std.json.Value = &.{};
+        if (objGet(sig, "parameters")) |p| switch (p) {
+            .array => |a| params = a.items,
+            else => {},
+        };
+        self.sig_total = params.len;
+        const act = getInt(sig, "activeParameter") orelse getInt(res, "activeParameter") orelse -1;
+        self.sig_active = act;
+        if (act >= 0 and act < params.len) {
+            if (getStr(params[@intCast(act)], "label")) |p|
+                self.sig_param = self.alloc.dupe(u8, p) catch null;
+        }
     }
 
     // ---- json helpers (switch-based: no tagged-union equality) ------------

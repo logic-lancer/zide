@@ -38,6 +38,11 @@ pub const Editor = struct {
     /// `Space g p` hunk preview: raw '\n'-separated rows, cleared on any key.
     preview_buf: [2048]u8 = undefined,
     preview_len: usize = 0,
+    /// Row of `preview_buf` to accent (the active parameter), or null.
+    preview_hl_row: ?u16 = null,
+    /// A signature-help panel is up in insert mode: the per-keypress preview
+    /// clear is suppressed so it survives typing the argument.
+    sig_shown: bool = false,
     popup: Popup = .{},
     files: std.ArrayListUnmanaged([]u8) = .{},
     /// Recently opened files, most recent first (persisted, NvDash "recent").
@@ -167,7 +172,7 @@ pub const Editor = struct {
         selected: usize = 0,
 
         const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols, qf };
-        /// Raised from 64: the cheatsheet sits at 64 rows and the
+        /// Raised from 64: the cheatsheet sits at 69 rows and the
         /// quickfix picker holds up to this many reference hits —
         /// popupMatches silently drops anything past the cap.
         const max_items = 96;
@@ -356,6 +361,7 @@ pub const Editor = struct {
         "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-s       save file",
         "Ctrl-n/p     (insert) complete word",
+        "Ctrl-k       (insert) signature help",
         "Ctrl-Shift-c copy to clipboard",
         "Ctrl-d/u     half-page down/up",
         "Ctrl-e/y     scroll line down/up",
@@ -1002,6 +1008,7 @@ pub const Editor = struct {
     /// `Space g p` (gitsigns preview_hunk).
     fn previewHunk(self: *Editor) void {
         self.preview_len = 0;
+        self.preview_hl_row = null;
         const b = self.gitTarget() orelse return;
         const text = self.gitDiffText(b, .head) orelse
             return self.setStatus("no git diff for this file", .{});
@@ -1060,12 +1067,16 @@ pub const Editor = struct {
         it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |ln| {
             if (ln.len == 0) continue;
-            const fg = switch (ln[0]) {
+            const fg = if (self.preview_hl_row) |h| (if (h == r) th.cyan else th.gray) else switch (ln[0]) {
                 '+' => th.green,
                 '-' => th.red,
                 else => th.gray,
             };
-            _ = writeText(surface, ctx, x0 + 1, y0 + r, ln, .{ .fg = fg, .bg = th.bar_bg });
+            _ = writeText(surface, ctx, x0 + 1, y0 + r, ln, .{
+                .fg = fg,
+                .bg = th.bar_bg,
+                .bold = self.preview_hl_row != null and self.preview_hl_row.? == r,
+            });
             r += 1;
         }
     }
@@ -1406,6 +1417,30 @@ pub const Editor = struct {
         self.setStatus("gr: searching...", .{});
     }
 
+    fn sigClose(self: *Editor) void {
+        if (self.sig_shown) self.preview_len = 0;
+        self.sig_shown = false;
+        self.preview_hl_row = null;
+    }
+
+    /// textDocument/signatureHelp for the cursor; the reply lands in the
+    /// preview panel a tick later. `manual` (Ctrl-k) reports why nothing
+    /// happened; the auto-triggers stay silent.
+    fn lspSignature(self: *Editor, manual: bool) void {
+        if (self.buffers.items.len == 0) return;
+        if (self.cmp.active or self.popup.kind != .none) return; // they own the screen
+        const b = self.cur();
+        if (!b.isZig()) return if (manual) self.setStatus("no language server for this file", .{});
+        const l = self.ensureLsp() orelse return if (manual) self.setStatus("LSP is not running", .{});
+        if (!l.initialized or !b.lsp_opened) return if (manual) self.setStatus("zls: not ready yet", .{});
+        // The '(' or ',' was typed a keystroke ago: zls must see that byte or
+        // activeParameter is off by one argument.
+        self.lspFlushChange(b);
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        l.signatureHelp(uri, b.row, b.col);
+    }
+
     /// Pump the client from the poll tick: I/O, deferred didOpen, debounced
     /// didChange, diagnostics, hover. Returns true when the screen must repaint.
     fn lspTick(self: *Editor) bool {
@@ -1463,6 +1498,7 @@ pub const Editor = struct {
             defer self.alloc.free(txt);
             l.hover_text = null;
             self.preview_len = 0;
+            self.preview_hl_row = null;
             var rows: usize = 0;
             var it = std.mem.splitScalar(u8, txt, '\n');
             while (it.next()) |ln| {
@@ -1504,6 +1540,15 @@ pub const Editor = struct {
             const edits = l.rename_edits;
             l.rename_edits = &.{};
             self.applyRename(edits);
+            changed = true;
+        }
+        if (l.sig_done) {
+            l.sig_done = false;
+            const label = l.sig_label;
+            const param = l.sig_param;
+            l.sig_label = null;
+            l.sig_param = null;
+            self.applySignature(label, param, l.sig_active, l.sig_total);
             changed = true;
         }
         return changed;
@@ -1605,6 +1650,28 @@ pub const Editor = struct {
             self.setStatus("renamed {d} occurrence{s} in {d} file{s} (unsaved)", .{
                 count, if (count == 1) "" else "s", files, if (files == 1) "" else "s",
             });
+    }
+
+    fn applySignature(self: *Editor, label: ?[]u8, param: ?[]u8, active: i64, total: usize) void {
+        defer if (label) |t| self.alloc.free(t);
+        defer if (param) |t| self.alloc.free(t);
+        // The user left insert (or opened a menu) while it was in flight.
+        if (self.mode != .insert or self.cmp.active or self.popup.kind != .none) return self.sigClose();
+        // null: the cursor is no longer inside a call — typing past the ')'
+        // is what closes the panel, so it needs no Esc of its own.
+        const lab = label orelse return self.sigClose();
+        self.preview_len = 0;
+        self.preview_hl_row = null;
+        self.appendPreviewLine(lab);
+        if (param) |p| {
+            // zls sends parameter labels as strings, not offsets into the
+            // signature, so there is no honest caret to draw under the active
+            // one (and appendPreviewLine truncates at 72 columns anyway).
+            var buf: [preview_max_cols]u8 = undefined;
+            self.appendPreviewLine(std.fmt.bufPrint(&buf, "arg {d}/{d}: {s}", .{ active + 1, total, p }) catch p);
+            self.preview_hl_row = 1;
+        }
+        self.sig_shown = true;
     }
 
     /// The definition answer, ~one poll tick after `gd`. vim semantics: jump
@@ -2170,7 +2237,14 @@ pub const Editor = struct {
             },
             .key_press => |key| {
                 self.status_len = 0;
-                self.preview_len = 0;
+                // Signature help is re-asked only at '(' ',' ')' — clearing on
+                // every key would blank the panel for the tick it takes the
+                // reply to land, i.e. for the whole time the user types the
+                // argument. A null reply, Esc, or leaving insert closes it.
+                if (!(self.sig_shown and self.mode == .insert)) {
+                    self.preview_len = 0;
+                    self.preview_hl_row = null;
+                }
                 // Record live keys into the active macro register. The `q`
                 // that stops recording is popped again in handleNormal.
                 if (self.recording != null and self.replay_depth == 0)
@@ -4125,6 +4199,12 @@ pub const Editor = struct {
             self.save();
             return ctx.consumeAndRedraw();
         }
+        // NvChad <C-k>: signature help. Free in insert mode (the popup's
+        // Ctrl-k is a different handler) and it inserts nothing.
+        if (key.mods.ctrl and key.codepoint == 'k') {
+            self.lspSignature(true);
+            return ctx.consumeAndRedraw();
+        }
         if (self.cmp.active) {
             if (try self.cmpKey(ctx, key)) return;
         } else if (key.matches('n', .{ .ctrl = true }) or key.matches('p', .{ .ctrl = true })) {
@@ -4134,6 +4214,7 @@ pub const Editor = struct {
         switch (key.codepoint) {
             vaxis.Key.escape => {
                 self.cmpClose();
+                self.sigClose();
                 self.mode = .normal;
                 if (b.col > 0) b.col = Buffer.snapToCp(b.lineText(b.row), b.col - 1);
                 b.clampCol(false);
@@ -4146,10 +4227,16 @@ pub const Editor = struct {
                 if (key.mods.ctrl or key.mods.alt) return;
                 const text = key.text orelse return;
                 if (text.len == 1 and try autoPair(b, text[0])) {
+                    if (text[0] == '(' or text[0] == ')') self.lspSignature(false);
                     ctx.consumeAndRedraw();
                     return;
                 }
                 try b.insertText(text);
+                // zls derives activeParameter from the comma count, so these
+                // three characters are the only ones that can change the
+                // answer — typing an argument costs no request at all.
+                if (text.len == 1 and (text[0] == '(' or text[0] == ',' or text[0] == ')'))
+                    self.lspSignature(false);
             },
         }
         ctx.consumeAndRedraw();
@@ -4303,6 +4390,7 @@ pub const Editor = struct {
     /// otherwise, and whenever the server has nothing to say, from the words
     /// in the open buffers.
     fn cmpOpen(self: *Editor, back: bool) !void {
+        self.sigClose();
         if (self.cmpRequestLsp(back)) return;
         try self.cmpOpenWords(back);
     }
