@@ -33,6 +33,9 @@ pub const Editor = struct {
     find_op: u8 = 0,
     status_buf: [256]u8 = undefined,
     status_len: usize = 0,
+    /// `Space g p` hunk preview: raw '\n'-separated rows, cleared on any key.
+    preview_buf: [2048]u8 = undefined,
+    preview_len: usize = 0,
     popup: Popup = .{},
     files: std.ArrayListUnmanaged([]u8) = .{},
     /// Recently opened files, most recent first (persisted, NvDash "recent").
@@ -498,6 +501,91 @@ pub const Editor = struct {
         self.setStatus("hunk reset (:w to save, u to undo)", .{});
     }
 
+    const preview_max_rows = 12;
+    const preview_max_cols = 72;
+
+    /// Append one row, truncated on a codepoint boundary.
+    fn appendPreviewLine(self: *Editor, line: []const u8) void {
+        var n = @min(line.len, preview_max_cols);
+        while (n > 0 and n < line.len and (line[n] & 0xC0) == 0x80) n -= 1;
+        if (self.preview_len + n + 1 > self.preview_buf.len) return;
+        @memcpy(self.preview_buf[self.preview_len..][0..n], line[0..n]);
+        self.preview_len += n;
+        self.preview_buf[self.preview_len] = '\n';
+        self.preview_len += 1;
+    }
+
+    /// `Space g p` (gitsigns preview_hunk).
+    fn previewHunk(self: *Editor) void {
+        self.preview_len = 0;
+        const b = self.gitTarget() orelse return;
+        const text = self.gitDiffText(b) orelse
+            return self.setStatus("no git diff for this file", .{});
+        defer self.alloc.free(text);
+        const h = findHunkAt(text, b.row) orelse
+            return self.setStatus("no hunk under cursor", .{});
+
+        var hbuf: [64]u8 = undefined;
+        self.appendPreviewLine(std.fmt.bufPrint(&hbuf, "@@ -{d},{d} +{d},{d} @@", .{
+            h.old_start, h.old_count, h.new_start, h.new_count,
+        }) catch "@@");
+        var rows: usize = 1;
+        var it = std.mem.splitScalar(u8, h.body(text), '\n');
+        while (it.next()) |ln| {
+            if (ln.len == 0 or (ln[0] != '-' and ln[0] != '+')) continue; // skips "\ No newline…"
+            if (rows >= preview_max_rows) {
+                self.appendPreviewLine("...");
+                break;
+            }
+            self.appendPreviewLine(ln);
+            rows += 1;
+        }
+    }
+
+    /// Hunk preview panel: same geometry as drawWhichKey (right-aligned above
+    /// the status line) but per-row colors for +/-.
+    fn drawPreview(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, max: vxfw.Size) void {
+        if (self.preview_len == 0) return;
+        const th = self.theme.p;
+        const text = self.preview_buf[0..self.preview_len];
+
+        var panel_w: u16 = 0;
+        var n_rows: u16 = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |ln| {
+            if (ln.len == 0) continue;
+            const w: u16 = @intCast(@min(ctx.stringWidth(ln), max.width));
+            if (w > panel_w) panel_w = w;
+            n_rows += 1;
+        }
+        if (n_rows == 0) return;
+        panel_w += 2;
+        if (max.width < panel_w) return;
+        const status_row = max.height -| 1;
+        if (status_row < n_rows + 1) return; // keep row 0 (tabline) clear
+        const x0 = max.width -| panel_w;
+        const y0 = status_row -| n_rows;
+
+        const bg: vaxis.Style = .{ .bg = th.bar_bg };
+        var r: u16 = 0;
+        while (r < n_rows) : (r += 1) {
+            var c: u16 = 0;
+            while (c < panel_w) : (c += 1) surface.writeCell(x0 + c, y0 + r, .{ .style = bg });
+        }
+        r = 0;
+        it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |ln| {
+            if (ln.len == 0) continue;
+            const fg = switch (ln[0]) {
+                '+' => th.green,
+                '-' => th.red,
+                else => th.gray,
+            };
+            _ = writeText(surface, ctx, x0 + 1, y0 + r, ln, .{ .fg = fg, .bg = th.bar_bg });
+            r += 1;
+        }
+    }
+
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
@@ -832,6 +920,7 @@ pub const Editor = struct {
             .mouse => |m| return self.handleMouse(ctx, m),
             .key_press => |key| {
                 self.status_len = 0;
+                self.preview_len = 0;
                 // Record live keys into the active macro register. The `q`
                 // that stops recording is popped again in handleNormal.
                 if (self.recording != null and self.replay_depth == 0)
@@ -1792,7 +1881,7 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'r' => self.resetHunk() catch {},
-                    'p' => {},
+                    'p' => self.previewHunk(),
                     'b' => {},
                     else => {},
                 }
@@ -3693,6 +3782,7 @@ pub const Editor = struct {
         if (self.focus == .editor and self.popup.kind == .none and (self.mode == .normal or self.mode == .visual or self.mode == .visual_line) and self.pending != .none) {
             self.drawWhichKey(surface, ctx, max);
         }
+        if (self.preview_len > 0 and self.popup.kind == .none) self.drawPreview(surface, ctx, max);
         if (self.term_view == .float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
