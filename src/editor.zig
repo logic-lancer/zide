@@ -956,11 +956,8 @@ pub const Editor = struct {
         var pos = line_start + @min(b.col, b.lineLen(b.row));
         while (pos < line_end and Buffer.wordClass(text[pos]) != 1) pos += 1;
         if (pos >= line_end) return self.setStatus("no word under cursor", .{});
-        var lo = pos;
-        while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
-        var hi = pos;
-        while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
-        const word = text[lo..hi];
+        const w = wordAt(text, pos).?; // pos is on a word char by the scan above
+        const word = text[w.lo..w.hi];
         var i: usize = 0;
         const hit: ?usize = while (std.mem.indexOfPos(u8, text, i, word)) |p| {
             if (wordBounded(text, p, word.len)) break p;
@@ -975,17 +972,37 @@ pub const Editor = struct {
         self.setStatus("gd: {s}", .{word});
     }
 
-    /// vim-illuminate: the word under the cursor as a slice of the buffer,
-    /// or null when the cursor is not on a word char.
-    fn wordUnderCursor(b: *Buffer) ?struct { lo: usize, hi: usize } {
-        const text = b.buf.items;
-        const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+    const WordRange = struct { lo: usize, hi: usize };
+
+    /// Byte range of the word containing `pos`, or null when `pos` is not
+    /// on a word char.
+    fn wordAt(text: []const u8, pos: usize) ?WordRange {
         if (pos >= text.len or Buffer.wordClass(text[pos]) != 1) return null;
         var lo = pos;
         while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
         var hi = pos;
         while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
         return .{ .lo = lo, .hi = hi };
+    }
+
+    /// vim-illuminate: byte range of the word under the cursor, or null
+    /// when the cursor is not on a word char.
+    fn wordUnderCursor(b: *const Buffer) ?WordRange {
+        return wordAt(b.buf.items, b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row)));
+    }
+
+    /// Next whole-word occurrence of `word` in the line `text` at or after
+    /// line-relative offset `from`, skipping the occurrence the cursor is on
+    /// (absolute offset `self_lo`). Rejected candidates (substrings, the
+    /// cursor's own word) are skipped, not terminal.
+    fn nextIllum(buf: []const u8, line_start: usize, text: []const u8, from: usize, word: []const u8, self_lo: usize) ?usize {
+        var i = from;
+        while (std.mem.indexOfPos(u8, text, i, word)) |p| {
+            if (wordBounded(buf, line_start + p, word.len) and line_start + p != self_lo)
+                return p;
+            i = p + 1;
+        }
+        return null;
     }
 
     /// Consume the pending count prefix (defaults to 1).
@@ -3226,14 +3243,14 @@ pub const Editor = struct {
 
         // vim-illuminate: passively underline other occurrences of the word
         // under the cursor (normal mode, editor focus only).
-        var illum: ?[]const u8 = null;
-        var illum_self_lo: usize = 0;
-        if (self.focus == .editor and self.mode == .normal) {
-            if (wordUnderCursor(b)) |w| {
-                illum = b.buf.items[w.lo..w.hi];
-                illum_self_lo = w.lo;
-            }
-        }
+        const illum: ?struct { word: []const u8, self_lo: usize } =
+            if (self.focus == .editor and self.mode == .normal)
+                if (wordUnderCursor(b)) |w|
+                    .{ .word = b.buf.items[w.lo..w.hi], .self_lo = w.lo }
+                else
+                    null
+            else
+                null;
 
         var row: u16 = 0;
         while (row < text_rows) : (row += 1) {
@@ -3269,15 +3286,10 @@ pub const Editor = struct {
             const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
             const sel = self.selRange();
             var match: ?usize = if (self.search_hl and pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
-            var ill_at: ?usize = null;
-            if (illum) |illum_word| {
-                if (std.mem.indexOf(u8, text, illum_word)) |found_idx| {
-                    if (wordBounded(b.buf.items, line.start + found_idx, illum_word.len) and
-                        line.start + found_idx != illum_self_lo) {
-                        ill_at = found_idx;
-                    }
-                }
-            }
+            var ill_at: ?usize = if (illum) |il|
+                nextIllum(b.buf.items, line.start, text, 0, il.word, il.self_lo)
+            else
+                null;
             var cspan: ?ColorSpan = findColorSpan(text, 0);
             var col: u16 = x0 + gutter;
             var i: usize = 0;
@@ -3297,22 +3309,6 @@ pub const Editor = struct {
                         style.fg = if (lum > 140_000) .{ .rgb = .{ 0, 0, 0 } } else .{ .rgb = .{ 255, 255, 255 } };
                     }
                 }
-                if (illum) |illum_word| {
-                    if (ill_at) |ia| {
-                        if (i >= ia + illum_word.len) {
-                            ill_at = null;
-                            if (std.mem.indexOfPos(u8, text, i, illum_word)) |found_idx| {
-                                if (wordBounded(b.buf.items, line.start + found_idx, illum_word.len) and
-                                    line.start + found_idx != illum_self_lo) {
-                                    ill_at = found_idx;
-                                }
-                            }
-                        }
-                    }
-                    if (ill_at) |ia| {
-                        if (i >= ia and i < ia + illum_word.len) style.ul_style = .single;
-                    }
-                }
                 if (match) |m| {
                     if (i >= m + pat.len) match = std.mem.indexOfPos(u8, text, i, pat);
                 }
@@ -3329,6 +3325,18 @@ pub const Editor = struct {
                         style.fg = th.cyan;
                         style.bg = th.bar_bg;
                         style.bold = true;
+                    }
+                }
+                // Illuminate last: it only adds an underline, so it coexists
+                // with (rather than being wiped by) the whole-struct search
+                // style and the bg-based selection/matchparen styles.
+                if (illum) |il| {
+                    if (ill_at) |ia| {
+                        if (i >= ia + il.word.len)
+                            ill_at = nextIllum(b.buf.items, line.start, text, i, il.word, il.self_lo);
+                    }
+                    if (ill_at) |ia| {
+                        if (i >= ia and i < ia + il.word.len) style.ul_style = .single;
                     }
                 }
                 if (slice[0] == '\t') {
