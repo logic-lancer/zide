@@ -163,6 +163,7 @@ pub const Editor = struct {
         "Ctrl-l       focus editor",
         "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-s       save file",
+        "Ctrl-Shift-c copy to clipboard",
         "Ctrl-d/u     half-page down/up",
         "Ctrl-e/y     scroll line down/up",
         "zz/zt/zb     center/top/bottom",
@@ -1395,7 +1396,9 @@ pub const Editor = struct {
         const cp = key.shifted_codepoint orelse key.codepoint;
         if (key.mods.ctrl) {
             switch (cp) {
-                'c' => ctx.quit = true,
+                'c', 'C' => if (!key.mods.shift) {
+                    ctx.quit = true;
+                },
                 'n' => self.toggleTree(),
                 else => return,
             }
@@ -1953,7 +1956,11 @@ pub const Editor = struct {
 
         if (key.mods.ctrl) {
             switch (cp) {
-                'c' => ctx.quit = true,
+                'c', 'C' => if (key.mods.shift)
+                    try self.copyToClipboard(ctx)
+                else {
+                    ctx.quit = true;
+                },
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
                 'e' => {
@@ -2358,6 +2365,19 @@ pub const Editor = struct {
         b.setCursorFromByte(pos[0]);
     }
 
+    /// Ctrl-Shift-C: copy to the system clipboard via OSC 52 — the visual
+    /// selection when one is active, otherwise the yank register. Terminals
+    /// that forward the chord used to hit the Ctrl-C quit arm instead.
+    fn copyToClipboard(self: *Editor, ctx: *vxfw.EventContext) !void {
+        const text = if (self.selRange()) |r|
+            self.cur().buf.items[r[0]..r[1]]
+        else
+            self.reg.items;
+        if (text.len == 0) return self.setStatus("nothing to copy (yank or select first)", .{});
+        try ctx.addCmd(.{ .copy_to_clipboard = text });
+        self.setStatus("copied {d} bytes to system clipboard", .{text.len});
+    }
+
     fn selRange(self: *Editor) ?[2]usize {
         if (self.mode != .visual and self.mode != .visual_line) return null;
         if (self.buffers.items.len == 0) return null;
@@ -2472,7 +2492,11 @@ pub const Editor = struct {
 
         if (key.mods.ctrl) {
             switch (cp) {
-                'c' => ctx.quit = true,
+                'c', 'C' => if (key.mods.shift)
+                    try self.copyToClipboard(ctx)
+                else {
+                    ctx.quit = true;
+                },
                 'd' => b.moveVert(half, false),
                 'u' => b.moveVert(-half, false),
                 'e' => {
@@ -3574,7 +3598,9 @@ pub const Editor = struct {
 
         if (key.mods.ctrl) {
             switch (cp) {
-                'c' => ctx.quit = true,
+                'c', 'C' => if (!key.mods.shift) {
+                    ctx.quit = true;
+                },
                 'n' => self.toggleTree(),
                 'l' => self.focus = .editor,
                 else => return,
