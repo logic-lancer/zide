@@ -187,9 +187,9 @@ pub const Editor = struct {
             .leader_r => &.{ "n  toggle relative numbers" },
             .g => &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
-            .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f t  find-char to", "i  +inner object", "a  +around object" },
-            .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f t  find-char to", "i  +inner object", "a  +around object", "s  change surround" },
-            .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "e  yank to word end", "f t  find-char to", "i  +inner object", "a  +around object" },
+            .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
+            .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
+            .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "e  yank to word end", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .bracket_f => &.{ "c  next git hunk" },
             .bracket_b => &.{ "c  prev git hunk" },
             else => null,
@@ -2962,6 +2962,14 @@ pub const Editor = struct {
 
         if (m.type != .press or m.button != .left) return;
 
+        // Any left press cancels a half-typed prefix and its count: a later
+        // keystroke must not resume an operator at the click destination, and
+        // the which-key panel must not outlive the click. Covers every press
+        // path below (tabline, tree, text area, dead space).
+        const had_pending = self.pending != .none;
+        self.pending = .none;
+        self.count = 0;
+
         // Tabline: click switches, click on the active tab's × closes.
         if (m.row == 0) {
             for (self.tab_spans[0..self.tab_span_count]) |sp| {
@@ -3009,7 +3017,6 @@ pub const Editor = struct {
             m.col >= L.tree_w and m.col < L.text_right)
         {
             self.focus = .editor;
-            self.pending = .none;
             // A plain click cancels any active visual selection (vim mouse=a).
             if (self.mode == .visual or self.mode == .visual_line)
                 self.exitVisual();
@@ -3034,6 +3041,10 @@ pub const Editor = struct {
             }
             return ctx.consumeAndRedraw();
         }
+
+        // Press on dead space (status row, splits): nothing to do, but the
+        // cleared prefix means a visible which-key panel must be redrawn away.
+        if (had_pending) ctx.consumeAndRedraw();
     }
 
     /// Double-click: visually select the word (or symbol run) under the cursor.
@@ -3669,20 +3680,19 @@ pub const Editor = struct {
         const rows = whichKeyRows(self.pending, visual) orelse return;
         const th = self.theme.p;
 
-        const row_count: usize = rows.len;
-
-        // Calculate panel width: longest row + 2 (left-pad 1 col + right margin 1).
+        // Panel width: longest row + 2 (left-pad 1 col + right margin 1).
         var max_width: u16 = 0;
         for (rows) |row| {
             const w: u16 = @intCast(@min(ctx.stringWidth(row), max.width));
             if (w > max_width) max_width = w;
         }
         const panel_w = max_width + 2;
-        if (panel_w == 2 or max.width < panel_w) return;
+        if (max.width < panel_w) return;
 
-        const panel_h: u16 = @intCast(row_count);
+        const panel_h: u16 = @intCast(rows.len);
         const status_row = max.height -| 1;
-        if (status_row < panel_h) return;
+        // + 1: keep the panel below the tabline (row 0).
+        if (status_row < panel_h + 1) return;
 
         const x0 = max.width -| panel_w; // right-aligned
         const y0 = status_row -| panel_h;
@@ -3700,28 +3710,15 @@ pub const Editor = struct {
             }
         }
 
-        // Draw each row.
+        // Draw each row: the key part ends at the first double space
+        // ("K  desc", "f F t T  desc"); rows without one draw as plain text.
         r = 0;
-        while (r < row_count) : (r += 1) {
+        while (r < rows.len) : (r += 1) {
             const row = rows[r];
             var col = x0 + 1; // left-pad 1 col
-
-            // Find the first space to separate key from description.
-            var space_idx: usize = 3; // default to first 3 chars ("K  " or "KK ")
-            for (row, 0..) |ch, i| {
-                if (ch == ' ') {
-                    space_idx = i;
-                    break;
-                }
-            }
-
-            // Draw key character(s) in blue bold.
-            const key_part = row[0..space_idx];
-            col = writeText(surface, ctx, col, y0 + r, key_part, key_style);
-
-            // Draw the rest (including spaces and description) in normal text style.
-            const desc_part = row[space_idx..];
-            _ = writeText(surface, ctx, col, y0 + r, desc_part, text_style);
+            const sep = std.mem.indexOf(u8, row, "  ") orelse 0;
+            col = writeText(surface, ctx, col, y0 + r, row[0..sep], key_style);
+            _ = writeText(surface, ctx, col, y0 + r, row[sep..], text_style);
         }
     }
 
