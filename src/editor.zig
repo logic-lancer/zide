@@ -107,7 +107,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, leader_r, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
+    const Pending = enum { none, g, g_comment, d, leader, leader_f, leader_c, leader_r, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -164,6 +164,8 @@ pub const Editor = struct {
         "]c / [c      next/prev git hunk",
         "gg / G       top / bottom",
         "gf           goto file under cursor",
+        "gcc / Ngcc   toggle comment",
+        "gc (visual)  comment selection",
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
@@ -190,7 +192,8 @@ pub const Editor = struct {
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet" },
             .leader_r => &.{ "n  toggle relative numbers" },
-            .g => &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition" },
+            .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
+            .g_comment => &.{ "c  toggle comment line" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
@@ -1272,6 +1275,23 @@ pub const Editor = struct {
                     self.gotoFile() catch {};
                 } else if (cp == 'd') {
                     self.gotoDef();
+                } else if (cp == 'c') {
+                    self.pending = .g_comment;
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .g_comment => {
+                self.pending = .none;
+                const n = self.takeCount();
+                if (cp == 'c') {
+                    if (n <= 1) {
+                        b.toggleComment() catch {};
+                    } else {
+                        const hi = @min(b.row + n - 1, b.lastRow());
+                        b.toggleCommentRows(b.row, hi) catch {};
+                        b.col = b.firstNonWs(b.row);
+                        b.goal_col = b.col;
+                    }
                 }
                 return ctx.consumeAndRedraw();
             },
@@ -2039,6 +2059,19 @@ pub const Editor = struct {
             try self.reg.append(self.alloc, '\n');
     }
 
+    /// Toggle comments over the selected rows, then leave visual mode with the
+    /// cursor on the first row (shared by visual `Space /` and `gc`).
+    fn commentSelection(self: *Editor) void {
+        const b = self.cur();
+        const lo = @min(self.vis_row, b.row);
+        const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
+        b.toggleCommentRows(lo, hi) catch {};
+        self.exitVisual();
+        b.row = @min(lo, b.lines.items.len - 1);
+        b.col = b.firstNonWs(b.row);
+        b.goal_col = b.col;
+    }
+
     fn handleVisual(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
         b.undo_new_group = true;
@@ -2080,13 +2113,19 @@ pub const Editor = struct {
         if (self.pending == .leader) {
             self.pending = .none;
             if (cp == '/') {
-                const lo = @min(self.vis_row, b.row);
-                const hi = @max(@min(self.vis_row, b.lines.items.len - 1), b.row);
-                b.toggleCommentRows(lo, hi) catch {};
-                self.exitVisual();
-                b.row = @min(lo, b.lines.items.len - 1);
-                b.col = b.firstNonWs(b.row);
-                b.goal_col = @intCast(b.col);
+                self.commentSelection();
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (self.pending == .g) {
+            self.pending = .none;
+            if (cp == 'g') {
+                b.row = 0;
+                b.col = 0;
+                b.goal_col = 0;
+            } else if (cp == 'c') {
+                self.commentSelection();
             }
             return ctx.consumeAndRedraw();
         }
@@ -2251,11 +2290,7 @@ pub const Editor = struct {
                 b.col = if (len == 0) 0 else Buffer.snapToCp(b.lineText(b.row), len - 1);
                 b.goal_col = std.math.maxInt(u32);
             },
-            'g' => {
-                b.row = 0;
-                b.col = 0;
-                b.goal_col = 0;
-            },
+            'g' => self.pending = .g,
             'G' => {
                 b.row = b.lastRow();
                 b.clampCol(false);
