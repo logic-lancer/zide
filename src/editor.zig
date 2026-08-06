@@ -1050,10 +1050,12 @@ pub const Editor = struct {
                 ) catch {};
             }
         }
-        // Ctrl-chords during a capture (e.g. Ctrl-s save mid-insert) are
-        // side-effect commands, not part of the change — replaying them
-        // via `.` would e.g. write the file as a surprise.
-        if (key.mods.ctrl) return;
+        // Ctrl-chords with no pending prefix (e.g. Ctrl-s save mid-insert)
+        // are side-effect commands, not part of the change — replaying them
+        // via `.` would e.g. write the file as a surprise. Ctrl keys that a
+        // pending handler consumes (r Ctrl-a, df<C-x>) ARE the change and
+        // must stay in the record or the replay dangles mid-operator.
+        if (key.mods.ctrl and self.pending == .none) return;
         self.dot_rec.append(self.alloc, key) catch {};
     }
 
@@ -1292,11 +1294,11 @@ pub const Editor = struct {
                     if (n <= 1) {
                         b.toggleComment() catch {};
                     } else {
+                        // toggleCommentRows keeps the byte column (screen
+                        // position), unlike toggleComment which follows the
+                        // shifted character — close enough to Comment.nvim.
                         const hi = @min(b.row + n - 1, b.lastRow());
                         b.toggleCommentRows(b.row, hi) catch {};
-                        // Like single-line gcc: stay near the current column
-                        // instead of snapping to the indent.
-                        b.clampCol(false);
                     }
                 }
                 return ctx.consumeAndRedraw();
@@ -2800,6 +2802,7 @@ pub const Editor = struct {
         if (std.mem.eql(u8, old, new)) return self.setStatus("rename: unchanged", .{});
         var out: std.ArrayListUnmanaged(u8) = .{};
         defer out.deinit(self.alloc);
+        try out.ensureTotalCapacity(self.alloc, b.buf.items.len);
         const text = b.buf.items;
         var hits: usize = 0;
         var cursor_byte: usize = r[0];
