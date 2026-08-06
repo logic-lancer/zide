@@ -1050,6 +1050,10 @@ pub const Editor = struct {
                 ) catch {};
             }
         }
+        // Ctrl-chords during a capture (e.g. Ctrl-s save mid-insert) are
+        // side-effect commands, not part of the change — replaying them
+        // via `.` would e.g. write the file as a surprise.
+        if (key.mods.ctrl) return;
         self.dot_rec.append(self.alloc, key) catch {};
     }
 
@@ -1290,8 +1294,9 @@ pub const Editor = struct {
                     } else {
                         const hi = @min(b.row + n - 1, b.lastRow());
                         b.toggleCommentRows(b.row, hi) catch {};
-                        b.col = b.firstNonWs(b.row);
-                        b.goal_col = b.col;
+                        // Like single-line gcc: stay near the current column
+                        // instead of snapping to the indent.
+                        b.clampCol(false);
                     }
                 }
                 return ctx.consumeAndRedraw();
@@ -1599,8 +1604,11 @@ pub const Editor = struct {
                         self.mode = .command;
                         self.cmd_is_search = false;
                         self.cmd.clearRetainingCapacity();
+                        // Prefill the old name (NvChad renamer style): it
+                        // stays visible in the cmdline while editing, and
+                        // plain Enter is caught by "rename: unchanged".
                         try self.cmd.appendSlice(self.alloc, "rename ");
-                        self.setStatus("rename: {s}", .{self.cur().buf.items[r[0]..r[1]]});
+                        try self.cmd.appendSlice(self.alloc, self.cur().buf.items[r[0]..r[1]]);
                     },
                     else => {},
                 }
@@ -2765,7 +2773,6 @@ pub const Editor = struct {
         }
     }
 
-    /// `*` / `#`: whole-word search for the identifier under (or right of)
     /// Byte range [lo, hi) of the identifier under (or to the right of) the
     /// cursor on the current line, or null when the line has none.
     fn wordNearCursor(self: *Editor) ?[2]usize {
@@ -2776,16 +2783,14 @@ pub const Editor = struct {
         var pos = line_start + @min(b.col, b.lineLen(b.row));
         while (pos < line_end and Buffer.wordClass(text[pos]) != 1) pos += 1;
         if (pos >= line_end) return null;
-        var lo = pos;
-        while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
-        var hi = pos;
-        while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
-        return .{ lo, hi };
+        const w = wordAt(text, pos).?; // pos is on a word char by the scan above
+        return .{ w.lo, w.hi };
     }
 
     /// `:rename <new>` — replace every whole-word occurrence of the identifier
-    /// under the cursor. Walks backwards so untouched earlier offsets stay
-    /// valid, and lands as a single undo group.
+    /// under the cursor. Rewrites the buffer in one pass and applies it as a
+    /// single replaceRange: one tree-sitter reparse and one undo entry, and
+    /// the cursor follows the renamed occurrence it started on.
     fn renameWord(self: *Editor, new: []const u8) !void {
         if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
         const b = self.cur();
@@ -2793,19 +2798,32 @@ pub const Editor = struct {
         const old = try self.alloc.dupe(u8, b.buf.items[r[0]..r[1]]);
         defer self.alloc.free(old);
         if (std.mem.eql(u8, old, new)) return self.setStatus("rename: unchanged", .{});
+        var out: std.ArrayListUnmanaged(u8) = .{};
+        defer out.deinit(self.alloc);
+        const text = b.buf.items;
         var hits: usize = 0;
-        var end = b.buf.items.len;
-        while (std.mem.lastIndexOf(u8, b.buf.items[0..end], old)) |p| {
-            end = p;
-            if (!wordBounded(b.buf.items, p, old.len)) continue;
-            try b.replaceRange(p, p + old.len, new);
+        var cursor_byte: usize = r[0];
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, old)) |p| {
+            if (!wordBounded(text, p, old.len)) {
+                try out.appendSlice(self.alloc, text[i .. p + 1]);
+                i = p + 1;
+                continue;
+            }
+            try out.appendSlice(self.alloc, text[i..p]);
+            if (p == r[0]) cursor_byte = out.items.len;
+            try out.appendSlice(self.alloc, new);
             hits += 1;
+            i = p + old.len;
         }
-        b.row = @min(b.row, b.lastRow());
-        b.clampCol(false);
+        try out.appendSlice(self.alloc, text[i..]);
+        try b.replaceRange(0, text.len, out.items);
+        b.setCursorFromByte(cursor_byte);
+        b.goal_col = b.col;
         self.setStatus("renamed {d} occurrence{s} of {s}", .{ hits, if (hits == 1) "" else "s", old });
     }
 
+    /// `*` / `#`: whole-word search for the identifier under (or right of)
     /// the cursor. Loads the search register so n/N continue the hunt.
     fn searchWord(self: *Editor, dir: i2) void {
         if (self.buffers.items.len == 0) return;
