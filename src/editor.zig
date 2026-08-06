@@ -140,6 +140,7 @@ pub const Editor = struct {
         "Space /      toggle comment",
         "Space b      buffer picker",
         "Space c h    cheatsheet",
+        "Space c r    rename word",
         "Space e      focus/toggle tree",
         "Space f f    find files",
         "Space f w    live grep",
@@ -190,7 +191,7 @@ pub const Editor = struct {
         return switch (p) {
             .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
-            .leader_c => &.{ "h  cheatsheet" },
+            .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
             .g_comment => &.{ "c  toggle comment line" },
@@ -1590,6 +1591,17 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'h' => self.openPopup(.keys),
+                    'r' => {
+                        const r = self.wordNearCursor() orelse {
+                            self.setStatus("no word under cursor", .{});
+                            return ctx.consumeAndRedraw();
+                        };
+                        self.mode = .command;
+                        self.cmd_is_search = false;
+                        self.cmd.clearRetainingCapacity();
+                        try self.cmd.appendSlice(self.alloc, "rename ");
+                        self.setStatus("rename: {s}", .{self.cur().buf.items[r[0]..r[1]]});
+                    },
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -2469,7 +2481,7 @@ pub const Editor = struct {
                 return self.completePath(arg, sp + 1);
             return;
         }
-        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh" };
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename" };
         return self.completeFrom(&cmds, s, 0);
     }
 
@@ -2569,6 +2581,7 @@ pub const Editor = struct {
             theme,
             themes,
             noh,
+            rename,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -2603,6 +2616,7 @@ pub const Editor = struct {
             .theme => try self.switchTheme(it.next()),
             .themes => self.setStatus("themes: {s}", .{themes.names}),
             .noh => self.search_hl = false,
+            .rename => try self.renameWord(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
@@ -2752,25 +2766,57 @@ pub const Editor = struct {
     }
 
     /// `*` / `#`: whole-word search for the identifier under (or right of)
-    /// the cursor. Loads the search register so n/N continue the hunt.
-    fn searchWord(self: *Editor, dir: i2) void {
-        if (self.buffers.items.len == 0) return;
+    /// Byte range [lo, hi) of the identifier under (or to the right of) the
+    /// cursor on the current line, or null when the line has none.
+    fn wordNearCursor(self: *Editor) ?[2]usize {
         const b = self.cur();
         const text = b.buf.items;
         const line_start = b.lines.items[b.row].start;
         const line_end = line_start + b.lineLen(b.row);
         var pos = line_start + @min(b.col, b.lineLen(b.row));
         while (pos < line_end and Buffer.wordClass(text[pos]) != 1) pos += 1;
-        if (pos >= line_end) return self.setStatus("no word under cursor", .{});
+        if (pos >= line_end) return null;
         var lo = pos;
         while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
         var hi = pos;
         while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
-        const word = text[lo..hi];
+        return .{ lo, hi };
+    }
+
+    /// `:rename <new>` — replace every whole-word occurrence of the identifier
+    /// under the cursor. Walks backwards so untouched earlier offsets stay
+    /// valid, and lands as a single undo group.
+    fn renameWord(self: *Editor, new: []const u8) !void {
+        if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
+        const b = self.cur();
+        const r = self.wordNearCursor() orelse return self.setStatus("no word under cursor", .{});
+        const old = try self.alloc.dupe(u8, b.buf.items[r[0]..r[1]]);
+        defer self.alloc.free(old);
+        if (std.mem.eql(u8, old, new)) return self.setStatus("rename: unchanged", .{});
+        var hits: usize = 0;
+        var end = b.buf.items.len;
+        while (std.mem.lastIndexOf(u8, b.buf.items[0..end], old)) |p| {
+            end = p;
+            if (!wordBounded(b.buf.items, p, old.len)) continue;
+            try b.replaceRange(p, p + old.len, new);
+            hits += 1;
+        }
+        b.row = @min(b.row, b.lastRow());
+        b.clampCol(false);
+        self.setStatus("renamed {d} occurrence{s} of {s}", .{ hits, if (hits == 1) "" else "s", old });
+    }
+
+    /// the cursor. Loads the search register so n/N continue the hunt.
+    fn searchWord(self: *Editor, dir: i2) void {
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const text = b.buf.items;
+        const r = self.wordNearCursor() orelse return self.setStatus("no word under cursor", .{});
+        const word = text[r[0]..r[1]];
         self.search.clearRetainingCapacity();
         self.search.appendSlice(self.alloc, word) catch return;
         self.search_hl = true;
-        const hit = findWordHit(text, self.search.items, lo, dir) orelse
+        const hit = findWordHit(text, self.search.items, r[0], dir) orelse
             return self.setStatus("pattern not found: {s}", .{self.search.items});
         self.pushJump();
         b.setCursorFromByte(hit);
