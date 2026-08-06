@@ -396,15 +396,15 @@ pub const Editor = struct {
     /// others are small but unhinted like obj_i/obj_a/indent ops).
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{"/  toggle comment"} else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines", "m  format buffer" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
-            .leader_r => &.{ "n  toggle relative numbers" },
+            .leader_r => &.{"n  toggle relative numbers"},
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "r  references", "c  +comment" },
             .g_comment => &.{ "c / 0  this line", "j / k  cursor+N lines", "G  to last line", "g  +to line", "i  +text object" },
-            .g_comment_g => &.{ "g  comment to first line" },
-            .g_comment_i => &.{ "p  comment paragraph" },
+            .g_comment_g => &.{"g  comment to first line"},
+            .g_comment_i => &.{"p  comment paragraph"},
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
@@ -1535,7 +1535,10 @@ pub const Editor = struct {
             var found = false;
             for (self.buffers.items) |*b| {
                 if (!std.mem.eql(u8, b.file_name, name)) continue;
-                if (loc.line < b.lines.items.len) { text = b.lineText(loc.line); found = true; }
+                if (loc.line < b.lines.items.len) {
+                    text = b.lineText(loc.line);
+                    found = true;
+                }
                 break;
             }
             if (!found) {
@@ -1548,7 +1551,10 @@ pub const Editor = struct {
                 if (cache_data) |d| {
                     var it = std.mem.splitScalar(u8, d, '\n');
                     var i: u32 = 0;
-                    while (it.next()) |ln| : (i += 1) if (i == loc.line) { text = ln; break; };
+                    while (it.next()) |ln| : (i += 1) if (i == loc.line) {
+                        text = ln;
+                        break;
+                    };
                 }
             }
             text = std.mem.trim(u8, text, " \t\r");
@@ -2064,26 +2070,26 @@ pub const Editor = struct {
     /// Route one key press by focus/mode; shared by live input and macro replay.
     fn dispatchKey(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) anyerror!void {
         {
-                if (self.popup.kind != .none) return self.handlePopup(ctx, key);
-                // NvTerm: Alt-h bottom split, Alt-v vertical split, Alt-i float.
-                if (key.mods.alt and (key.codepoint == 'h' or key.codepoint == 'H'))
-                    return self.toggleTerm(ctx, .split);
-                if (key.mods.alt and (key.codepoint == 'v' or key.codepoint == 'V'))
-                    return self.toggleTerm(ctx, .vert);
-                if (key.mods.alt and (key.codepoint == 'i' or key.codepoint == 'I'))
-                    return self.toggleTerm(ctx, .float);
-                if (self.focus == .term)
-                    return self.handleTerm(ctx, key);
-                if (self.focus == .tree and self.mode != .command)
-                    return self.handleTree(ctx, key);
-                if (self.buffers.items.len == 0 and self.mode != .command)
-                    return self.handleDash(ctx, key);
-                switch (self.mode) {
-                    .normal => try self.handleNormal(ctx, key),
-                    .insert => try self.handleInsert(ctx, key),
-                    .command => try self.handleCommand(ctx, key),
-                    .visual, .visual_line => try self.handleVisual(ctx, key),
-                }
+            if (self.popup.kind != .none) return self.handlePopup(ctx, key);
+            // NvTerm: Alt-h bottom split, Alt-v vertical split, Alt-i float.
+            if (key.mods.alt and (key.codepoint == 'h' or key.codepoint == 'H'))
+                return self.toggleTerm(ctx, .split);
+            if (key.mods.alt and (key.codepoint == 'v' or key.codepoint == 'V'))
+                return self.toggleTerm(ctx, .vert);
+            if (key.mods.alt and (key.codepoint == 'i' or key.codepoint == 'I'))
+                return self.toggleTerm(ctx, .float);
+            if (self.focus == .term)
+                return self.handleTerm(ctx, key);
+            if (self.focus == .tree and self.mode != .command)
+                return self.handleTree(ctx, key);
+            if (self.buffers.items.len == 0 and self.mode != .command)
+                return self.handleDash(ctx, key);
+            switch (self.mode) {
+                .normal => try self.handleNormal(ctx, key),
+                .insert => try self.handleInsert(ctx, key),
+                .command => try self.handleCommand(ctx, key),
+                .visual, .visual_line => try self.handleVisual(ctx, key),
+            }
         }
     }
 
@@ -3994,7 +4000,10 @@ pub const Editor = struct {
     fn handleInsert(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
         // NvChad <C-s>: write the buffer without leaving insert mode.
-        if (key.mods.ctrl and key.codepoint == 's') { self.save(); return ctx.consumeAndRedraw(); }
+        if (key.mods.ctrl and key.codepoint == 's') {
+            self.save();
+            return ctx.consumeAndRedraw();
+        }
         if (self.cmp.active) {
             if (try self.cmpKey(ctx, key)) return;
         } else if (key.matches('n', .{ .ctrl = true }) or key.matches('p', .{ .ctrl = true })) {
@@ -4317,7 +4326,7 @@ pub const Editor = struct {
         for (options) |opt| {
             if (!std.mem.startsWith(u8, opt, prefix)) continue;
             count += 1;
-            lcp = if (lcp) |p| p[0..std.mem.indexOfDiff(u8, p, opt) orelse p.len] else opt;
+            lcp = if (lcp) |p| p[0 .. std.mem.indexOfDiff(u8, p, opt) orelse p.len] else opt;
             if (listing_len + opt.len + 1 <= listing.len) {
                 if (listing_len > 0) {
                     listing[listing_len] = ' ';
@@ -4360,7 +4369,7 @@ pub const Editor = struct {
         var lcp: []const u8 = names.items[0];
         var listing_len: usize = 0;
         for (names.items) |n| {
-            lcp = lcp[0..std.mem.indexOfDiff(u8, lcp, n) orelse lcp.len];
+            lcp = lcp[0 .. std.mem.indexOfDiff(u8, lcp, n) orelse lcp.len];
             const short = n[dir_part.len..];
             if (listing_len + short.len + 1 <= buf.len) {
                 if (listing_len > 0) {

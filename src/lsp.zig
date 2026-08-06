@@ -7,7 +7,7 @@ const std = @import("std");
 pub const Lsp = struct {
     alloc: std.mem.Allocator,
     child: std.process.Child,
-    in_fd: std.posix.fd_t,  // child stdout
+    in_fd: std.posix.fd_t, // child stdout
     out_fd: std.posix.fd_t, // child stdin
     in: std.ArrayListUnmanaged(u8) = .{},
     out: std.ArrayListUnmanaged(u8) = .{},
@@ -51,7 +51,7 @@ pub const Lsp = struct {
 
     pub const Diag = struct {
         line: u32, // 0-based
-        col: u32,  // 0-based byte column (utf-8 position encoding)
+        col: u32, // 0-based byte column (utf-8 position encoding)
         severity: u8, // 1 error, 2 warning, 3 info, 4 hint
         message: []u8, // owned, newlines folded to spaces
     };
@@ -196,7 +196,10 @@ pub const Lsp = struct {
 
     pub fn didOpen(self: *Lsp, uri: []const u8, text: []const u8, version: i32) void {
         self.notify("textDocument/didOpen", .{ .textDocument = .{
-            .uri = uri, .languageId = "zig", .version = version, .text = text,
+            .uri = uri,
+            .languageId = "zig",
+            .version = version,
+            .text = text,
         } });
     }
 
