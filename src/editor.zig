@@ -192,6 +192,7 @@ pub const Editor = struct {
         "u / Ctrl-r   undo / redo",
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
+        "s (on dash)  restore session",
     };
 
     /// Which-key: hint rows for a pending prefix, or null for prefixes that
@@ -287,6 +288,74 @@ pub const Editor = struct {
             self.alloc.free(last);
         }
         self.saveOldfiles();
+    }
+
+    /// `$HOME/.cache/zide/session` — one `row:col:/abs/path` line per open
+    /// buffer, then a final `active:<index>`.
+    fn sessionPath(self: *Editor, buf: []u8) ?[]u8 {
+        _ = self;
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/.cache/zide/session", .{home}) catch null;
+    }
+
+    /// Rewrite the session file. Called whenever the buffer set changes and
+    /// on save/exit, so a crash still leaves a usable (if slightly stale)
+    /// session — cheaper than writing on every cursor move.
+    fn saveSession(self: *Editor) void {
+        if (self.buffers.items.len == 0) return; // never clobber with nothing
+        var pbuf: [512]u8 = undefined;
+        const path = self.sessionPath(&pbuf) orelse return;
+        if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch return;
+        var f = std.fs.cwd().createFile(path, .{}) catch return;
+        defer f.close();
+        for (self.buffers.items) |*b| {
+            var abuf: [std.fs.max_path_bytes]u8 = undefined;
+            const abs = std.fs.cwd().realpath(b.file_name, &abuf) catch continue;
+            var lbuf: [std.fs.max_path_bytes + 48]u8 = undefined;
+            const line = std.fmt.bufPrint(&lbuf, "{d}:{d}:{s}\n", .{ b.row, b.col, abs }) catch continue;
+            f.writeAll(line) catch return;
+        }
+        var abuf: [32]u8 = undefined;
+        f.writeAll(std.fmt.bufPrint(&abuf, "active:{d}\n", .{self.active}) catch return) catch return;
+    }
+
+    /// Dashboard `s`: reopen every session buffer and restore its cursor.
+    fn restoreSession(self: *Editor) void {
+        var pbuf: [512]u8 = undefined;
+        const path = self.sessionPath(&pbuf) orelse return;
+        const data = std.fs.cwd().readFileAlloc(self.alloc, path, 256 * 1024) catch
+            return self.setStatus("no saved session", .{});
+        defer self.alloc.free(data);
+
+        var want_active: usize = 0;
+        var opened: usize = 0;
+        var it = std.mem.tokenizeScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "active:")) {
+                want_active = std.fmt.parseInt(usize, line["active:".len..], 10) catch 0;
+                continue;
+            }
+            const c1 = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const rest = line[c1 + 1 ..];
+            const c2 = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
+            const row = std.fmt.parseInt(usize, line[0..c1], 10) catch continue;
+            const col = std.fmt.parseInt(usize, rest[0..c2], 10) catch continue;
+            const fpath = rest[c2 + 1 ..];
+            if (fpath.len == 0 or !fileExists(fpath)) continue; // openFile would
+            const before = self.buffers.items.len; //               fabricate an
+            self.openFile(fpath) catch continue; //                 empty buffer
+            if (self.buffers.items.len == before) continue;
+            const b = self.cur();
+            b.row = @min(row, b.lastRow());
+            b.col = col;
+            b.clampCol(false); // snaps to a codepoint and clamps to line length
+            b.goal_col = b.col;
+            opened += 1;
+        }
+        if (opened == 0) return self.setStatus("no session files to restore", .{});
+        self.active = @min(want_active, self.buffers.items.len - 1);
+        self.saveSession();
+        self.setStatus("session restored: {d} file(s)", .{opened});
     }
 
     /// Read the current branch from .git/HEAD (NvChad statusline segment).
@@ -739,6 +808,7 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        self.saveSession();
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
         self.jumps.deinit(self.alloc);
@@ -796,6 +866,7 @@ pub const Editor = struct {
         self.active = self.buffers.items.len - 1;
         self.refreshGitSigns(self.cur());
         self.recordOldfile(path);
+        self.saveSession();
     }
 
     fn cycleBuffer(self: *Editor, delta: isize) void {
@@ -824,6 +895,7 @@ pub const Editor = struct {
             return;
         }
         self.active = @min(self.active, self.buffers.items.len - 1);
+        self.saveSession();
     }
 
     fn switchTheme(self: *Editor, arg: ?[]const u8) !void {
@@ -855,6 +927,7 @@ pub const Editor = struct {
         };
         self.setStatus("\"{s}\" {d}L, {d}B written", .{ b.file_name, b.lines.items.len, b.buf.items.len });
         self.refreshGitSigns(b);
+        self.saveSession();
     }
 
     // ---- popup ------------------------------------------------------------
@@ -1527,6 +1600,7 @@ pub const Editor = struct {
                 self.status_len = 0;
                 self.cmd.clearRetainingCapacity();
             },
+            's' => self.restoreSession(),
             else => return,
         }
         ctx.consumeAndRedraw();
@@ -4132,6 +4206,7 @@ pub const Editor = struct {
             .{ .icon = "\u{f114}", .label = "File Tree", .key = "e" },
             .{ .icon = "\u{f043}", .label = "Themes", .key = "t" },
             .{ .icon = "\u{f128}", .label = "Cheatsheet", .key = "h" },
+            .{ .icon = "\u{f1da}", .label = "Restore Session", .key = "s" },
             .{ .icon = "\u{f011}", .label = "Quit", .key = "q" },
         };
         const btn_w: u16 = 26;
