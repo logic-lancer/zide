@@ -154,8 +154,11 @@ pub const Editor = struct {
         filter: std.ArrayListUnmanaged(u8) = .{},
         selected: usize = 0,
 
-        const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols };
-        const max_items = 64;
+        const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols, qf };
+        /// Raised from 64: the cheatsheet sits at 64 rows and the
+        /// quickfix picker holds up to this many reference hits —
+        /// popupMatches silently drops anything past the cap.
+        const max_items = 96;
         const max_files = 2000;
         /// Per-buffer cap for the `Space f z` line picker (distinct from
         /// the per-project max_files).
@@ -320,6 +323,7 @@ pub const Editor = struct {
         "Space g p    preview hunk",
         "Space g r    reset hunk",
         "Space g s    stage hunk",
+        "Space q      quickfix picker",
         "Space n      toggle line numbers",
         "Space r n    relative numbers",
         "Space t      theme picker",
@@ -375,7 +379,7 @@ pub const Editor = struct {
     /// others are small but unhinted like obj_i/obj_a/indent ops).
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
@@ -1438,7 +1442,16 @@ pub const Editor = struct {
             };
         }
         const n = self.grep_hits.items.len;
-        self.setStatus("{d} reference{s} - ]q / [q to navigate", .{ n, if (n == 1) "" else "s" });
+        if (n < locs.len) {
+            // The cap is real on big symbols (Editor has 100+ refs):
+            // never let "96 references" read as the true total.
+            self.setStatus("showing {d} of {d} references", .{ n, locs.len });
+        } else {
+            self.setStatus("{d} reference{s} - ]q / [q to navigate", .{ n, if (n == 1) "" else "s" });
+        }
+        // NvChad shows references in a picker immediately; Esc keeps them
+        // in the quickfix list for ]q / [q.
+        self.openPopup(.qf);
     }
 
     // ---- status line ------------------------------------------------------
@@ -1465,6 +1478,8 @@ pub const Editor = struct {
     fn openPopup(self: *Editor, kind: Popup.Kind) void {
         if (kind == .files or kind == .grep) self.refreshFiles();
         if (kind == .grep) self.clearGrep();
+        // .qf deliberately refreshes nothing: it is a window onto the
+        // current quickfix list (grep or gr results), not a new search.
         if (kind == .lines) self.refreshLines();
         if (kind == .symbols) self.refreshSymbols();
         self.popup.kind = kind;
@@ -1644,6 +1659,7 @@ pub const Editor = struct {
             .recent => " Recent Files ",
             .lines => " Buffer Lines ",
             .symbols => " Document Symbols ",
+            .qf => " Quickfix ",
             .none => "",
         };
     }
@@ -1658,6 +1674,7 @@ pub const Editor = struct {
             .recent => self.oldfiles.items.len,
             .lines => self.line_hits.items.len,
             .symbols => self.symbol_hits.items.len,
+            .qf => self.grep_hits.items.len,
             .none => 0,
         };
     }
@@ -1672,6 +1689,7 @@ pub const Editor = struct {
             .recent => self.oldfiles.items[i],
             .lines => self.line_hits.items[i].disp,
             .symbols => self.symbol_hits.items[i].disp,
+            .qf => self.grep_hits.items[i].disp,
             .none => "",
         };
     }
@@ -1721,7 +1739,7 @@ pub const Editor = struct {
                     .files => self.openFile(self.files.items[idx]) catch {
                         self.setStatus("could not open {s}", .{self.files.items[idx]});
                     },
-                    .grep => {
+                    .grep, .qf => {
                         const h = self.grep_hits.items[idx];
                         self.qf_idx = idx;
                         self.qf_seen = true;
@@ -2890,6 +2908,7 @@ pub const Editor = struct {
                     'f' => self.pending = .leader_f,
                     'g' => self.pending = .leader_g,
                     'n' => self.numbers = !self.numbers,
+                    'q' => self.openPopup(.qf),
                     'r' => self.pending = .leader_r,
                     't' => self.openPopup(.themes),
                     'x' => self.closeBuffer(ctx, false),
