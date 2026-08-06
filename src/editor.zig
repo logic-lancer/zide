@@ -102,8 +102,7 @@ pub const Editor = struct {
     yank_flash: ?struct { buf: usize, seq: u32, lo: usize, hi: usize, until_ms: i64 } = null,
     /// A clear-tick is already scheduled for the current flash.
     yank_flash_armed: bool = false,
-    /// One current-buffer line for the `Space f z` picker: 0-based row +
-    /// owned "NNNN: text" display row.
+    /// `Space f z` picker rows (see LineHit); cleared on popup close.
     line_hits: std.ArrayListUnmanaged(LineHit) = .{},
 
     const TermView = enum { none, split, vert, float };
@@ -137,6 +136,9 @@ pub const Editor = struct {
         const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines };
         const max_items = 64;
         const max_files = 2000;
+        /// Per-buffer cap for the `Space f z` line picker (distinct from
+        /// the per-project max_files).
+        const max_lines = 10000;
         const max_file_size = 1024 * 1024;
     };
 
@@ -146,9 +148,9 @@ pub const Editor = struct {
     const Cmp = struct {
         active: bool = false,
         items: std.ArrayListUnmanaged([]u8) = .{},
-        /// Index into `items`, or null when only the typed prefix is in the
-        /// buffer (right after typing narrowed the list).
-        sel: ?usize = null,
+        /// Index of the candidate currently applied in the buffer. Always
+        /// set while the menu is active (opening applies a match at once).
+        sel: usize = 0,
         /// Byte offset where the completed region starts, and its length.
         start: usize = 0,
         len: usize = 0,
@@ -956,6 +958,10 @@ pub const Editor = struct {
             self.setStatus("unsaved changes in {s} (add ! to discard)", .{b.displayName()});
             return;
         }
+        // Buffer indices shift: a flash or completion region keyed on the
+        // old index/offsets must not survive.
+        self.yank_flash = null;
+        if (self.cmp.active) self.cmpClose();
         var removed = self.buffers.orderedRemove(self.active);
         removed.deinit();
         if (self.buffers.items.len == 0) {
@@ -1077,7 +1083,9 @@ pub const Editor = struct {
         self.clearLines();
         if (self.buffers.items.len == 0) return;
         const b = self.cur();
-        const n = @min(b.lines.items.len, Popup.max_files);
+        const n = @min(b.lines.items.len, Popup.max_lines);
+        if (n < b.lines.items.len)
+            self.setStatus("line picker: first {d} of {d} lines", .{ n, b.lines.items.len });
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const raw = std.mem.trim(u8, b.lineText(i), " \t\r");
@@ -1178,6 +1186,7 @@ pub const Editor = struct {
 
         if (key.matches(vaxis.Key.escape, .{})) {
             self.closePopup();
+            self.clearLines(); // line-picker rows: thousands of heap strings
         } else if (key.matches(vaxis.Key.enter, .{})) {
             if (n > 0) {
                 const idx = matches[@min(self.popup.selected, n - 1)];
@@ -1214,6 +1223,9 @@ pub const Editor = struct {
                     .keys => {},
                     .none => {},
                 }
+                // After the switch: the .lines arm reads line_hits above,
+                // so the release must not happen inside closePopup.
+                self.clearLines();
             } else self.closePopup();
         } else if (key.matches(vaxis.Key.down, .{}) or
             key.matches('n', .{ .ctrl = true }) or key.matches('j', .{ .ctrl = true }))
@@ -1244,16 +1256,15 @@ pub const Editor = struct {
             .init => return ctx.requestFocus(self.widget()),
             .tick => {
                 if (self.yank_flash) |f| {
-                    const now = std.time.milliTimestamp();
-                    if (now >= f.until_ms) {
+                    if (std.time.milliTimestamp() >= f.until_ms) {
                         self.yank_flash = null;
                         self.yank_flash_armed = false;
                         ctx.redraw = true;
-                    } else {
-                        // A newer yank pushed the deadline out (or a terminal
-                        // tick arrived early): re-arm for the remainder.
-                        try ctx.tick(@intCast(f.until_ms - now + 10), self.widget());
                     }
+                    // Not expired: no re-arm here — an early terminal tick
+                    // spawning extras would multiply. A fresh yank resets
+                    // yank_flash_armed, so its own keypress schedules the
+                    // clear-tick for the new deadline.
                 } else self.yank_flash_armed = false;
                 if (self.term_view != .none) {
                     if (self.term) |*t| {
@@ -2356,7 +2367,16 @@ pub const Editor = struct {
                 'h' => if (self.tree_open) {
                     self.focus = .tree;
                 },
-                'r' => { const rn = self.takeCount(); for (0..rn) |_| { if (!try b.redo()) { self.setStatus("already at newest change", .{}); break; } } },
+                'r' => {
+                    self.yank_flash = null; // same reason as the undo arm
+                    const rn = self.takeCount();
+                    for (0..rn) |_| {
+                        if (!try b.redo()) {
+                            self.setStatus("already at newest change", .{});
+                            break;
+                        }
+                    }
+                },
                 's' => self.save(),
                 else => return,
             }
@@ -2466,7 +2486,17 @@ pub const Editor = struct {
             '*' => self.searchWord(1),
             '#' => self.searchWord(-1),
             'x' => for (0..n) |_| try b.deleteCharAtCursor(),
-            'u' => for (0..n) |_| { if (!try b.undo()) { self.setStatus("already at oldest change", .{}); break; } },
+            'u' => {
+                // Undo/redo shift bytes without bumping undo_seq (in_undo
+                // skips recordEdit), so the flash guard can't see it.
+                self.yank_flash = null;
+                for (0..n) |_| {
+                    if (!try b.undo()) {
+                        self.setStatus("already at oldest change", .{});
+                        break;
+                    }
+                }
+            },
             'r' => self.pending = .replace_char,
             '~' => for (0..n) |_| try b.toggleCaseAtCursor(),
             '.' => try self.playDot(ctx),
@@ -2708,6 +2738,9 @@ pub const Editor = struct {
             .hi = hi,
             .until_ms = std.time.milliTimestamp() + yank_flash_ms,
         };
+        // Force the current keypress to schedule a clear-tick for THIS
+        // deadline, even if one was pending for an earlier yank.
+        self.yank_flash_armed = false;
     }
 
     /// Charwise copy into the unnamed register.
@@ -3214,7 +3247,7 @@ pub const Editor = struct {
         self.cmp.items.clearRetainingCapacity();
         self.cmp.prefix.clearRetainingCapacity();
         self.cmp.active = false;
-        self.cmp.sel = null;
+        self.cmp.sel = 0;
         self.cmp.len = 0;
     }
 
@@ -3262,25 +3295,10 @@ pub const Editor = struct {
         b.goal_col = b.col;
     }
 
-    /// Drop candidates that no longer extend the typed prefix.
-    fn cmpFilter(self: *Editor) void {
-        const pre = self.cmp.prefix.items;
-        var w: usize = 0;
-        for (self.cmp.items.items) |it| {
-            if (it.len > pre.len and std.mem.startsWith(u8, it, pre)) {
-                self.cmp.items.items[w] = it;
-                w += 1;
-            } else self.alloc.free(it);
-        }
-        self.cmp.items.shrinkRetainingCapacity(w);
-        self.cmp.sel = null;
-    }
-
     fn cmpCycle(self: *Editor, delta: isize) !void {
         const n = self.cmp.items.items.len;
         if (n == 0) return;
-        const cur_i: isize = if (self.cmp.sel) |s| @intCast(s) else if (delta > 0) -1 else 0;
-        const next = @mod(cur_i + delta, @as(isize, @intCast(n)));
+        const next = @mod(@as(isize, @intCast(self.cmp.sel)) + delta, @as(isize, @intCast(n)));
         self.cmp.sel = @intCast(next);
         try self.cmpApply(self.cmp.items.items[@intCast(next)]);
     }
@@ -3296,18 +3314,17 @@ pub const Editor = struct {
         while (s > 0 and Buffer.wordClass(text[s - 1]) == 1) s -= 1;
         try self.cmp.prefix.appendSlice(self.alloc, text[s..pos]);
         try self.cmpCollect(self.cmp.prefix.items);
-        // No prefix match: offer every word rather than nothing.
-        if (self.cmp.items.items.len == 0 and self.cmp.prefix.items.len > 0)
-            try self.cmpCollect("");
+        // No match: leave the typed text alone, like vim's
+        // "Pattern not found" — never substitute an unrelated word.
         if (self.cmp.items.items.len == 0) {
             self.cmpClose();
-            return self.setStatus("no completions", .{});
+            return self.setStatus("no completions for prefix", .{});
         }
         self.cmp.active = true;
         self.cmp.start = s;
         self.cmp.len = pos - s;
         self.cmp.sel = if (back) self.cmp.items.items.len - 1 else 0;
-        try self.cmpApply(self.cmp.items.items[self.cmp.sel.?]);
+        try self.cmpApply(self.cmp.items.items[self.cmp.sel]);
     }
 
     /// Keys while the menu is up. Returns true when the key was consumed;
@@ -3323,29 +3340,16 @@ pub const Editor = struct {
             ctx.consumeAndRedraw();
             return true;
         }
-        // The completed text is already in the buffer, so accept and cancel
-        // both just dismiss the menu; Esc keeps you in insert mode (vim's
-        // <C-e>), a second Esc leaves it.
-        if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{}) or
-            key.matches(vaxis.Key.escape, .{}))
-        {
+        // The completed text is already in the buffer, so Enter/Tab just
+        // dismiss the menu.
+        if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{})) {
             self.cmpClose();
             ctx.consumeAndRedraw();
             return true;
         }
-        // Typing a word char with nothing selected narrows the list in place.
-        if (!key.mods.ctrl and !key.mods.alt and self.cmp.sel == null) {
-            if (key.text) |t| {
-                if (t.len == 1 and Buffer.wordClass(t[0]) == 1) {
-                    try self.cmp.prefix.append(self.alloc, t[0]);
-                    try self.cmpApply(self.cmp.prefix.items);
-                    self.cmpFilter();
-                    if (self.cmp.items.items.len == 0) self.cmpClose();
-                    ctx.consumeAndRedraw();
-                    return true;
-                }
-            }
-        }
+        // Any other key — including Esc, which must also leave insert mode
+        // like vim's single-Esc-through-the-pum — closes the menu and is
+        // then handled normally (typing accepts the completed text).
         self.cmpClose();
         return false;
     }
@@ -3984,6 +3988,10 @@ pub const Editor = struct {
         // but mouse events branch off before that reset).
         const had_preview = m.type == .press and self.preview_len != 0;
         if (m.type == .press) self.preview_len = 0;
+        // Any mouse activity invalidates the completion menu: its recorded
+        // byte region would otherwise be applied at a stale offset — or in
+        // a different buffer entirely — by the next Ctrl-n.
+        if (self.cmp.active) self.cmpClose();
         if (!self.mlay.valid) return;
         if (self.popup.kind != .none) return; // popups stay keyboard-driven
         if (self.buffers.items.len == 0) return;
@@ -4874,8 +4882,8 @@ pub const Editor = struct {
         const below = cur_row + 1 + visible <= text_top + text_rows;
         if (!below and cur_row < text_top + visible) return;
         const row0: u16 = if (below) cur_row + 1 else cur_row - visible;
-        const sel = self.cmp.sel orelse std.math.maxInt(usize);
-        const start = if (sel != std.math.maxInt(usize) and sel >= visible) sel - visible + 1 else 0;
+        const sel = self.cmp.sel;
+        const start = if (sel >= visible) sel - visible + 1 else 0;
         const body: vaxis.Style = .{ .fg = th.fg, .bg = th.bar_bg };
         const sel_style: vaxis.Style = .{ .fg = th.bg, .bg = th.blue, .bold = true };
         var vi: u16 = 0;
@@ -4885,7 +4893,11 @@ pub const Editor = struct {
             const st = if (idx == sel) sel_style else body;
             var c: u16 = 0;
             while (c < w) : (c += 1) surface.writeCell(col0 + c, row0 + vi, .{ .style = st });
-            _ = writeText(surface, ctx, col0 + 1, row0 + vi, items[idx], st);
+            // Clip to the box (codepoint-safe): long candidates must not
+            // spill over the buffer text to the right.
+            var cap: usize = @min(items[idx].len, @as(usize, w) -| 2);
+            while (cap > 0 and cap < items[idx].len and (items[idx][cap] & 0xC0) == 0x80) cap -= 1;
+            _ = writeText(surface, ctx, col0 + 1, row0 + vi, items[idx][0..cap], st);
         }
     }
 
