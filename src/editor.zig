@@ -1226,7 +1226,10 @@ pub const Editor = struct {
                 // After the switch: the .lines arm reads line_hits above,
                 // so the release must not happen inside closePopup.
                 self.clearLines();
-            } else self.closePopup();
+            } else {
+                self.closePopup();
+                self.clearLines(); // zero-match Enter must release rows too
+            }
         } else if (key.matches(vaxis.Key.down, .{}) or
             key.matches('n', .{ .ctrl = true }) or key.matches('j', .{ .ctrl = true }))
         {
@@ -3988,10 +3991,17 @@ pub const Editor = struct {
         // but mouse events branch off before that reset).
         const had_preview = m.type == .press and self.preview_len != 0;
         if (m.type == .press) self.preview_len = 0;
-        // Any mouse activity invalidates the completion menu: its recorded
-        // byte region would otherwise be applied at a stale offset — or in
-        // a different buffer entirely — by the next Ctrl-n.
-        if (self.cmp.active) self.cmpClose();
+        // Presses, drags and wheel events move the cursor or switch buffers,
+        // which would leave the completion menu's byte region stale (next
+        // Ctrl-n applying at a wrong offset or in a different buffer). Bare
+        // pointer motion moves nothing — vxfw reports it (DECSET 1003), and
+        // closing on it would break cycling whenever the mouse twitches.
+        if (self.cmp.active and
+            (m.type == .press or m.type == .drag or
+                m.button == .wheel_up or m.button == .wheel_down))
+        {
+            self.cmpClose();
+        }
         if (!self.mlay.valid) return;
         if (self.popup.kind != .none) return; // popups stay keyboard-driven
         if (self.buffers.items.len == 0) return;
