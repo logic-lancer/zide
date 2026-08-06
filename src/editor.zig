@@ -172,17 +172,18 @@ pub const Editor = struct {
     };
 
     /// Which-key: hint rows for a pending prefix, or null for prefixes that
-    /// take arbitrary input (find-char, marks, registers, ...).
-    fn whichKeyRows(p: Pending) ?[]const []const u8 {
+    /// have no hint table (some take arbitrary input like find-char/marks;
+    /// others are small but unhinted like obj_i/obj_a/indent ops).
+    fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet" },
             .g => &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
-            .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "i  +inner object", "a  +around object" },
-            .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "i  +inner object", "a  +around object", "s  change surround" },
-            .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "i  +inner object", "a  +around object" },
+            .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f t  find-char to", "i  +inner object", "a  +around object" },
+            .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f t  find-char to", "i  +inner object", "a  +around object", "s  change surround" },
+            .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "e  yank to word end", "f t  find-char to", "i  +inner object", "a  +around object" },
             .bracket_f => &.{ "c  next git hunk" },
             .bracket_b => &.{ "c  prev git hunk" },
             else => null,
@@ -2992,6 +2993,7 @@ pub const Editor = struct {
             m.col >= L.tree_w and m.col < L.text_right)
         {
             self.focus = .editor;
+            self.pending = .none;
             // A plain click cancels any active visual selection (vim mouse=a).
             if (self.mode == .visual or self.mode == .visual_line)
                 self.exitVisual();
@@ -3271,7 +3273,7 @@ pub const Editor = struct {
         if (term_total > 0) self.drawTerm(surface, ctx, 0, text_top + text_rows, term_rows, max.width);
         if (term_w > 0) self.drawTerm(surface, ctx, text_right, text_top, text_rows - 1, term_w);
         self.drawStatus(surface, ctx, max.height - 1, max.width);
-        if (self.focus == .editor and self.popup.kind == .none and (self.mode == .normal or self.mode == .visual or self.mode == .visual_line) and self.pending != .none and whichKeyRows(self.pending) != null) {
+        if (self.focus == .editor and self.popup.kind == .none and (self.mode == .normal or self.mode == .visual or self.mode == .visual_line) and self.pending != .none) {
             self.drawWhichKey(surface, ctx, max);
         }
         if (self.term_view == .float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
@@ -3638,16 +3640,15 @@ pub const Editor = struct {
     }
 
     fn drawWhichKey(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, max: vxfw.Size) void {
-        const rows = whichKeyRows(self.pending) orelse return;
+        const visual = self.mode == .visual or self.mode == .visual_line;
+        const rows = whichKeyRows(self.pending, visual) orelse return;
         const th = self.theme.p;
 
-        // Cap at 12 rows.
-        const row_count: usize = @min(rows.len, 12);
-        if (row_count == 0) return;
+        const row_count: usize = rows.len;
 
         // Calculate panel width: longest row + 2 (left-pad 1 col + right margin 1).
         var max_width: u16 = 0;
-        for (rows[0..row_count]) |row| {
+        for (rows) |row| {
             const w: u16 = @intCast(@min(ctx.stringWidth(row), max.width));
             if (w > max_width) max_width = w;
         }
@@ -3681,7 +3682,7 @@ pub const Editor = struct {
             var col = x0 + 1; // left-pad 1 col
 
             // Find the first space to separate key from description.
-            var space_idx: ?usize = null;
+            var space_idx: usize = 3; // default to first 3 chars ("K  " or "KK ")
             for (row, 0..) |ch, i| {
                 if (ch == ' ') {
                     space_idx = i;
@@ -3689,19 +3690,13 @@ pub const Editor = struct {
                 }
             }
 
-            if (space_idx) |idx| {
-                // Draw key character(s) in blue bold.
-                const key_part = row[0..idx];
-                _ = writeText(surface, ctx, col, y0 + r, key_part, key_style);
-                col += @intCast(@min(ctx.stringWidth(key_part), max.width - col));
+            // Draw key character(s) in blue bold.
+            const key_part = row[0..space_idx];
+            col = writeText(surface, ctx, col, y0 + r, key_part, key_style);
 
-                // Draw the rest (including spaces and description) in normal text style.
-                const desc_part = row[idx..];
-                _ = writeText(surface, ctx, col, y0 + r, desc_part, text_style);
-            } else {
-                // No space found, draw entire row in normal text style.
-                _ = writeText(surface, ctx, col, y0 + r, row, text_style);
-            }
+            // Draw the rest (including spaces and description) in normal text style.
+            const desc_part = row[space_idx..];
+            _ = writeText(surface, ctx, col, y0 + r, desc_part, text_style);
         }
     }
 
