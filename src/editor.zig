@@ -249,6 +249,27 @@ pub const Editor = struct {
         return .{ .kw = kw, .name = nodeText(src, nm) };
     }
 
+    /// nvim-navic-lite: enclosing declarations at the cursor, innermost first.
+    /// O(tree depth); the statusline draws once per frame so no cache is needed.
+    fn breadcrumbs(self: *Editor, out: *[4]Crumb) usize {
+        if (self.buffers.items.len == 0) return 0;
+        const b = self.cur();
+        const tree = b.hl.tree orelse return 0;
+        const byte: u32 = @intCast(@min(b.cursorByte(), b.buf.items.len));
+        var node = tree.rootNode().descendantForByteRange(byte, byte) orelse return 0;
+        var n: usize = 0;
+        while (true) {
+            if (declCrumb(b, node)) |c| {
+                if (n < out.len) {
+                    out[n] = c;
+                    n += 1;
+                }
+            }
+            node = node.parent() orelse break;
+        }
+        return n;
+    }
+
     /// NvCheatsheet-style keybinding reference, shown via `Space c h`.
     const cheats = [_][]const u8{
         "Tab          next buffer",
@@ -4942,11 +4963,34 @@ pub const Editor = struct {
         end = writeText(surface, ctx, end, status_row, left, bar_style);
 
         if (b) |buf| {
-            const right = std.fmt.allocPrint(ctx.arena, " {d}/{d}  {d}:{d} ", .{
-                self.active + 1, self.buffers.items.len, buf.row + 1, buf.col + 1,
-            }) catch return;
-            if (right.len < width) {
-                _ = writeText(surface, ctx, @intCast(width - right.len), status_row, right, mode_style);
+            var crumbs: [4]Crumb = undefined;
+            const nc = self.breadcrumbs(&crumbs);
+            if (nc > 0) {
+                const seg = if (nc >= 2)
+                    std.fmt.allocPrint(ctx.arena, " {s} > {s} {s} ", .{
+                        crumbs[1].name, crumbs[0].kw, crumbs[0].name,
+                    }) catch return
+                else
+                    std.fmt.allocPrint(ctx.arena, " {s} {s} ", .{ crumbs[0].kw, crumbs[0].name }) catch return;
+                const w: u16 = @intCast(@min(ctx.stringWidth(seg), width));
+                const right = std.fmt.allocPrint(ctx.arena, " {d}/{d}  {d}:{d} ", .{
+                    self.active + 1, self.buffers.items.len, buf.row + 1, buf.col + 1,
+                }) catch return;
+                const rx: u16 = if (right.len < width) width - @as(u16, @intCast(right.len)) else 0;
+                if (w > 0 and rx -| w > end) {
+                    const crumb_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bar_bg };
+                    _ = writeText(surface, ctx, rx - w, status_row, seg, crumb_style);
+                }
+                if (right.len < width) {
+                    _ = writeText(surface, ctx, rx, status_row, right, mode_style);
+                }
+            } else {
+                const right = std.fmt.allocPrint(ctx.arena, " {d}/{d}  {d}:{d} ", .{
+                    self.active + 1, self.buffers.items.len, buf.row + 1, buf.col + 1,
+                }) catch return;
+                if (right.len < width) {
+                    _ = writeText(surface, ctx, @intCast(width - right.len), status_row, right, mode_style);
+                }
             }
         }
     }
