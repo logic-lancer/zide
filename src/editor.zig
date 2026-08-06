@@ -151,6 +151,7 @@ pub const Editor = struct {
         "Space g b    blame line",
         "Space g p    preview hunk",
         "Space g r    reset hunk",
+        "Space g s    stage hunk",
         "Space n      toggle line numbers",
         "Space r n    relative numbers",
         "Space t      theme picker",
@@ -202,7 +203,7 @@ pub const Editor = struct {
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
-            .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk" },
+            .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
             .g_comment => &.{ "c  line (Ngcc)", "j / k  N lines down/up", "G  to last line", "g  +to line", "i  +text object" },
             .g_comment_g => &.{ "g  comment to first line" },
@@ -519,6 +520,68 @@ pub const Editor = struct {
         b.goal_col = 0;
         b.clampCol(false);
         self.setStatus("hunk reset (:w to save, u to undo)", .{});
+    }
+
+    /// `Space g s` (gitsigns stage_hunk): feed just the hunk under the
+    /// cursor to `git apply --cached`. The diff's own header block —
+    /// everything before the first `@@` — is reused verbatim because its
+    /// paths are repo-root-relative, while b.file_name may be cwd-relative
+    /// and the cwd need not be the repo root.
+    fn stageHunk(self: *Editor) !void {
+        const b = self.gitTarget() orelse return;
+        const text = self.gitDiffText(b) orelse
+            return self.setStatus("no git diff for this file", .{});
+        defer self.alloc.free(text);
+        const h = findHunkAt(text, b.row) orelse
+            return self.setStatus("no hunk under cursor", .{});
+        const hdr_nl = std.mem.indexOf(u8, text, "\n@@ ") orelse
+            return self.setStatus("unexpected diff format", .{});
+
+        var patch: std.ArrayListUnmanaged(u8) = .{};
+        defer patch.deinit(self.alloc);
+        try patch.appendSlice(self.alloc, text[0 .. hdr_nl + 1]);
+        // Rebuilt from the parsed Hunk: git omits a ",1" count and appends
+        // function context, both of which apply cleanly when normalized.
+        var hbuf: [80]u8 = undefined;
+        try patch.appendSlice(self.alloc, std.fmt.bufPrint(&hbuf, "@@ -{d},{d} +{d},{d} @@\n", .{
+            h.old_start, h.old_count, h.new_start, h.new_count,
+        }) catch return self.setStatus("hunk header too long", .{}));
+        // Body verbatim, "\ No newline at end of file" markers included.
+        try patch.appendSlice(self.alloc, h.body(text));
+        if (patch.items.len > 0 and patch.items[patch.items.len - 1] != '\n')
+            try patch.append(self.alloc, '\n');
+
+        var child = std.process.Child.init(
+            &.{ "git", "apply", "--cached", "--unidiff-zero", "-" },
+            self.alloc,
+        );
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch return self.setStatus("could not run git apply", .{});
+        if (child.stdin) |in| {
+            in.writeAll(patch.items) catch {};
+            in.close();
+            child.stdin = null; // wait() would otherwise close it twice
+        }
+        var ebuf: [256]u8 = undefined;
+        var elen: usize = 0;
+        if (child.stderr) |errf| {
+            elen = errf.readAll(&ebuf) catch 0;
+            if (elen == ebuf.len) { // drain, so git never blocks on a full pipe
+                var sink: [512]u8 = undefined;
+                while ((errf.read(&sink) catch 0) > 0) {}
+            }
+        }
+        const term = child.wait() catch return self.setStatus("git apply failed", .{});
+        if (term != .Exited or term.Exited != 0) {
+            const out = std.mem.trimRight(u8, ebuf[0..elen], "\n");
+            const first = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
+            return self.setStatus("git apply: {s}", .{first});
+        }
+        // Signs are diffed against HEAD, not the index, so staging leaves
+        // them exactly as they were — nothing to refresh.
+        self.setStatus("hunk staged", .{});
     }
 
     const preview_max_rows = 12;
@@ -2020,9 +2083,10 @@ pub const Editor = struct {
             .leader_g => {
                 self.pending = .none;
                 switch (cp) {
-                    'r' => self.resetHunk() catch {},
-                    'p' => self.previewHunk(),
                     'b' => self.blameLine(),
+                    'p' => self.previewHunk(),
+                    'r' => self.resetHunk() catch {},
+                    's' => self.stageHunk() catch {},
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
