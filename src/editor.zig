@@ -2982,6 +2982,10 @@ pub const Editor = struct {
         const had_pending = self.pending != .none;
         self.pending = .none;
         self.count = 0;
+        // Also abort any in-flight dot capture: with the prefix gone,
+        // dotSettle would otherwise commit the orphaned keys plus whatever
+        // is typed next (e.g. `r` click `j` -> dot register "rj").
+        self.dot_capturing = false;
 
         // Tabline: click switches, click on the active tab's × closes.
         if (m.row == 0) {
@@ -2996,6 +3000,9 @@ pub const Editor = struct {
                     return ctx.consumeAndRedraw();
                 }
             }
+            // Miss (right of the last tab): still repaint a stale which-key
+            // panel away, since the prefix was cleared above.
+            if (had_pending) ctx.consumeAndRedraw();
             return;
         }
 
@@ -3177,7 +3184,7 @@ pub const Editor = struct {
 
         const tree_w: u16 = if (self.tree_open) @min(tree_width_max, max.width / 3) else 0;
         const x0 = tree_w; // text area starts right of the sidebar
-        const gutter: u16 = if (self.numbers)
+        const gutter: u16 = if (self.numbers or self.relnum)
             @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 3) // sign col + digits + pad
         else
             2; // sign col + pad
@@ -3235,11 +3242,16 @@ pub const Editor = struct {
             const line = b.lines.items[li];
             const draw_row = text_top + row;
 
-            if (self.numbers) {
+            if (self.numbers or self.relnum) {
+                // relnum alone = vim's pure relativenumber (cursor row shows
+                // 0); with numbers on, the cursor row keeps its absolute
+                // number (hybrid, like NvChad).
                 const num_val = if (self.relnum and li != b.row)
                     (if (li > b.row) li - b.row else b.row - li)
+                else if (self.numbers)
+                    (li + 1)
                 else
-                    (li + 1);
+                    0;
                 const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{num_val});
                 _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
             }
