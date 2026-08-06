@@ -43,6 +43,10 @@ pub const Editor = struct {
     /// A signature-help panel is up in insert mode: the per-keypress preview
     /// clear is suppressed so it survives typing the argument.
     sig_shown: bool = false,
+    /// Row the signature panel was requested on: leaving it (Enter, j/k
+    /// via mouse, ...) closes the panel — zls never answers null past the
+    /// closing paren, so the row change IS the close condition.
+    sig_row: usize = 0,
     popup: Popup = .{},
     files: std.ArrayListUnmanaged([]u8) = .{},
     /// Recently opened files, most recent first (persisted, NvDash "recent").
@@ -1657,8 +1661,10 @@ pub const Editor = struct {
         defer if (param) |t| self.alloc.free(t);
         // The user left insert (or opened a menu) while it was in flight.
         if (self.mode != .insert or self.cmp.active or self.popup.kind != .none) return self.sigClose();
-        // null: the cursor is no longer inside a call — typing past the ')'
-        // is what closes the panel, so it needs no Esc of its own.
+        // null: not inside a call. NOTE: zls 0.14 keeps answering the
+        // enclosing call even past its closing paren (probed), so the real
+        // close conditions are the row change and ';' handled in the key
+        // path — this null arm fires mainly for non-call positions.
         const lab = label orelse return self.sigClose();
         self.preview_len = 0;
         self.preview_hl_row = null;
@@ -1672,6 +1678,7 @@ pub const Editor = struct {
             self.preview_hl_row = 1;
         }
         self.sig_shown = true;
+        self.sig_row = self.cur().row;
     }
 
     /// The definition answer, ~one poll tick after `gd`. vim semantics: jump
@@ -2240,10 +2247,16 @@ pub const Editor = struct {
                 // Signature help is re-asked only at '(' ',' ')' — clearing on
                 // every key would blank the panel for the tick it takes the
                 // reply to land, i.e. for the whole time the user types the
-                // argument. A null reply, Esc, or leaving insert closes it.
-                if (!(self.sig_shown and self.mode == .insert)) {
+                // argument. The panel survives only while the cursor stays on
+                // the row it was asked on: zls keeps answering the enclosing
+                // call even past its ')' (probed), so a null reply can't be
+                // the close signal — the row change and ';' are.
+                const sig_holds = self.sig_shown and self.mode == .insert and
+                    self.buffers.items.len > 0 and self.cur().row == self.sig_row;
+                if (!sig_holds) {
                     self.preview_len = 0;
                     self.preview_hl_row = null;
+                    self.sig_shown = false;
                 }
                 // Record live keys into the active macro register. The `q`
                 // that stops recording is popped again in handleNormal.
@@ -4220,7 +4233,10 @@ pub const Editor = struct {
                 b.clampCol(false);
                 b.goal_col = b.col;
             },
-            vaxis.Key.enter => try b.insertText("\n"),
+            vaxis.Key.enter => {
+                try b.insertText("\n");
+                self.sigClose(); // new row: the call context is behind us
+            },
             vaxis.Key.backspace => try backspacePair(b),
             vaxis.Key.tab => try b.insertText("    "),
             else => {
@@ -4237,6 +4253,10 @@ pub const Editor = struct {
                 // answer — typing an argument costs no request at all.
                 if (text.len == 1 and (text[0] == '(' or text[0] == ',' or text[0] == ')'))
                     self.lspSignature(false);
+                // ';' ends the statement: zls would still answer with the
+                // enclosing call (probed — never null past the ')'), so the
+                // close has to be explicit rather than a re-ask.
+                if (text.len == 1 and text[0] == ';') self.sigClose();
             },
         }
         ctx.consumeAndRedraw();
@@ -4866,12 +4886,15 @@ pub const Editor = struct {
     }
 
     /// zls does NOT validate newName — it returns a full edit set for "1bad",
-    /// "" and even "fn" (verified live) — so the check has to live here, or a
-    /// rename writes dead syntax into every occurrence at once.
+    /// "" and even "fn" (verified live) — so the check has to live here.
+    /// Keywords are rejected too: zls would escape them as @"fn", but the
+    /// textual fallback path would write them bare, breaking every
+    /// occurrence at once, and renaming to a keyword is a mistake anyway.
     fn validIdent(s: []const u8) bool {
         if (s.len == 0) return false;
         if (!std.ascii.isAlphabetic(s[0]) and s[0] != '_') return false;
         for (s) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        if (std.zig.Token.keywords.get(s) != null) return false;
         return true;
     }
 
