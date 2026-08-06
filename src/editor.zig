@@ -975,6 +975,19 @@ pub const Editor = struct {
         self.setStatus("gd: {s}", .{word});
     }
 
+    /// vim-illuminate: the word under the cursor as a slice of the buffer,
+    /// or null when the cursor is not on a word char.
+    fn wordUnderCursor(b: *Buffer) ?struct { lo: usize, hi: usize } {
+        const text = b.buf.items;
+        const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+        if (pos >= text.len or Buffer.wordClass(text[pos]) != 1) return null;
+        var lo = pos;
+        while (lo > 0 and Buffer.wordClass(text[lo - 1]) == 1) lo -= 1;
+        var hi = pos;
+        while (hi < text.len and Buffer.wordClass(text[hi]) == 1) hi += 1;
+        return .{ .lo = lo, .hi = hi };
+    }
+
     /// Consume the pending count prefix (defaults to 1).
     fn takeCount(self: *Editor) u32 {
         const n = if (self.count == 0) 1 else self.count;
@@ -3204,6 +3217,17 @@ pub const Editor = struct {
             }
         }
 
+        // vim-illuminate: passively underline other occurrences of the word
+        // under the cursor (normal mode, editor focus only).
+        var illum: ?[]const u8 = null;
+        var illum_self_lo: usize = 0;
+        if (self.focus == .editor and self.mode == .normal) {
+            if (wordUnderCursor(b)) |w| {
+                illum = b.buf.items[w.lo..w.hi];
+                illum_self_lo = w.lo;
+            }
+        }
+
         var row: u16 = 0;
         while (row < text_rows) : (row += 1) {
             const li = b.scroll + row;
@@ -3233,6 +3257,15 @@ pub const Editor = struct {
             const search_style: vaxis.Style = .{ .fg = th.bg, .bg = th.yellow };
             const sel = self.selRange();
             var match: ?usize = if (self.search_hl and pat.len > 0) std.mem.indexOf(u8, text, pat) else null;
+            var ill_at: ?usize = null;
+            if (illum) |illum_word| {
+                if (std.mem.indexOf(u8, text, illum_word)) |found_idx| {
+                    if (wordBounded(b.buf.items, line.start + found_idx, illum_word.len) and
+                        line.start + found_idx != illum_self_lo) {
+                        ill_at = found_idx;
+                    }
+                }
+            }
             var cspan: ?ColorSpan = findColorSpan(text, 0);
             var col: u16 = x0 + gutter;
             var i: usize = 0;
@@ -3250,6 +3283,22 @@ pub const Editor = struct {
                         const lum: u32 = 299 * @as(u32, c.r) + 587 * @as(u32, c.g) + 114 * @as(u32, c.b);
                         style.bg = .{ .rgb = .{ c.r, c.g, c.b } };
                         style.fg = if (lum > 140_000) .{ .rgb = .{ 0, 0, 0 } } else .{ .rgb = .{ 255, 255, 255 } };
+                    }
+                }
+                if (illum) |illum_word| {
+                    if (ill_at) |ia| {
+                        if (i >= ia + illum_word.len) {
+                            ill_at = null;
+                            if (std.mem.indexOfPos(u8, text, i, illum_word)) |found_idx| {
+                                if (wordBounded(b.buf.items, line.start + found_idx, illum_word.len) and
+                                    line.start + found_idx != illum_self_lo) {
+                                    ill_at = found_idx;
+                                }
+                            }
+                        }
+                    }
+                    if (ill_at) |ia| {
+                        if (i >= ia and i < ia + illum_word.len) style.ul_style = .single;
                     }
                 }
                 if (match) |m| {
