@@ -1032,7 +1032,7 @@ pub const Editor = struct {
             if (key.mods.ctrl or key.mods.alt) return;
             const cp = key.shifted_codepoint orelse key.codepoint;
             switch (cp) {
-                'x', 'r', '~', 'J', 'p', 'o', 'O', 'i', 'a', 'A', 'I', 'd' => {},
+                'x', 'r', '~', 'J', 'p', 'o', 'O', 'i', 'a', 'A', 'I', 'd', 'g' => {},
                 else => return,
             }
             self.dot_capturing = true;
@@ -1272,6 +1272,12 @@ pub const Editor = struct {
             .none => {},
             .g => {
                 self.pending = .none;
+                // Dot-repeat: `gc…` is the only change here. gg/gv/gf/gd are
+                // motions, and `gv` even leaves normal mode — that would keep
+                // the capture alive into visual mode and let a later visual
+                // edit commit e.g. `gvd` into the dot register. Abort now
+                // (same reasoning as the mouse-click abort in handleMouse).
+                if (cp != 'c') self.dot_capturing = false;
                 if (cp == 'g') {
                     self.pushJump();
                     // `gg` = first line, `Ngg` = line N (like vim).
