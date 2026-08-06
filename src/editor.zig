@@ -330,6 +330,7 @@ pub const Editor = struct {
         "Space f o    recent files",
         "Space f s    document symbols",
         "Space f z    buffer lines",
+        "Space f m    format buffer",
         "Space g b    blame line",
         "Space g p    preview hunk",
         "Space g r    reset hunk",
@@ -382,6 +383,7 @@ pub const Editor = struct {
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
         ":LspRestart  restart zls",
+        ":Format      zig fmt buffer",
         "s (on dash)  restore session",
     };
 
@@ -391,7 +393,7 @@ pub const Editor = struct {
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
             .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
-            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines" },
+            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines", "m  format buffer" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
@@ -803,6 +805,95 @@ pub const Editor = struct {
     /// everything before the first `@@` — is reused verbatim because its
     /// paths are repo-root-relative, while b.file_name may be cwd-relative
     /// and the cwd need not be the repo root.
+    fn spawnZigFmt(self: *Editor) ?std.process.Child {
+        for (zig_exes) |exe| {
+            var child = std.process.Child.init(&.{ exe, "fmt", "--stdin" }, self.alloc);
+            child.stdin_behavior = .Pipe;
+            child.stdout_behavior = .Pipe;
+            child.stderr_behavior = .Pipe;
+            child.spawn() catch continue;
+            return child;
+        }
+        return null;
+    }
+
+    /// `:Format` / `Space f m` — pipe the buffer through `zig fmt --stdin`
+    /// and swap it wholesale. `quiet` suppresses the success statuses so
+    /// format-on-save can keep the write's own message.
+    fn formatBuffer(self: *Editor, quiet: bool) FormatResult {
+        if (self.buffers.items.len == 0) return .failed;
+        const b = self.cur();
+        if (!b.isZig()) {
+            self.setStatus("no formatter for this file", .{});
+            return .failed;
+        }
+        // Every completion offset is about to become garbage.
+        self.cmpClose();
+        var child = self.spawnZigFmt() orelse {
+            self.setStatus("could not run zig fmt", .{});
+            return .failed;
+        };
+        // `zig fmt --stdin` reads stdin to EOF before writing a byte, so the
+        // whole buffer goes out in one blocking write without deadlocking
+        // against a full stdout pipe (verified on 253 KB). SIGPIPE is a noop
+        // under Zig's start code, so a dead child surfaces as an error.
+        if (child.stdin) |in| {
+            in.writeAll(b.buf.items) catch {};
+            in.close();
+            child.stdin = null; // wait() would otherwise close it twice
+        }
+        var out: []u8 = &.{};
+        defer self.alloc.free(out); // free is a no-op on an empty slice
+        if (child.stdout) |f| out = f.readToEndAlloc(self.alloc, format_max) catch &.{};
+        var ebuf: [256]u8 = undefined;
+        var elen: usize = 0;
+        if (child.stderr) |f| {
+            elen = f.readAll(&ebuf) catch 0;
+            if (elen == ebuf.len) { // drain so the child never blocks
+                var sink: [512]u8 = undefined;
+                while ((f.read(&sink) catch 0) > 0) {}
+            }
+        }
+        const term = child.wait() catch {
+            self.setStatus("zig fmt failed", .{});
+            return .failed;
+        };
+        // Exit 2 on a parse error, `<stdin>:L:C: error: ...` on stderr. An
+        // empty buffer legitimately formats to nothing, so only an empty
+        // result from non-empty input counts as a failure.
+        if (term != .Exited or term.Exited != 0 or (out.len == 0 and b.buf.items.len != 0)) {
+            const t = std.mem.trimRight(u8, ebuf[0..elen], "\n");
+            var first = t[0 .. std.mem.indexOfScalar(u8, t, '\n') orelse t.len];
+            // Cap so setStatus's 256-byte buffer cannot silently print
+            // nothing.
+            first = first[0..Buffer.snapToCp(first, @min(first.len, 200))];
+            self.setStatus("zig fmt: {s}", .{if (first.len > 0) first else "failed"});
+            return .failed;
+        }
+        if (std.mem.eql(u8, out, b.buf.items)) {
+            if (!quiet) self.setStatus("already formatted", .{});
+            return .unchanged;
+        }
+        const row = b.row;
+        const col = b.col;
+        // One replaceRange, its own undo group whatever the caller's mode: a
+        // Ctrl-s format-on-save from insert mode would otherwise fold into
+        // the insert session, and `u` could not undo just the reformat.
+        b.undo_new_group = true;
+        b.replaceRange(0, b.buf.items.len, out) catch {
+            self.setStatus("format failed: out of memory", .{});
+            return .failed;
+        };
+        // Byte-exact restoration is impossible after a reformat; clamp row
+        // into the new buffer and the column into that line.
+        b.row = @min(row, b.lastRow());
+        b.col = @min(col, b.lineLen(b.row));
+        b.clampCol(self.mode == .insert);
+        b.goal_col = b.col;
+        if (!quiet) self.setStatus("formatted", .{});
+        return .formatted;
+    }
+
     fn stageHunk(self: *Editor) !void {
         const b = self.gitTarget() orelse return;
         // Index-based diff (see DiffBase): line numbers stay valid however
@@ -3009,6 +3100,7 @@ pub const Editor = struct {
                     'o' => self.openPopup(.recent),
                     's' => self.openPopup(.symbols),
                     'z' => self.openPopup(.lines),
+                    'm' => _ = self.formatBuffer(false),
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -4191,7 +4283,7 @@ pub const Editor = struct {
                 return self.completePath(arg, sp + 1);
             return;
         }
-        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart" };
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart", "Format" };
         return self.completeFrom(&cmds, s, 0);
     }
 
@@ -4293,6 +4385,7 @@ pub const Editor = struct {
             noh,
             rename,
             LspRestart,
+            Format,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -4329,6 +4422,7 @@ pub const Editor = struct {
             .noh => self.search_hl = false,
             .rename => try self.renameWord(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
             .LspRestart => self.lspRestart(),
+            .Format => _ = self.formatBuffer(false),
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
@@ -4604,6 +4698,15 @@ pub const Editor = struct {
     // ---- integrated terminal (NvTerm-style) -------------------------------
 
     const poll_tick_ms: u32 = 80;
+
+    /// Formatter output ceiling — a runaway child, not a source file.
+    const format_max = 8 * 1024 * 1024;
+    /// The compiler is `zig0.14` on this box and plain `zig` elsewhere. The
+    /// pinned name goes first so a stray newer zig on PATH cannot restyle a
+    /// 0.14 file.
+    const zig_exes = [_][]const u8{ "zig0.14", "zig" };
+
+    const FormatResult = enum { formatted, unchanged, failed };
 
     /// Arm one tick and account for it. Every ctx.tick call in the editor goes
     /// through here.
