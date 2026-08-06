@@ -40,6 +40,9 @@ pub const Editor = struct {
     grep_hits: std.ArrayListUnmanaged(GrepHit) = .{},
     tree: Tree,
     tree_open: bool = false,
+    /// Space n / Space r n: absolute + relative line-number display.
+    numbers: bool = true,
+    relnum: bool = false,
     focus: Focus = .editor,
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
@@ -100,7 +103,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, d, leader, leader_f, leader_c, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
+    const Pending = enum { none, g, d, leader, leader_f, leader_c, leader_r, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -137,6 +140,8 @@ pub const Editor = struct {
         "Space f f    find files",
         "Space f w    live grep",
         "Space f o    recent files",
+        "Space n      toggle line numbers",
+        "Space r n    relative numbers",
         "Space t      theme picker",
         "Space x      close buffer",
         "Alt-h        terminal split",
@@ -176,9 +181,10 @@ pub const Editor = struct {
     /// others are small but unhinted like obj_i/obj_a/indent ops).
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet" },
+            .leader_r => &.{ "n  toggle relative numbers" },
             .g => &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f t  find-char to", "i  +inner object", "a  +around object" },
@@ -1498,6 +1504,8 @@ pub const Editor = struct {
                     'c' => self.pending = .leader_c,
                     'e' => self.toggleTree(),
                     'f' => self.pending = .leader_f,
+                    'n' => self.numbers = !self.numbers,
+                    'r' => self.pending = .leader_r,
                     't' => self.openPopup(.themes),
                     'x' => self.closeBuffer(ctx, false),
                     '/' => b.toggleComment() catch {},
@@ -1519,6 +1527,14 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'h' => self.openPopup(.keys),
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .leader_r => {
+                self.pending = .none;
+                switch (cp) {
+                    'n' => self.relnum = !self.relnum,
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -3137,7 +3153,10 @@ pub const Editor = struct {
 
         const tree_w: u16 = if (self.tree_open) @min(tree_width_max, max.width / 3) else 0;
         const x0 = tree_w; // text area starts right of the sidebar
-        const gutter: u16 = @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 3); // sign col + digits + pad
+        const gutter: u16 = if (self.numbers)
+            @intCast(std.fmt.count("{d}", .{b.lines.items.len}) + 3) // sign col + digits + pad
+        else
+            2; // sign col + pad
         const gutter_style: vaxis.Style = .{ .fg = th.gutter, .bg = th.bg };
         const cursor_ln_style: vaxis.Style = .{ .fg = th.gutter_active, .bg = th.bg };
 
@@ -3181,8 +3200,14 @@ pub const Editor = struct {
             const line = b.lines.items[li];
             const draw_row = text_top + row;
 
-            const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{li + 1});
-            _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
+            if (self.numbers) {
+                const num_val = if (self.relnum and li != b.row)
+                    (if (li > b.row) li - b.row else b.row - li)
+                else
+                    (li + 1);
+                const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{num_val});
+                _ = writeText(surface, ctx, @intCast(x0 + gutter - 1 - num.len), draw_row, num, if (li == b.row) cursor_ln_style else gutter_style);
+            }
 
             // gitsigns-style hunk marker in the leftmost gutter column
             switch (b.signFor(li)) {
