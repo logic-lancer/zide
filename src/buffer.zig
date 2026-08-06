@@ -32,8 +32,33 @@ pub const Buffer = struct {
     mark_lt: ?Mark = null,
     mark_gt: ?Mark = null,
 
+    /// Undo history: every replaceRange is recorded here. Edits sharing a
+    /// `seq` form one undo group (one normal-mode command, or one whole
+    /// insert-mode session — the editor bumps the group on normal keys).
+    undo_stack: std.ArrayListUnmanaged(UndoEdit) = .{},
+    redo_stack: std.ArrayListUnmanaged(UndoEdit) = .{},
+    undo_seq: u32 = 0,
+    /// Set by the editor on non-insert keypresses; the next recorded edit
+    /// starts a fresh group.
+    undo_new_group: bool = true,
+    /// True while undo()/redo() replay edits, so they aren't re-recorded.
+    in_undo: bool = false,
+    /// `undo_seq` at the top of the stack when last saved — lets undo
+    /// restore `dirty = false` when it walks back to the on-disk state.
+    saved_seq: u32 = 0,
+
     pub const Mark = struct { row: usize, col: usize };
     pub const Sign = enum(u8) { none, add, change, delete };
+    pub const UndoEdit = struct {
+        start: usize,
+        old_text: []u8,
+        new_text: []u8,
+        /// Cursor position just before the edit, restored on undo.
+        row: usize,
+        col: usize,
+        seq: u32,
+    };
+    const undo_max = 1000;
 
     pub const Line = struct { start: u32, end: u32 };
 
@@ -61,11 +86,20 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
+        for (self.undo_stack.items) |e| self.freeEdit(e);
+        for (self.redo_stack.items) |e| self.freeEdit(e);
+        self.undo_stack.deinit(self.alloc);
+        self.redo_stack.deinit(self.alloc);
         self.buf.deinit(self.alloc);
         self.lines.deinit(self.alloc);
         self.git_signs.deinit(self.alloc);
         self.hl.deinit();
         self.alloc.free(self.file_name);
+    }
+
+    fn freeEdit(self: *Buffer, e: UndoEdit) void {
+        self.alloc.free(e.old_text);
+        self.alloc.free(e.new_text);
     }
 
     pub fn signFor(self: *const Buffer, row_idx: usize) Sign {
@@ -152,10 +186,85 @@ pub const Buffer = struct {
             else
                 .{ .row = start_point.row + newlines, .column = @intCast(text.len - after_last_nl) },
         };
+        if (!self.in_undo) try self.recordEdit(start, end, text);
         try self.buf.replaceRange(self.alloc, start, end - start, text);
         try self.rebuildLines();
         try self.hl.update(self.buf.items, edit);
         self.dirty = true;
+    }
+
+    // ---- undo -------------------------------------------------------------
+
+    fn recordEdit(self: *Buffer, start: usize, end: usize, text: []const u8) !void {
+        if (self.undo_new_group) {
+            self.undo_seq += 1;
+            self.undo_new_group = false;
+        }
+        for (self.redo_stack.items) |e| self.freeEdit(e);
+        self.redo_stack.clearRetainingCapacity();
+        const old = try self.alloc.dupe(u8, self.buf.items[start..end]);
+        errdefer self.alloc.free(old);
+        const new = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(new);
+        try self.undo_stack.append(self.alloc, .{
+            .start = start,
+            .old_text = old,
+            .new_text = new,
+            .row = self.row,
+            .col = self.col,
+            .seq = self.undo_seq,
+        });
+        if (self.undo_stack.items.len > undo_max) {
+            self.freeEdit(self.undo_stack.orderedRemove(0));
+        }
+    }
+
+    fn topSeq(self: *const Buffer) u32 {
+        const items = self.undo_stack.items;
+        return if (items.len == 0) 0 else items[items.len - 1].seq;
+    }
+
+    /// Revert the newest undo group. Returns false when there is nothing
+    /// left to undo. Cursor lands where it was before the group's first edit.
+    pub fn undo(self: *Buffer) !bool {
+        if (self.undo_stack.items.len == 0) return false;
+        const seq = self.topSeq();
+        self.in_undo = true;
+        defer self.in_undo = false;
+        while (self.undo_stack.items.len > 0) {
+            const len = self.undo_stack.items.len;
+            const e = self.undo_stack.items[len - 1];
+            if (e.seq != seq) break;
+            self.undo_stack.items.len = len - 1;
+            try self.replaceRange(e.start, e.start + e.new_text.len, e.old_text);
+            self.row = @min(e.row, self.lines.items.len - 1);
+            self.col = e.col;
+            try self.redo_stack.append(self.alloc, e);
+        }
+        self.clampCol(false);
+        self.goal_col = self.col;
+        self.dirty = self.topSeq() != self.saved_seq;
+        return true;
+    }
+
+    /// Re-apply the newest undone group. Returns false when there is
+    /// nothing to redo.
+    pub fn redo(self: *Buffer) !bool {
+        if (self.redo_stack.items.len == 0) return false;
+        const seq = self.redo_stack.items[self.redo_stack.items.len - 1].seq;
+        self.in_undo = true;
+        defer self.in_undo = false;
+        while (self.redo_stack.items.len > 0) {
+            const len = self.redo_stack.items.len;
+            const e = self.redo_stack.items[len - 1];
+            if (e.seq != seq) break;
+            self.redo_stack.items.len = len - 1;
+            try self.replaceRange(e.start, e.start + e.old_text.len, e.new_text);
+            self.setCursorFromByte(e.start);
+            try self.undo_stack.append(self.alloc, e);
+        }
+        self.dirty = self.topSeq() != self.saved_seq;
+        return true;
     }
 
     // ---- cursor helpers ---------------------------------------------------
@@ -517,5 +626,6 @@ pub const Buffer = struct {
     pub fn save(self: *Buffer) !void {
         try std.fs.cwd().writeFile(.{ .sub_path = self.file_name, .data = self.buf.items });
         self.dirty = false;
+        self.saved_seq = self.topSeq();
     }
 };

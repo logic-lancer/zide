@@ -166,6 +166,7 @@ pub const Editor = struct {
         "cs \" '       change surround",
         "ds ( \" ...   delete surround",
         "S( (visual)  wrap selection",
+        "u / Ctrl-r   undo / redo",
         "i / Esc      insert / normal mode",
         ":w :q :wq    write / quit",
     };
@@ -1179,6 +1180,9 @@ pub const Editor = struct {
 
     fn handleNormal(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
+        // Any normal-mode key starts a fresh undo group, so a command's
+        // edits (plus the insert session it may open) undo as one unit.
+        b.undo_new_group = true;
         // Effective character: kitty reports 'g'+shift with shifted 'G',
         // legacy terminals report 'G' directly.
         const cp = key.shifted_codepoint orelse key.codepoint;
@@ -1541,6 +1545,7 @@ pub const Editor = struct {
                 'h' => if (self.tree_open) {
                     self.focus = .tree;
                 },
+                'r' => { const rn = self.takeCount(); for (0..rn) |_| { if (!try b.redo()) { self.setStatus("already at newest change", .{}); break; } } },
                 else => return,
             }
             return ctx.consumeAndRedraw();
@@ -1649,6 +1654,7 @@ pub const Editor = struct {
             '*' => self.searchWord(1),
             '#' => self.searchWord(-1),
             'x' => for (0..n) |_| try b.deleteCharAtCursor(),
+            'u' => for (0..n) |_| { if (!try b.undo()) { self.setStatus("already at oldest change", .{}); break; } },
             'r' => self.pending = .replace_char,
             '~' => for (0..n) |_| try b.toggleCaseAtCursor(),
             '.' => try self.playDot(ctx),
@@ -1956,6 +1962,7 @@ pub const Editor = struct {
 
     fn handleVisual(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
+        b.undo_new_group = true;
         const cp = key.shifted_codepoint orelse key.codepoint;
         const half: i64 = @max(1, self.last_height / 2);
 
