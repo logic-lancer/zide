@@ -196,12 +196,10 @@ pub const Buffer = struct {
     // ---- undo -------------------------------------------------------------
 
     fn recordEdit(self: *Buffer, start: usize, end: usize, text: []const u8) !void {
-        if (self.undo_new_group) {
-            self.undo_seq += 1;
-            self.undo_new_group = false;
-        }
-        for (self.redo_stack.items) |e| self.freeEdit(e);
-        self.redo_stack.clearRetainingCapacity();
+        // Allocate everything before touching existing state, so an OOM
+        // mid-record can't destroy the redo history or bump the group seq
+        // for an edit that never lands.
+        const seq = if (self.undo_new_group) self.undo_seq + 1 else self.undo_seq;
         const old = try self.alloc.dupe(u8, self.buf.items[start..end]);
         errdefer self.alloc.free(old);
         const new = try self.alloc.dupe(u8, text);
@@ -212,10 +210,25 @@ pub const Buffer = struct {
             .new_text = new,
             .row = self.row,
             .col = self.col,
-            .seq = self.undo_seq,
+            .seq = seq,
         });
+        self.undo_seq = seq;
+        self.undo_new_group = false;
+        for (self.redo_stack.items) |e| self.freeEdit(e);
+        self.redo_stack.clearRetainingCapacity();
         if (self.undo_stack.items.len > undo_max) {
-            self.freeEdit(self.undo_stack.orderedRemove(0));
+            // Evict the entire oldest group: dropping single edits could
+            // split a group, leaving undo() able to half-revert it into a
+            // state that never existed.
+            const drop_seq = self.undo_stack.items[0].seq;
+            var k: usize = 0;
+            while (k < self.undo_stack.items.len and
+                self.undo_stack.items[k].seq == drop_seq) : (k += 1)
+            {
+                self.freeEdit(self.undo_stack.items[k]);
+            }
+            // Shrinking replace can't allocate, hence can't fail.
+            self.undo_stack.replaceRange(self.alloc, 0, k, &.{}) catch unreachable;
         }
     }
 
