@@ -107,7 +107,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, g_comment, d, leader, leader_f, leader_c, leader_r, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
+    const Pending = enum { none, g, g_comment, d, leader, leader_f, leader_c, leader_r, leader_g, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -145,6 +145,9 @@ pub const Editor = struct {
         "Space f f    find files",
         "Space f w    live grep",
         "Space f o    recent files",
+        "Space g b    blame line",
+        "Space g p    preview hunk",
+        "Space g r    reset hunk",
         "Space n      toggle line numbers",
         "Space r n    relative numbers",
         "Space t      theme picker",
@@ -189,10 +192,11 @@ pub const Editor = struct {
     /// others are small but unhinted like obj_i/obj_a/indent ops).
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
+            .leader_g => &.{ "r  reset hunk", "p  preview hunk", "b  blame line" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
             .g_comment => &.{ "c  toggle comment line" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
@@ -342,6 +346,156 @@ pub const Editor = struct {
             const stop = @min(i + new_count, b.git_signs.items.len);
             while (i < stop) : (i += 1) b.git_signs.items[i] = sign;
         }
+    }
+
+    /// One `@@ -old_start[,old_count] +new_start[,new_count] @@` hunk plus the
+    /// byte range of its body (the -/+ lines) inside the diff output.
+    const Hunk = struct {
+        old_start: usize,
+        old_count: usize,
+        new_start: usize,
+        new_count: usize,
+        body_start: usize = 0,
+        body_end: usize = 0,
+
+        /// 0-based row the hunk's sign sits on — must match refreshGitSigns
+        /// so `]c` always lands somewhere `Space g r/p` accepts.
+        fn signRow(h: Hunk) usize {
+            if (h.new_count == 0) return if (h.new_start > 0) h.new_start - 1 else 0;
+            return h.new_start - 1;
+        }
+        fn covers(h: Hunk, row: usize) bool {
+            if (h.new_count == 0) return row == h.signRow();
+            return row >= h.new_start - 1 and row < h.new_start - 1 + h.new_count;
+        }
+        fn body(h: Hunk, text: []const u8) []const u8 {
+            const s = @min(h.body_start, text.len);
+            const e = @min(@max(h.body_end, s), text.len);
+            return text[s..e];
+        }
+    };
+
+    fn parseSpec(spec: []const u8) ?[2]usize {
+        if (std.mem.indexOfScalar(u8, spec, ',')) |c| return .{
+            std.fmt.parseInt(usize, spec[0..c], 10) catch return null,
+            std.fmt.parseInt(usize, spec[c + 1 ..], 10) catch return null,
+        };
+        return .{ std.fmt.parseInt(usize, spec, 10) catch return null, 1 };
+    }
+
+    /// Parse a unified-diff hunk header. A missing count means 1
+    /// (`@@ -2 +2 @@`); the trailing function-context text is ignored.
+    fn parseHunkHeader(line: []const u8) ?Hunk {
+        if (!std.mem.startsWith(u8, line, "@@ -")) return null;
+        var it = std.mem.tokenizeScalar(u8, line[4..], ' ');
+        const old_spec = it.next() orelse return null;
+        const new_raw = it.next() orelse return null;
+        if (new_raw.len < 2 or new_raw[0] != '+') return null;
+        const o = parseSpec(old_spec) orelse return null;
+        const n = parseSpec(new_raw[1..]) orelse return null;
+        return .{ .old_start = o[0], .old_count = o[1], .new_start = n[0], .new_count = n[1] };
+    }
+
+    /// The hunk whose new-side lines contain `row` (0-based), or null.
+    fn findHunkAt(text: []const u8, row: usize) ?Hunk {
+        var open: ?Hunk = null;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        var off: usize = 0;
+        while (it.next()) |line| : (off += line.len + 1) {
+            if (!std.mem.startsWith(u8, line, "@@ ")) continue;
+            if (open) |prev| {
+                var done = prev;
+                done.body_end = off; // body runs up to this next header
+                if (done.covers(row)) return done;
+            }
+            var h = parseHunkHeader(line) orelse continue;
+            h.body_start = off + line.len + 1;
+            open = h;
+        }
+        if (open) |prev| {
+            var done = prev;
+            done.body_end = text.len;
+            if (done.covers(row)) return done;
+        }
+        return null;
+    }
+
+    /// `git diff --no-color -U0 HEAD -- file` stdout (caller frees), or null
+    /// outside a repo / for an untracked path.
+    fn gitDiffText(self: *Editor, b: *Buffer) ?[]u8 {
+        const res = std.process.Child.run(.{
+            .allocator = self.alloc,
+            .argv = &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name },
+            .max_output_bytes = 1 << 20,
+        }) catch return null;
+        self.alloc.free(res.stderr);
+        if (res.term != .Exited or res.term.Exited != 0) {
+            self.alloc.free(res.stdout);
+            return null;
+        }
+        return res.stdout;
+    }
+
+    /// Shared gate for the `Space g` actions: git sees the file ON DISK, so an
+    /// unsaved buffer would make every line number lie (and reset would splice
+    /// the wrong rows). gitsigns works off the index the same way.
+    fn gitTarget(self: *Editor) ?*Buffer {
+        if (self.buffers.items.len == 0) return null;
+        const b = self.cur();
+        if (b.dirty) {
+            self.setStatus("save first: git commands read the file on disk", .{});
+            return null;
+        }
+        return b;
+    }
+
+    /// `Space g r` (gitsigns reset_hunk): restore the hunk under the cursor to
+    /// its HEAD content, as one undo group.
+    fn resetHunk(self: *Editor) !void {
+        const b = self.gitTarget() orelse return;
+        const text = self.gitDiffText(b) orelse
+            return self.setStatus("no git diff for this file", .{});
+        defer self.alloc.free(text);
+        const h = findHunkAt(text, b.row) orelse
+            return self.setStatus("no hunk under cursor", .{});
+
+        // Old side of the hunk: the '-' body lines, each re-terminated.
+        var old: std.ArrayListUnmanaged(u8) = .{};
+        defer old.deinit(self.alloc);
+        var it = std.mem.splitScalar(u8, h.body(text), '\n');
+        while (it.next()) |ln| {
+            if (ln.len == 0 or ln[0] != '-') continue;
+            try old.appendSlice(self.alloc, ln[1..]);
+            try old.append(self.alloc, '\n');
+        }
+
+        b.undo_new_group = true; // one command = one undo group
+        if (h.new_count == 0) {
+            // Pure deletion: put the old lines back after row new_start-1
+            // (new_start == 0 means they were deleted from the very top).
+            const at = if (h.new_start == 0) 0 else @min(
+                b.lines.items[@min(h.new_start - 1, b.lines.items.len - 1)].end + 1,
+                b.buf.items.len,
+            );
+            try b.replaceRange(at, at, old.items);
+            b.row = @min(if (h.new_start == 0) 0 else h.new_start, b.lastRow());
+        } else {
+            const first = @min(h.new_start - 1, b.lines.items.len - 1);
+            const last = @min(first + h.new_count - 1, b.lines.items.len - 1);
+            const start = b.lines.items[first].start;
+            var end: usize = b.lines.items[last].end;
+            if (end < b.buf.items.len) {
+                end += 1; // take the trailing newline, like Buffer.deleteLine
+            } else if (old.items.len > 0) {
+                _ = old.pop(); // replacing through EOF: no trailing newline
+            }
+            try b.replaceRange(start, end, old.items); // "" for a pure-add hunk
+            b.row = @min(first, b.lastRow());
+        }
+        b.col = 0;
+        b.goal_col = 0;
+        b.clampCol(false);
+        self.setStatus("hunk reset (:w to save, u to undo)", .{});
     }
 
     pub fn deinit(self: *Editor) void {
@@ -1584,6 +1738,7 @@ pub const Editor = struct {
                     'c' => self.pending = .leader_c,
                     'e' => self.toggleTree(),
                     'f' => self.pending = .leader_f,
+                    'g' => self.pending = .leader_g,
                     'n' => self.numbers = !self.numbers,
                     'r' => self.pending = .leader_r,
                     't' => self.openPopup(.themes),
@@ -1629,6 +1784,16 @@ pub const Editor = struct {
                 self.pending = .none;
                 switch (cp) {
                     'n' => self.relnum = !self.relnum,
+                    else => {},
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .leader_g => {
+                self.pending = .none;
+                switch (cp) {
+                    'r' => self.resetHunk() catch {},
+                    'p' => {},
+                    'b' => {},
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
