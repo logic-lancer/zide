@@ -122,6 +122,11 @@ pub const Editor = struct {
     /// Where `gd` was pressed. The answer lands a poll tick later, so the
     /// jumplist entry must point here and not at wherever the cursor drifted.
     lsp_req: ?struct { buf: usize, row: usize, col: usize } = null,
+    /// Ctrl-n/Ctrl-p asked zls for completions. The answer lands a poll tick
+    /// later, so the request's region start (a byte offset — later typing
+    /// only shifts bytes *after* it) is remembered to validate and re-filter
+    /// it. `back` replays the Ctrl-p direction into whichever menu opens.
+    cmp_req: ?struct { buf: usize, start: usize, back: bool } = null,
     /// Ticks currently in flight. The terminal/LSP poll chain re-arms only at
     /// zero, so overlapping arm sites can never multiply into extra chains.
     ticks: u8 = 0,
@@ -180,6 +185,12 @@ pub const Editor = struct {
         start: usize = 0,
         len: usize = 0,
         prefix: std.ArrayListUnmanaged(u8) = .{},
+        /// False only while an LSP menu is showing with nothing inserted yet
+        /// (nvim-cmp: the popup appears, the buffer still holds what you
+        /// typed). The first Ctrl-n/Ctrl-p applies `sel` instead of moving
+        /// it. Buffer-word completion leaves this true — vim's Ctrl-n
+        /// inserts on the first press.
+        applied: bool = true,
 
         const max_items = 500;
         const rows = 8;
@@ -1109,7 +1120,7 @@ pub const Editor = struct {
         // old index/offsets must not survive.
         self.yank_flash = null;
         self.lsp_req = null; // indices shift; a pending gd must not push a stale jump
-        if (self.cmp.active) self.cmpClose();
+        self.cmpClose();
         self.lspDidClose(b);
         var removed = self.buffers.orderedRemove(self.active);
         removed.deinit();
@@ -1167,6 +1178,7 @@ pub const Editor = struct {
         self.lsp_root = null;
         self.lsp_failed = false; // the whole point: undo the permanent-death flag
         self.lsp_req = null;
+        self.cmp_req = null;
         for (self.buffers.items) |*b| {
             for (b.diags.items) |d| self.alloc.free(d.message);
             b.diags.clearRetainingCapacity();
@@ -1242,6 +1254,19 @@ pub const Editor = struct {
         l.didSave(uri);
     }
 
+    /// Push this buffer's queued full-text didChange right now. lspTick calls
+    /// it on the debounce; cmpRequestLsp calls it directly because a
+    /// completion request one line later must see the character just typed.
+    fn lspFlushChange(self: *Editor, b: *Buffer) void {
+        const l = if (self.lsp) |*p| p else return;
+        if (!l.alive or !l.initialized or !b.lsp_opened or !b.lsp_dirty) return;
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        b.lsp_version += 1;
+        l.didChange(uri, b.buf.items, b.lsp_version);
+        b.lsp_dirty = false;
+    }
+
     /// K: ask zls about the identifier under the cursor. The answer arrives on
     /// a later poll tick and lands in the preview panel.
     fn lspHover(self: *Editor) void {
@@ -1288,6 +1313,7 @@ pub const Editor = struct {
                 b.lsp_opened = false;
             }
             self.lsp_req = null;
+            self.cmp_req = null;
             self.setStatus("zls exited — LSP off", .{});
             return true;
         }
@@ -1299,12 +1325,7 @@ pub const Editor = struct {
                     self.lspDidOpen(b);
                     continue;
                 }
-                if (!b.lsp_dirty) continue;
-                const uri = self.bufUri(b) orelse continue;
-                defer self.alloc.free(uri);
-                b.lsp_version += 1;
-                l.didChange(uri, b.buf.items, b.lsp_version);
-                b.lsp_dirty = false;
+                self.lspFlushChange(b);
             }
         }
         // FIFO: pop() would apply the OLDEST publish last, resurrecting
@@ -1358,6 +1379,13 @@ pub const Editor = struct {
             const locs = l.refs;
             l.refs = &.{};
             self.applyReferences(locs);
+            changed = true;
+        }
+        if (l.cmp_done) {
+            l.cmp_done = false;
+            const items = l.cmp_items;
+            l.cmp_items = &.{};
+            self.applyCompletion(items);
             changed = true;
         }
         return changed;
@@ -1455,6 +1483,59 @@ pub const Editor = struct {
         // reroute in-flight keystrokes into the filter — or worse, let a
         // race-timed Enter jump somewhere the user never chose.
         if (self.popup.kind == .none and self.mode == .normal) self.openPopup(.qf);
+    }
+
+    /// The completion answer, ~one poll tick after Ctrl-n. The user keeps
+    /// typing while the request is in flight, so items are re-filtered
+    /// against the prefix as it stands NOW rather than dropped; anything
+    /// that means the cursor left the word drops the answer instead.
+    fn applyCompletion(self: *Editor, items: [][]u8) void {
+        defer Lsp.freeItems(self.alloc, items);
+        const req = self.cmp_req orelse return;
+        self.cmp_req = null;
+        if (self.mode != .insert or self.popup.kind != .none) return;
+        if (req.buf >= self.buffers.items.len or req.buf != self.active) return;
+        const b = self.cur();
+        const ls = b.lines.items[b.row].start;
+        const cpos = ls + @min(b.col, b.lineLen(b.row));
+        // Still on the request's row, cursor at or after the region start,
+        // and nothing but word bytes in between: exactly "the user only kept
+        // typing the same word". Enter moves ls past start; backspacing out
+        // of the word pulls cur before start; a space or dot fails the scan.
+        if (req.start < ls or req.start > cpos) return;
+        for (b.buf.items[req.start..cpos]) |c| if (Buffer.wordClass(c) != 1) return;
+        const prefix = b.buf.items[req.start..cpos];
+
+        self.cmpClose(); // also nulls cmp_req, already taken above
+        for (items) |it| {
+            // zls does NOT filter — it returns the same full candidate set
+            // for `std.` and `std.deb` (verified) — so the prefix match is
+            // ours. Case-sensitive, like cmpCollect and vim's own Ctrl-n.
+            // Exact matches are kept: dropping them would show "no
+            // completions" for a fully typed symbol.
+            if (!std.mem.startsWith(u8, it, prefix)) continue;
+            const owned = self.alloc.dupe(u8, it) catch break;
+            self.cmp.items.append(self.alloc, owned) catch {
+                self.alloc.free(owned);
+                break;
+            };
+            if (self.cmp.items.items.len >= Cmp.max_items) break;
+        }
+        if (self.cmp.items.items.len == 0) {
+            // Empty or null response: the pre-LSP behavior, one tick late.
+            // Same shape as applyDefinition -> gotoDefLocal.
+            self.cmpClose();
+            self.cmpOpenWords(req.back) catch {};
+            return;
+        }
+        std.mem.sort([]u8, self.cmp.items.items, {}, lessStr);
+        self.cmp.prefix.appendSlice(self.alloc, prefix) catch {};
+        self.cmp.active = true;
+        self.cmp.start = req.start;
+        self.cmp.len = cpos - req.start; // region still holds the typed prefix
+        self.cmp.applied = false; // nothing inserted yet
+        self.cmp.sel = if (req.back) self.cmp.items.items.len - 1 else 0;
+        self.setStatus("zls: {d} completions", .{self.cmp.items.items.len});
     }
 
     // ---- status line ------------------------------------------------------
@@ -3911,6 +3992,12 @@ pub const Editor = struct {
         self.cmp.active = false;
         self.cmp.sel = 0;
         self.cmp.len = 0;
+        self.cmp.applied = true;
+        self.cmp_req = null;
+    }
+
+    fn lessStr(_: void, a: []u8, b: []u8) bool {
+        return std.mem.lessThan(u8, a, b);
     }
 
     /// Harvest distinct word runs (wordClass == 1, len >= 2) from every open
@@ -3940,11 +4027,7 @@ pub const Editor = struct {
             }
             if (self.cmp.items.items.len >= Cmp.max_items) break;
         }
-        std.mem.sort([]u8, self.cmp.items.items, {}, struct {
-            fn less(_: void, a: []u8, b: []u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.less);
+        std.mem.sort([]u8, self.cmp.items.items, {}, lessStr);
     }
 
     /// Replace the completion region with `text`, cursor just after it.
@@ -3960,15 +4043,64 @@ pub const Editor = struct {
     fn cmpCycle(self: *Editor, delta: isize) !void {
         const n = self.cmp.items.items.len;
         if (n == 0) return;
+        if (!self.cmp.applied) {
+            // First press on an LSP menu: apply the already-highlighted row
+            // instead of moving off it, so Ctrl-n Ctrl-n walks 0, 1, 2 and
+            // Ctrl-p Ctrl-p walks n-1, n-2 — the same rhythm as buffer
+            // words.
+            self.cmp.applied = true;
+            return self.cmpApply(self.cmp.items.items[self.cmp.sel]);
+        }
         const next = @mod(@as(isize, @intCast(self.cmp.sel)) + delta, @as(isize, @intCast(n)));
         self.cmp.sel = @intCast(next);
         try self.cmpApply(self.cmp.items.items[@intCast(next)]);
     }
 
+    /// Ctrl-n / Ctrl-p in insert mode. With zls alive on a zig buffer the
+    /// candidates come from the server one poll tick later (applyCompletion);
+    /// otherwise, and whenever the server has nothing to say, from the words
+    /// in the open buffers.
+    fn cmpOpen(self: *Editor, back: bool) !void {
+        if (self.cmpRequestLsp(back)) return;
+        try self.cmpOpenWords(back);
+    }
+
+    /// Ask zls for completions at the cursor. False means "no usable server
+    /// here" so the caller falls back to buffer words this instant.
+    fn cmpRequestLsp(self: *Editor, back: bool) bool {
+        const b = self.cur();
+        if (!b.isZig()) return false;
+        // Dot-repeat and macro replay must stay deterministic and
+        // synchronous: an async answer would land after dotSettle, in normal
+        // mode, and be dropped — the repeat would silently lose the word.
+        if (self.replay_depth > 0) return false;
+        const l = self.ensureLsp() orelse return false;
+        if (!l.initialized or !b.lsp_opened) return false;
+        const uri = self.bufUri(b) orelse return false;
+        defer self.alloc.free(uri);
+        // ORDERING: zls must see the character just typed. lspTick's
+        // debounced didChange has not gone out yet, so push it now — it
+        // lands in `out` ahead of the request, and the server processes the
+        // stream in order (verified: back-to-back didChange+completion
+        // answered against the fresh text in 12 ms).
+        self.lspFlushChange(b);
+        const col = @min(b.col, b.lineLen(b.row));
+        l.completion(uri, b.row, col); // utf-8 negotiated: byte column
+        self.cmpClose(); // also clears cmp_req; must precede the set
+        const text = b.buf.items;
+        const pos = b.lines.items[b.row].start + col;
+        var s = pos;
+        while (s > 0 and Buffer.wordClass(text[s - 1]) == 1) s -= 1;
+        self.cmp_req = .{ .buf = self.active, .start = s, .back = back };
+        self.setStatus("zls: completing...", .{});
+        return true;
+    }
+
     /// Ctrl-n / Ctrl-p in insert mode: open the menu on the word before the
     /// cursor (vim semantics — the first press already inserts a match).
-    fn cmpOpen(self: *Editor, back: bool) !void {
+    fn cmpOpenWords(self: *Editor, back: bool) !void {
         self.cmpClose();
+        self.cmp_req = null;
         const b = self.cur();
         const text = b.buf.items;
         const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
@@ -4002,9 +4134,12 @@ pub const Editor = struct {
             ctx.consumeAndRedraw();
             return true;
         }
-        // The completed text is already in the buffer, so Enter/Tab just
-        // dismiss the menu.
         if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{})) {
+            // With an LSP menu the text is not in the buffer yet, so
+            // Enter/Tab confirm the highlighted row (nvim-cmp); with buffer
+            // words it is already there and they only dismiss.
+            if (!self.cmp.applied and self.cmp.items.items.len > 0)
+                try self.cmpApply(self.cmp.items.items[self.cmp.sel]);
             self.cmpClose();
             ctx.consumeAndRedraw();
             return true;

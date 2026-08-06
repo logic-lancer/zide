@@ -31,6 +31,11 @@ pub const Lsp = struct {
     /// server answered null). Taken and freed by the editor.
     refs_done: bool = false,
     refs: []Loc = &.{},
+    cmp_id: i64 = 0,
+    /// A completion response landed; `cmp_items` is its payload (empty when
+    /// the server answered null). Taken and freed by the editor.
+    cmp_done: bool = false,
+    cmp_items: [][]u8 = &.{},
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -38,6 +43,9 @@ pub const Lsp = struct {
 
     /// Runaway-server guard: a stream this far behind is desynchronized.
     const max_in = 8 * 1024 * 1024;
+    /// Hard cap on one response. zls 0.14 tops out around 282 items in this
+    /// project; anything past this is a runaway server, not a menu.
+    const max_cmp = 2000;
     /// JSON `{}` — an empty anonymous tuple would stringify as `[]`.
     const Empty = struct {};
 
@@ -89,6 +97,11 @@ pub const Lsp = struct {
                     .synchronization = .{ .dynamicRegistration = false, .didSave = true },
                     .publishDiagnostics = .{ .relatedInformation = false },
                     .hover = .{ .contentFormat = [_][]const u8{"plaintext"} },
+                    .completion = .{
+                        .dynamicRegistration = false,
+                        .completionItem = .{ .snippetSupport = false, .insertReplaceSupport = false },
+                        .contextSupport = false,
+                    },
                 },
             },
         });
@@ -122,6 +135,7 @@ pub const Lsp = struct {
         if (self.hover_text) |t| self.alloc.free(t);
         if (self.def_loc) |l| self.alloc.free(l.path);
         freeLocs(self.alloc, self.refs);
+        freeItems(self.alloc, self.cmp_items);
         self.* = undefined;
     }
 
@@ -230,6 +244,18 @@ pub const Lsp = struct {
         alloc.free(locs);
     }
 
+    pub fn completion(self: *Lsp, uri: []const u8, line: usize, col: usize) void {
+        self.cmp_id = self.request("textDocument/completion", .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = @as(i64, @intCast(line)), .character = @as(i64, @intCast(col)) },
+        });
+    }
+
+    pub fn freeItems(alloc: std.mem.Allocator, items: [][]u8) void {
+        for (items) |i| alloc.free(i);
+        alloc.free(items);
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -323,6 +349,11 @@ pub const Lsp = struct {
         if (self.refs_id != 0 and id == self.refs_id) {
             self.refs_id = 0;
             self.onReferences(root);
+            return;
+        }
+        if (self.cmp_id != 0 and id == self.cmp_id) {
+            self.cmp_id = 0;
+            self.onCompletion(root);
             return;
         }
     }
@@ -465,6 +496,57 @@ pub const Lsp = struct {
         if (c != .eq) return c == .lt;
         if (a.line != b.line) return a.line < b.line;
         return a.col < b.col;
+    }
+
+    // ---- completion ---------------------------------------------------------
+
+    /// zls 0.14 fills `textEdit.newText` on every item and never `insertText`
+    /// (verified live). newText equals the label for everything except
+    /// builtins, where the label is `@memcpy` but newText is `memcpy` because
+    /// the edit range starts after the `@` — which is exactly the word-class
+    /// region the editor replaces. So one string serves as menu row, filter
+    /// key and inserted text, and Cmp needs no new shape.
+    fn onCompletion(self: *Lsp, root: std.json.Value) void {
+        freeItems(self.alloc, self.cmp_items);
+        self.cmp_items = &.{};
+        self.cmp_done = true;
+        const res = objGet(root, "result") orelse return;
+        // CompletionList {isIncomplete, items} is what zls sends; the bare
+        // CompletionItem[] branch keeps any other server from doing nothing.
+        // isIncomplete is ignored: zls answered false in every probe, and a
+        // re-request would need a keystroke anyway.
+        const arr = switch (res) {
+            .array => |a| a,
+            .object => switch (objGet(res, "items") orelse return) {
+                .array => |a| a,
+                else => return,
+            },
+            else => return, // null: nothing completable here (e.g. zls cannot
+            // resolve `std` because `zig` is not on PATH)
+        };
+        var list: std.ArrayListUnmanaged([]u8) = .{};
+        errdefer {
+            for (list.items) |i| self.alloc.free(i);
+            list.deinit(self.alloc);
+        }
+        for (arr.items) |item| {
+            const text = blk: {
+                if (objGet(item, "textEdit")) |te| if (getStr(te, "newText")) |t| break :blk t;
+                break :blk getStr(item, "insertText") orelse getStr(item, "label") orelse continue;
+            };
+            if (text.len == 0) continue;
+            // zls offers an operator row (label "*", a pointer deref) after a
+            // dot. It can never match a word prefix and would only ever be
+            // noise at index 0.
+            if (text[0] < 0x80 and !std.ascii.isAlphanumeric(text[0]) and text[0] != '_') continue;
+            const owned = self.alloc.dupe(u8, text) catch break;
+            list.append(self.alloc, owned) catch {
+                self.alloc.free(owned);
+                break;
+            };
+            if (list.items.len >= max_cmp) break;
+        }
+        self.cmp_items = list.toOwnedSlice(self.alloc) catch &.{};
     }
 
     // ---- json helpers (switch-based: no tagged-union equality) ------------
