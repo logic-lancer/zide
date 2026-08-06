@@ -52,6 +52,9 @@ pub const Editor = struct {
     /// Space n / Space r n: absolute + relative line-number display.
     numbers: bool = true,
     relnum: bool = false,
+    /// conform.nvim format_on_save: `:AutoFormat` toggles it. Session state
+    /// only — like `numbers`, `relnum` and the theme, it is not persisted.
+    format_on_save: bool = false,
     focus: Focus = .editor,
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
@@ -384,6 +387,7 @@ pub const Editor = struct {
         ":w :q :wq    write / quit",
         ":LspRestart  restart zls",
         ":Format      zig fmt buffer",
+        ":AutoFormat  format on save",
         "s (on dash)  restore session",
     };
 
@@ -1638,11 +1642,19 @@ pub const Editor = struct {
 
     fn save(self: *Editor) void {
         const b = self.cur();
+        // Format BEFORE the write so the bytes on disk are the bytes in the
+        // buffer. A failure (parse error mid-edit, no zig on PATH) still
+        // saves the unformatted buffer — never lose an edit to a formatter.
+        const fmt: ?FormatResult =
+            if (self.format_on_save and b.isZig()) self.formatBuffer(true) else null;
         b.save() catch |err| {
             self.setStatus("write failed: {s}", .{@errorName(err)});
             return;
         };
-        self.setStatus("\"{s}\" {d}L, {d}B written", .{ b.file_name, b.lines.items.len, b.buf.items.len });
+        // The write message must not swallow the formatter's error, which
+        // formatBuffer already put in the status line.
+        if (fmt == null or fmt.? != .failed)
+            self.setStatus("\"{s}\" {d}L, {d}B written", .{ b.file_name, b.lines.items.len, b.buf.items.len });
         self.refreshGitSigns(b);
         self.lspDidSave(b);
         self.saveSession();
@@ -4283,7 +4295,7 @@ pub const Editor = struct {
                 return self.completePath(arg, sp + 1);
             return;
         }
-        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart", "Format" };
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart", "Format", "AutoFormat" };
         return self.completeFrom(&cmds, s, 0);
     }
 
@@ -4386,6 +4398,7 @@ pub const Editor = struct {
             rename,
             LspRestart,
             Format,
+            AutoFormat,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -4423,6 +4436,10 @@ pub const Editor = struct {
             .rename => try self.renameWord(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
             .LspRestart => self.lspRestart(),
             .Format => _ = self.formatBuffer(false),
+            .AutoFormat => {
+                self.format_on_save = !self.format_on_save;
+                self.setStatus("format on save: {s}", .{if (self.format_on_save) "on" else "off"});
+            },
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
