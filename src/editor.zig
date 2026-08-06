@@ -206,7 +206,7 @@ pub const Editor = struct {
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
-            .g_comment => &.{ "c  line (Ngcc)", "j / k  N lines down/up", "G  to last line", "g  +to line", "i  +text object" },
+            .g_comment => &.{ "c  line (Ngcc)", "j / k  cursor+N lines", "G  to last line", "g  +to line", "i  +text object" },
             .g_comment_g => &.{ "g  comment to first line" },
             .g_comment_i => &.{ "p  comment paragraph" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
@@ -308,15 +308,22 @@ pub const Editor = struct {
         if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch return;
         var f = std.fs.cwd().createFile(path, .{}) catch return;
         defer f.close();
-        for (self.buffers.items) |*b| {
+        // `active` must index the lines actually written, not self.buffers:
+        // buffers whose realpath fails (new unsaved file, deleted underneath)
+        // are skipped and would shift every later index.
+        var written: usize = 0;
+        var active_out: usize = 0;
+        for (self.buffers.items, 0..) |*b, i| {
             var abuf: [std.fs.max_path_bytes]u8 = undefined;
             const abs = std.fs.cwd().realpath(b.file_name, &abuf) catch continue;
             var lbuf: [std.fs.max_path_bytes + 48]u8 = undefined;
             const line = std.fmt.bufPrint(&lbuf, "{d}:{d}:{s}\n", .{ b.row, b.col, abs }) catch continue;
+            if (i == self.active) active_out = written;
             f.writeAll(line) catch return;
+            written += 1;
         }
         var abuf: [32]u8 = undefined;
-        f.writeAll(std.fmt.bufPrint(&abuf, "active:{d}\n", .{self.active}) catch return) catch return;
+        f.writeAll(std.fmt.bufPrint(&abuf, "active:{d}\n", .{active_out}) catch return) catch return;
     }
 
     /// Dashboard `s`: reopen every session buffer and restore its cursor.
@@ -502,12 +509,22 @@ pub const Editor = struct {
         return null;
     }
 
-    /// `git diff --no-color -U0 HEAD -- file` stdout (caller frees), or null
-    /// outside a repo / for an untracked path.
-    fn gitDiffText(self: *Editor, b: *Buffer) ?[]u8 {
+    /// The comparison base for a hunk diff: HEAD for display/reset (matches
+    /// the gutter signs), the index for staging — `git apply --cached`
+    /// targets the index, so a HEAD-based preimage mis-places pure-add
+    /// hunks whenever an earlier hunk is not yet staged.
+    const DiffBase = enum { head, index };
+
+    /// `git diff --no-color -U0 [HEAD] -- file` stdout (caller frees), or
+    /// null outside a repo / for an untracked path.
+    fn gitDiffText(self: *Editor, b: *Buffer, base: DiffBase) ?[]u8 {
+        const argv_head: []const []const u8 =
+            &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name };
+        const argv_index: []const []const u8 =
+            &.{ "git", "diff", "--no-color", "-U0", "--", b.file_name };
         const res = std.process.Child.run(.{
             .allocator = self.alloc,
-            .argv = &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name },
+            .argv = if (base == .head) argv_head else argv_index,
             .max_output_bytes = 1 << 20,
         }) catch return null;
         self.alloc.free(res.stderr);
@@ -535,7 +552,7 @@ pub const Editor = struct {
     /// its HEAD content, as one undo group.
     fn resetHunk(self: *Editor) !void {
         const b = self.gitTarget() orelse return;
-        const text = self.gitDiffText(b) orelse
+        const text = self.gitDiffText(b, .head) orelse
             return self.setStatus("no git diff for this file", .{});
         defer self.alloc.free(text);
         const h = findHunkAt(text, b.row) orelse
@@ -598,11 +615,14 @@ pub const Editor = struct {
     /// and the cwd need not be the repo root.
     fn stageHunk(self: *Editor) !void {
         const b = self.gitTarget() orelse return;
-        const text = self.gitDiffText(b) orelse
+        // Index-based diff (see DiffBase): line numbers stay valid however
+        // many other hunks are staged, and an already-staged hunk simply
+        // disappears from the diff instead of staging twice.
+        const text = self.gitDiffText(b, .index) orelse
             return self.setStatus("no git diff for this file", .{});
         defer self.alloc.free(text);
         const h = findHunkAt(text, b.row) orelse
-            return self.setStatus("no hunk under cursor", .{});
+            return self.setStatus("no unstaged hunk under cursor", .{});
         const hdr_nl = std.mem.indexOf(u8, text, "\n@@ ") orelse
             return self.setStatus("unexpected diff format", .{});
 
@@ -645,8 +665,11 @@ pub const Editor = struct {
         const term = child.wait() catch return self.setStatus("git apply failed", .{});
         if (term != .Exited or term.Exited != 0) {
             const out = std.mem.trimRight(u8, ebuf[0..elen], "\n");
-            const first = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
-            return self.setStatus("git apply: {s}", .{first});
+            var first = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
+            // Cap so setStatus's 256-byte buffer can't overflow and
+            // silently show nothing.
+            first = first[0..Buffer.snapToCp(first, @min(first.len, 200))];
+            return self.setStatus("git apply: {s}", .{if (first.len > 0) first else "failed"});
         }
         // Signs are diffed against HEAD, not the index, so staging leaves
         // them exactly as they were — nothing to refresh.
@@ -685,7 +708,7 @@ pub const Editor = struct {
     fn previewHunk(self: *Editor) void {
         self.preview_len = 0;
         const b = self.gitTarget() orelse return;
-        const text = self.gitDiffText(b) orelse
+        const text = self.gitDiffText(b, .head) orelse
             return self.setStatus("no git diff for this file", .{});
         defer self.alloc.free(text);
         const h = findHunkAt(text, b.row) orelse
@@ -1779,6 +1802,10 @@ pub const Editor = struct {
                     '0' => if (self.count > 0) {
                         self.count = @min(self.count * 10, 99999);
                         self.pending = .g_comment;
+                    } else {
+                        // gc0: `0` as a motion — linewise op on the current
+                        // line, like Comment.nvim.
+                        b.toggleComment() catch {};
                     },
                     'c' => {
                         const n = self.takeCount();
