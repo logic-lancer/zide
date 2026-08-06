@@ -110,7 +110,7 @@ pub const Editor = struct {
     const TabSpan = struct { start: u16, end: u16, close: u16, idx: usize };
 
     pub const Mode = enum { normal, insert, command, visual, visual_line };
-    const Pending = enum { none, g, g_comment, d, leader, leader_f, leader_c, leader_r, leader_g, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
+    const Pending = enum { none, g, g_comment, g_comment_g, g_comment_i, d, leader, leader_f, leader_c, leader_r, leader_g, bracket_f, bracket_b, mark_set, mark_exact, mark_line, macro_rec, macro_play, replace_char, c_op, surround_old, surround_new, surround_del, surround_vis, obj_i, obj_a, y_op, indent_gt, indent_lt, indent_eq, find_f, find_F, find_t, find_T, z };
 
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
@@ -174,6 +174,8 @@ pub const Editor = struct {
         "gf           goto file under cursor",
         "gcc / Ngcc   toggle comment",
         "gc (visual)  comment selection",
+        "gcj gck gcG  comment motion",
+        "gcgg gcip    comment to top / para",
         "v / V        visual / line select",
         "y d p        yank / delete / put",
         "dd           delete line",
@@ -202,7 +204,9 @@ pub const Editor = struct {
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "c  +comment" },
-            .g_comment => &.{ "c  toggle comment line" },
+            .g_comment => &.{ "c  line (Ngcc)", "j / k  N lines down/up", "G  to last line", "g  +to line", "i  +text object" },
+            .g_comment_g => &.{ "g  comment to first line" },
+            .g_comment_i => &.{ "p  comment paragraph" },
             .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
@@ -1628,17 +1632,66 @@ pub const Editor = struct {
             },
             .g_comment => {
                 self.pending = .none;
-                const n = self.takeCount();
-                if (cp == 'c') {
-                    if (n <= 1) {
-                        b.toggleComment() catch {};
-                    } else {
-                        // toggleCommentRows keeps the byte column (screen
-                        // position), unlike toggleComment which follows the
-                        // shifted character — close enough to Comment.nvim.
-                        const hi = @min(b.row + n - 1, b.lastRow());
-                        b.toggleCommentRows(b.row, hi) catch {};
-                    }
+                switch (cp) {
+                    // A count typed between `gc` and the motion (`gc2j`):
+                    // keep accumulating instead of eating it as a bad motion.
+                    '1'...'9' => {
+                        self.count = @min(self.count * 10 + @as(u32, @intCast(cp - '0')), 99999);
+                        self.pending = .g_comment;
+                    },
+                    '0' => if (self.count > 0) {
+                        self.count = @min(self.count * 10, 99999);
+                        self.pending = .g_comment;
+                    },
+                    'c' => {
+                        const n = self.takeCount();
+                        if (n <= 1) {
+                            b.toggleComment() catch {};
+                        } else {
+                            // toggleCommentRows keeps the byte column (screen
+                            // position), unlike toggleComment which follows the
+                            // shifted character — close enough to Comment.nvim.
+                            const hi = @min(b.row + n - 1, b.lastRow());
+                            b.toggleCommentRows(b.row, hi) catch {};
+                        }
+                    },
+                    'j' => {
+                        const n = self.takeCount();
+                        self.commentRange(b.row, b.row + n);
+                    },
+                    'k' => {
+                        const n = self.takeCount();
+                        self.commentRange(b.row -| n, b.row);
+                    },
+                    'G' => {
+                        const had = self.count > 0;
+                        const n = self.takeCount();
+                        const t = if (had) @min(n - 1, b.lastRow()) else b.lastRow();
+                        self.commentRange(@min(b.row, t), @max(b.row, t));
+                    },
+                    // gcgg / gcNgg — count deliberately left intact.
+                    'g' => self.pending = .g_comment_g,
+                    'i' => self.pending = .g_comment_i, // gcip
+                    else => self.count = 0,
+                }
+                return ctx.consumeAndRedraw();
+            },
+            .g_comment_g => {
+                self.pending = .none;
+                if (cp == 'g') {
+                    const had = self.count > 0;
+                    const n = self.takeCount();
+                    const t = if (had) @min(n - 1, b.lastRow()) else 0;
+                    self.commentRange(@min(b.row, t), @max(b.row, t));
+                } else self.count = 0;
+                return ctx.consumeAndRedraw();
+            },
+            .g_comment_i => {
+                self.pending = .none;
+                self.count = 0;
+                if (cp == 'p') {
+                    const r = paragraphRows(b);
+                    self.commentRange(r[0], r[1]);
                 }
                 return ctx.consumeAndRedraw();
             },
@@ -2446,6 +2499,32 @@ pub const Editor = struct {
         if (self.reg_linewise and (self.reg.items.len == 0 or
             self.reg.items[self.reg.items.len - 1] != '\n'))
             try self.reg.append(self.alloc, '\n');
+    }
+
+    /// Toggle comments over rows [lo,hi] (clamped) and park the cursor on
+    /// the first non-blank column of the first row — Comment.nvim's
+    /// behaviour for `gc` + motion.
+    fn commentRange(self: *Editor, lo: usize, hi: usize) void {
+        const b = self.cur();
+        const l = @min(lo, b.lastRow());
+        const h = @min(@max(hi, l), b.lastRow());
+        b.toggleCommentRows(l, h) catch {};
+        b.row = l;
+        b.col = b.firstNonWs(l);
+        b.goal_col = b.col;
+    }
+
+    /// Blank-line-delimited block containing the cursor row (vim `ip`,
+    /// linewise). On a blank row this is the run of blank rows instead —
+    /// toggleCommentRows then no-ops, which is the right nothing.
+    fn paragraphRows(b: *Buffer) [2]usize {
+        const want = b.rowBlank(b.row);
+        var lo = b.row;
+        while (lo > 0 and b.rowBlank(lo - 1) == want) lo -= 1;
+        var hi = b.row;
+        const last = b.lastRow();
+        while (hi < last and b.rowBlank(hi + 1) == want) hi += 1;
+        return .{ lo, hi };
     }
 
     /// Toggle comments over the selected rows, then leave visual mode with the

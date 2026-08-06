@@ -354,7 +354,7 @@ pub const Buffer = struct {
         self.goal_col = self.col;
     }
 
-    fn rowBlank(self: *const Buffer, row: usize) bool {
+    pub fn rowBlank(self: *const Buffer, row: usize) bool {
         for (self.lineText(row)) |c| {
             if (c != ' ' and c != '\t') return false;
         }
