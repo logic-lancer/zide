@@ -155,6 +155,7 @@ pub const Editor = struct {
         "Ctrl-h       focus tree",
         "Ctrl-l       focus editor",
         "Ctrl-o/i     jumplist back/fwd",
+        "Ctrl-s       save file",
         "Ctrl-d/u     half-page down/up",
         "Ctrl-e/y     scroll line down/up",
         "zz/zt/zb     center/top/bottom",
@@ -1623,6 +1624,7 @@ pub const Editor = struct {
                     self.focus = .tree;
                 },
                 'r' => { const rn = self.takeCount(); for (0..rn) |_| { if (!try b.redo()) { self.setStatus("already at newest change", .{}); break; } } },
+                's' => self.save(),
                 else => return,
             }
             return ctx.consumeAndRedraw();
@@ -2297,6 +2299,8 @@ pub const Editor = struct {
 
     fn handleInsert(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         const b = self.cur();
+        // NvChad <C-s>: write the buffer without leaving insert mode.
+        if (key.mods.ctrl and key.codepoint == 's') { self.save(); return ctx.consumeAndRedraw(); }
         switch (key.codepoint) {
             vaxis.Key.escape => {
                 self.mode = .normal;
