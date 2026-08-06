@@ -36,6 +36,11 @@ pub const Lsp = struct {
     /// the server answered null). Taken and freed by the editor.
     cmp_done: bool = false,
     cmp_items: [][]u8 = &.{},
+    rename_id: i64 = 0,
+    /// A rename response landed; `rename_edits` is its payload (empty when
+    /// the server answered null). Taken and freed by the editor.
+    rename_done: bool = false,
+    rename_edits: []TextEdit = &.{},
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -46,6 +51,9 @@ pub const Lsp = struct {
     /// Hard cap on one response. zls 0.14 tops out around 282 items in this
     /// project; anything past this is a runaway server, not a menu.
     const max_cmp = 2000;
+    /// Hard cap on one WorkspaceEdit. `Buffer` -> 49 edits across this
+    /// project; anything past this is a runaway server, not a refactor.
+    const max_edits = 4000;
     /// JSON `{}` — an empty anonymous tuple would stringify as `[]`.
     const Empty = struct {};
 
@@ -62,6 +70,20 @@ pub const Lsp = struct {
     /// One resolved location: absolute path (decoded from the uri) + 0-based
     /// line and byte column (utf-8 encoding was negotiated). `path` is owned.
     pub const Loc = struct { path: []u8, line: u32, col: u32 };
+
+    /// One WorkspaceEdit entry: absolute path + a 0-based utf-8 range +
+    /// replacement. zls only ever emits single-line ranges covering exactly
+    /// the old identifier (verified on decls, uses, fields, methods, types,
+    /// params and locals), but the range is carried in full so a wrong
+    /// assumption fails the editor's text check instead of corrupting a file.
+    pub const TextEdit = struct {
+        path: []u8, // owned
+        line: u32,
+        col: u32,
+        end_line: u32,
+        end_col: u32,
+        new_text: []u8, // owned
+    };
 
     // ---- lifecycle --------------------------------------------------------
 
@@ -102,6 +124,7 @@ pub const Lsp = struct {
                         .completionItem = .{ .snippetSupport = false, .insertReplaceSupport = false },
                         .contextSupport = false,
                     },
+                    .rename = .{ .dynamicRegistration = false, .prepareSupport = false },
                 },
             },
         });
@@ -136,6 +159,7 @@ pub const Lsp = struct {
         if (self.def_loc) |l| self.alloc.free(l.path);
         freeLocs(self.alloc, self.refs);
         freeItems(self.alloc, self.cmp_items);
+        freeEdits(self.alloc, self.rename_edits);
         self.* = undefined;
     }
 
@@ -259,6 +283,22 @@ pub const Lsp = struct {
         alloc.free(items);
     }
 
+    pub fn freeEdits(alloc: std.mem.Allocator, edits: []TextEdit) void {
+        for (edits) |e| {
+            alloc.free(e.path);
+            alloc.free(e.new_text);
+        }
+        alloc.free(edits);
+    }
+
+    pub fn rename(self: *Lsp, uri: []const u8, line: usize, col: usize, new_name: []const u8) void {
+        self.rename_id = self.request("textDocument/rename", .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = @as(i64, @intCast(line)), .character = @as(i64, @intCast(col)) },
+            .newName = new_name,
+        });
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -357,6 +397,11 @@ pub const Lsp = struct {
         if (self.cmp_id != 0 and id == self.cmp_id) {
             self.cmp_id = 0;
             self.onCompletion(root);
+            return;
+        }
+        if (self.rename_id != 0 and id == self.rename_id) {
+            self.rename_id = 0;
+            self.onRename(root);
             return;
         }
     }
@@ -550,6 +595,92 @@ pub const Lsp = struct {
             if (list.items.len >= max_cmp) break;
         }
         self.cmp_items = list.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    // ---- rename ---------------------------------------------------------
+
+    /// zls 0.14 answers with `changes` (uri -> TextEdit[]) and never
+    /// `documentChanges`, even when the client advertises support for it
+    /// (verified live). The documentChanges branch is a few lines and keeps
+    /// any other server from silently doing nothing.
+    fn onRename(self: *Lsp, root: std.json.Value) void {
+        freeEdits(self.alloc, self.rename_edits);
+        self.rename_edits = &.{};
+        self.rename_done = true;
+        const res = objGet(root, "result") orelse return; // null: no symbol here
+        var list: std.ArrayListUnmanaged(TextEdit) = .{};
+        errdefer {
+            for (list.items) |e| {
+                self.alloc.free(e.path);
+                self.alloc.free(e.new_text);
+            }
+            list.deinit(self.alloc);
+        }
+        if (objGet(res, "changes")) |ch| switch (ch) {
+            .object => |o| {
+                var it = o.iterator();
+                while (it.next()) |kv| self.collectEdits(&list, kv.key_ptr.*, kv.value_ptr.*);
+            },
+            else => {},
+        };
+        if (list.items.len == 0) {
+            if (objGet(res, "documentChanges")) |dc| switch (dc) {
+                .array => |a| for (a.items) |entry| {
+                    const td = objGet(entry, "textDocument") orelse continue;
+                    const uri = getStr(td, "uri") orelse continue;
+                    self.collectEdits(&list, uri, objGet(entry, "edits") orelse continue);
+                },
+                else => {},
+            };
+        }
+        // Grouped by file and ascending within it, so the editor can walk one
+        // file's edits as a contiguous run — backwards.
+        std.mem.sort(TextEdit, list.items, {}, lessEdit);
+        self.rename_edits = list.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    fn collectEdits(self: *Lsp, list: *std.ArrayListUnmanaged(TextEdit), uri: []const u8, edits: std.json.Value) void {
+        const arr = switch (edits) {
+            .array => |a| a,
+            else => return,
+        };
+        const path = pathFromUri(self.alloc, uri) catch return;
+        defer self.alloc.free(path); // one dupe per edit: each entry owns its own
+        for (arr.items) |e| {
+            if (list.items.len >= max_edits) return;
+            const range = objGet(e, "range") orelse continue;
+            const s = objGet(range, "start") orelse continue;
+            const en = objGet(range, "end") orelse continue;
+            const sl = getInt(s, "line") orelse continue;
+            const sc = getInt(s, "character") orelse continue;
+            const el = getInt(en, "line") orelse continue;
+            const ec = getInt(en, "character") orelse continue;
+            const nt = getStr(e, "newText") orelse continue;
+            const p = self.alloc.dupe(u8, path) catch return;
+            const t = self.alloc.dupe(u8, nt) catch {
+                self.alloc.free(p);
+                return;
+            };
+            list.append(self.alloc, .{
+                .path = p,
+                .line = @intCast(@max(sl, 0)),
+                .col = @intCast(@max(sc, 0)),
+                .end_line = @intCast(@max(el, 0)),
+                .end_col = @intCast(@max(ec, 0)),
+                .new_text = t,
+            }) catch {
+                self.alloc.free(p);
+                self.alloc.free(t);
+                return;
+            };
+        }
+    }
+
+    fn lessEdit(_: void, a: TextEdit, b: TextEdit) bool {
+        const c = std.mem.order(u8, a.path, b.path);
+        if (c != .eq) return c == .lt;
+        if (a.line != b.line) return a.line < b.line;
+        return a.col < b.col;
     }
 
     // ---- json helpers (switch-based: no tagged-union equality) ------------

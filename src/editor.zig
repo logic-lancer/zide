@@ -130,6 +130,10 @@ pub const Editor = struct {
     /// only shifts bytes *after* it) is remembered to validate and re-filter
     /// it. `back` replays the Ctrl-p direction into whichever menu opens.
     cmp_req: ?struct { buf: usize, start: usize, back: bool, had_prefix: bool } = null,
+    /// In-flight `:rename`. `old` is what the request point held; `new` is
+    /// what to write. Both owned — the reply lands a tick later and the
+    /// fallback path needs them.
+    rename_req: ?struct { buf: usize, row: usize, col: usize, old: []u8, new: []u8 } = null,
     /// Ticks currently in flight. The terminal/LSP poll chain re-arms only at
     /// zero, so overlapping arm sites can never multiply into extra chains.
     ticks: u8 = 0,
@@ -326,7 +330,7 @@ pub const Editor = struct {
         "Space /      toggle comment",
         "Space b      buffer picker",
         "Space c h    cheatsheet",
-        "Space c r    rename word",
+        "Space c r    rename symbol",
         "Space e      focus/toggle tree",
         "Space f f    find files",
         "Space f w    live grep",
@@ -398,7 +402,7 @@ pub const Editor = struct {
         return switch (p) {
             .leader => if (visual) &.{"/  toggle comment"} else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines", "m  format buffer" },
-            .leader_c => &.{ "h  cheatsheet", "r  rename word" },
+            .leader_c => &.{ "h  cheatsheet", "r  rename symbol" },
             .leader_r => &.{"n  toggle relative numbers"},
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
             .g => if (visual) &.{ "g  goto top", "c  toggle comment" } else &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition", "r  references", "c  +comment" },
@@ -1150,6 +1154,7 @@ pub const Editor = struct {
         if (self.term) |*t| t.deinit();
         if (self.lsp) |*l| l.deinit();
         if (self.lsp_root) |r| self.alloc.free(r);
+        self.renameReqClear();
     }
 
     pub fn widget(self: *Editor) vxfw.Widget {
@@ -1162,6 +1167,14 @@ pub const Editor = struct {
 
     fn cur(self: *Editor) *Buffer {
         return &self.buffers.items[self.active];
+    }
+
+    fn renameReqClear(self: *Editor) void {
+        if (self.rename_req) |r| {
+            self.alloc.free(r.old);
+            self.alloc.free(r.new);
+        }
+        self.rename_req = null;
     }
 
     // ---- buffer management ------------------------------------------------
@@ -1215,6 +1228,7 @@ pub const Editor = struct {
         // old index/offsets must not survive.
         self.yank_flash = null;
         self.lsp_req = null; // indices shift; a pending gd must not push a stale jump
+        self.renameReqClear(); // indices shift; a pending rename target must not apply
         self.cmpClose();
         self.lspDidClose(b);
         var removed = self.buffers.orderedRemove(self.active);
@@ -1274,6 +1288,7 @@ pub const Editor = struct {
         self.lsp_failed = false; // the whole point: undo the permanent-death flag
         self.lsp_req = null;
         self.cmp_req = null;
+        self.renameReqClear();
         for (self.buffers.items) |*b| {
             for (b.diags.items) |d| self.alloc.free(d.message);
             b.diags.clearRetainingCapacity();
@@ -1409,6 +1424,7 @@ pub const Editor = struct {
             }
             self.lsp_req = null;
             self.cmp_req = null;
+            self.renameReqClear();
             self.setStatus("zls exited — LSP off", .{});
             return true;
         }
@@ -1483,7 +1499,112 @@ pub const Editor = struct {
             self.applyCompletion(items);
             changed = true;
         }
+        if (l.rename_done) {
+            l.rename_done = false;
+            const edits = l.rename_edits;
+            l.rename_edits = &.{};
+            self.applyRename(edits);
+            changed = true;
+        }
         return changed;
+    }
+
+    /// Byte offset of a 0-based LSP (line, character) in `b`, or null when the
+    /// position is outside the buffer as it stands NOW.
+    fn byteAt(b: *const Buffer, line: u32, col: u32) ?usize {
+        if (line >= b.lines.items.len) return null;
+        if (col > b.lineLen(line)) return null;
+        return b.lines.items[line].start + col;
+    }
+
+    /// The WorkspaceEdit answer, ~one poll tick after `:rename`.
+    fn applyRename(self: *Editor, edits: []Lsp.TextEdit) void {
+        defer Lsp.freeEdits(self.alloc, edits);
+        const req = self.rename_req orelse return; // not ours (LspRestart, buffer closed)
+        defer self.renameReqClear();
+
+        if (edits.len == 0) {
+            // zls had no symbol here (keywords, comments, block labels).
+            // Fall back to the textual rename, but only while the user is
+            // still where the request was made — applyDefinition's rule.
+            if (req.buf < self.buffers.items.len and req.buf == self.active) {
+                const b = self.cur();
+                if (b.row == req.row and b.col == req.col) {
+                    self.renameWord(req.new) catch {};
+                    return; // renameWord sets its own status
+                }
+            }
+            return self.setStatus("rename: zls has no symbol here", .{});
+        }
+
+        const saved_active = self.active; // openFile switches; put it back
+        var count: usize = 0;
+        var files: usize = 0;
+        var skipped: usize = 0;
+        var i: usize = 0;
+        while (i < edits.len) {
+            var j = i;
+            while (j < edits.len and std.mem.eql(u8, edits[j].path, edits[i].path)) j += 1;
+            defer i = j;
+            const name = self.lspLocalPath(edits[i].path) orelse {
+                skipped += 1;
+                continue;
+            };
+            defer self.alloc.free(name);
+            // Files zls touched that aren't open are OPENED, not written: every
+            // edit lands in a buffer the user can see, undo and choose to :w.
+            // Nothing here reaches the disk.
+            self.openFile(name) catch {
+                skipped += 1;
+                continue;
+            };
+            if (self.buffers.items.len == 0) {
+                skipped += 1;
+                continue;
+            }
+            // openFile may have appended and reallocated: index, never a
+            // pointer held across the call.
+            const bi = self.active;
+            const b = &self.buffers.items[bi];
+            if (!std.mem.eql(u8, b.file_name, name)) {
+                skipped += 1;
+                continue;
+            }
+            var applied: usize = 0;
+            // Reverse: an edit's offsets are only valid while every byte
+            // before it is untouched.
+            var k = j;
+            while (k > i) {
+                k -= 1;
+                const e = edits[k];
+                const start = byteAt(b, e.line, e.col) orelse continue;
+                const end = byteAt(b, e.end_line, e.end_col) orelse continue;
+                if (end < start) continue;
+                // Every range zls returns covers exactly the old identifier
+                // (verified across decls, uses, fields, methods, types,
+                // params and locals). Anything else means the buffer moved
+                // under the request — drop the edit instead of corrupting it.
+                if (!std.mem.eql(u8, b.buf.items[start..end], req.old)) continue;
+                if (applied == 0) b.undo_new_group = true; // one group per buffer
+                b.replaceRange(start, end, e.new_text) catch continue;
+                applied += 1;
+            }
+            if (applied == 0) {
+                skipped += 1;
+                continue;
+            }
+            b.clampCol(false); // a shorter name can leave the cursor past EOL
+            count += applied;
+            files += 1;
+        }
+        self.active = @min(saved_active, self.buffers.items.len -| 1);
+        if (count == 0) return self.setStatus("rename: nothing applied (buffer changed?)", .{});
+        if (skipped > 0)
+            self.setStatus("renamed {d} in {d} file(s), {d} skipped (unsaved)", .{ count, files, skipped })
+        else
+            self.setStatus("renamed {d} occurrence{s} in {d} file{s} (unsaved)", .{
+                count, if (count == 1) "" else "s", files, if (files == 1) "" else "s",
+            });
     }
 
     /// The definition answer, ~one poll tick after `gd`. vim semantics: jump
@@ -4450,7 +4571,7 @@ pub const Editor = struct {
             .theme => try self.switchTheme(it.next()),
             .themes => self.setStatus("themes: {s}", .{themes.names}),
             .noh => self.search_hl = false,
-            .rename => try self.renameWord(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
+            .rename => try self.renameSymbol(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
             .LspRestart => self.lspRestart(),
             .Format => _ = self.formatBuffer(false),
             .AutoFormat => {
@@ -4654,6 +4775,50 @@ pub const Editor = struct {
         b.setCursorFromByte(cursor_byte);
         b.goal_col = b.col;
         self.setStatus("renamed {d} occurrence{s} of {s}", .{ hits, if (hits == 1) "" else "s", old });
+    }
+
+    /// zls does NOT validate newName — it returns a full edit set for "1bad",
+    /// "" and even "fn" (verified live) — so the check has to live here, or a
+    /// rename writes dead syntax into every occurrence at once.
+    fn validIdent(s: []const u8) bool {
+        if (s.len == 0) return false;
+        if (!std.ascii.isAlphabetic(s[0]) and s[0] != '_') return false;
+        for (s) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        return true;
+    }
+
+    /// `:rename <new>` / `Space c r`. Asks zls first: its answer is
+    /// scope-exact — no comments, no strings, no unrelated same-named locals —
+    /// where the whole-word rewrite is textual. Falls back to renameWord when
+    /// zls is unusable, and again (a tick later) when it has no symbol here.
+    ///
+    /// Scope caveat, measured: zls 0.14's rename covers exactly what its
+    /// references cover, which for a cross-file symbol is the declaring file
+    /// plus any `@import("x.zig").Sym` field access — NOT call sites reached
+    /// through a local alias. It is a precise local rename, not a
+    /// project-wide refactor, and the status line says "(unsaved)" so the
+    /// user reviews before writing.
+    fn renameSymbol(self: *Editor, new: []const u8) !void {
+        if (self.buffers.items.len == 0) return self.setStatus("no open buffer", .{});
+        if (!validIdent(new)) return self.setStatus("rename: '{s}' is not an identifier", .{new});
+        const b = self.cur();
+        const r = self.wordNearCursor() orelse return self.setStatus("no word under cursor", .{});
+        if (std.mem.eql(u8, b.buf.items[r[0]..r[1]], new)) return self.setStatus("rename: unchanged", .{});
+        if (!b.isZig()) return self.renameWord(new);
+        const l = self.ensureLsp() orelse return self.renameWord(new);
+        if (!l.initialized or !b.lsp_opened) return self.renameWord(new);
+        // zls computes every range against ITS copy of the document: a queued
+        // didChange must go out first or all of them are stale.
+        self.lspFlushChange(b);
+        const uri = self.bufUri(b) orelse return self.renameWord(new);
+        defer self.alloc.free(uri);
+        self.renameReqClear();
+        const old = try self.alloc.dupe(u8, b.buf.items[r[0]..r[1]]);
+        errdefer self.alloc.free(old);
+        const nw = try self.alloc.dupe(u8, new);
+        self.rename_req = .{ .buf = self.active, .row = b.row, .col = b.col, .old = old, .new = nw };
+        l.rename(uri, b.row, b.col, new);
+        self.setStatus("rename: asking zls...", .{});
     }
 
     /// `*` / `#`: whole-word search for the identifier under (or right of)
