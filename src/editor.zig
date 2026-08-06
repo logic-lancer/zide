@@ -95,6 +95,16 @@ pub const Editor = struct {
     mlay: MouseLayout = .{},
     tab_spans: [32]TabSpan = undefined,
     tab_span_count: usize = 0,
+    /// nvim-cmp-lite: insert-mode Ctrl-n/Ctrl-p word completion.
+    cmp: Cmp = .{},
+    /// vim highlight.on_yank: the byte range of the last yank, painted with
+    /// an accent bg until the flash tick expires.
+    yank_flash: ?struct { buf: usize, seq: u32, lo: usize, hi: usize, until_ms: i64 } = null,
+    /// A clear-tick is already scheduled for the current flash.
+    yank_flash_armed: bool = false,
+    /// One current-buffer line for the `Space f z` picker: 0-based row +
+    /// owned "NNNN: text" display row.
+    line_hits: std.ArrayListUnmanaged(LineHit) = .{},
 
     const TermView = enum { none, split, vert, float };
 
@@ -115,6 +125,7 @@ pub const Editor = struct {
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
+    const yank_flash_ms: i64 = 180;
 
     /// Floating picker overlay (buffers / themes), telescope-flavored:
     /// typing filters, arrows or C-j/C-k move, Enter picks, Esc closes.
@@ -123,10 +134,28 @@ pub const Editor = struct {
         filter: std.ArrayListUnmanaged(u8) = .{},
         selected: usize = 0,
 
-        const Kind = enum { none, buffers, themes, files, keys, grep, recent };
+        const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines };
         const max_items = 64;
         const max_files = 2000;
         const max_file_size = 1024 * 1024;
+    };
+
+    /// Insert-mode word completion. `items` are words harvested from every
+    /// open buffer; the buffer region [start, start+len) always holds either
+    /// the typed prefix (sel == null) or the selected candidate.
+    const Cmp = struct {
+        active: bool = false,
+        items: std.ArrayListUnmanaged([]u8) = .{},
+        /// Index into `items`, or null when only the typed prefix is in the
+        /// buffer (right after typing narrowed the list).
+        sel: ?usize = null,
+        /// Byte offset where the completed region starts, and its length.
+        start: usize = 0,
+        len: usize = 0,
+        prefix: std.ArrayListUnmanaged(u8) = .{},
+
+        const max_items = 500;
+        const rows = 8;
     };
 
     /// One live-grep result: owned path + owned "path:line: text" display row.
@@ -135,6 +164,10 @@ pub const Editor = struct {
         line: usize,
         disp: []u8,
     };
+
+    /// One current-buffer line for the `Space f z` picker: 0-based row +
+    /// owned "NNNN: text" display row.
+    const LineHit = struct { row: usize, disp: []u8 };
 
     /// NvCheatsheet-style keybinding reference, shown via `Space c h`.
     const cheats = [_][]const u8{
@@ -148,6 +181,7 @@ pub const Editor = struct {
         "Space f f    find files",
         "Space f w    live grep",
         "Space f o    recent files",
+        "Space f z    buffer lines",
         "Space g b    blame line",
         "Space g p    preview hunk",
         "Space g r    reset hunk",
@@ -164,6 +198,7 @@ pub const Editor = struct {
         "Ctrl-l       focus editor",
         "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-s       save file",
+        "Ctrl-n/p     (insert) complete word",
         "Ctrl-Shift-c copy to clipboard",
         "Ctrl-d/u     half-page down/up",
         "Ctrl-e/y     scroll line down/up",
@@ -201,7 +236,7 @@ pub const Editor = struct {
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
             .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
-            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
+            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "z  buffer lines" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
@@ -851,6 +886,11 @@ pub const Editor = struct {
         self.oldfiles.deinit(self.alloc);
         self.clearGrep();
         self.grep_hits.deinit(self.alloc);
+        self.cmpClose();
+        self.cmp.items.deinit(self.alloc);
+        self.cmp.prefix.deinit(self.alloc);
+        self.clearLines();
+        self.line_hits.deinit(self.alloc);
         self.tree.deinit();
         for (&self.macros) |*m| m.deinit(self.alloc);
         self.dot.deinit(self.alloc);
@@ -964,6 +1004,7 @@ pub const Editor = struct {
     fn openPopup(self: *Editor, kind: Popup.Kind) void {
         if (kind == .files or kind == .grep) self.refreshFiles();
         if (kind == .grep) self.clearGrep();
+        if (kind == .lines) self.refreshLines();
         self.popup.kind = kind;
         self.popup.selected = 0;
         self.popup.filter.clearRetainingCapacity();
@@ -1025,6 +1066,32 @@ pub const Editor = struct {
         }
     }
 
+    fn clearLines(self: *Editor) void {
+        for (self.line_hits.items) |h| self.alloc.free(h.disp);
+        self.line_hits.clearRetainingCapacity();
+    }
+
+    /// Fill the line picker from the active buffer: every non-blank line of
+    /// the first Popup.max_files lines, as "NNNN: text".
+    fn refreshLines(self: *Editor) void {
+        self.clearLines();
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const n = @min(b.lines.items.len, Popup.max_files);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const raw = std.mem.trim(u8, b.lineText(i), " \t\r");
+            if (raw.len == 0) continue;
+            var end: usize = @min(raw.len, 80);
+            while (end > 0 and end < raw.len and (raw[end] & 0xC0) == 0x80) end -= 1;
+            const disp = std.fmt.allocPrint(self.alloc, "{d:>4}: {s}", .{ i + 1, raw[0..end] }) catch continue;
+            self.line_hits.append(self.alloc, .{ .row = i, .disp = disp }) catch {
+                self.alloc.free(disp);
+                return;
+            };
+        }
+    }
+
     /// Open `path` and place the cursor on `line` (1-based), roughly centered.
     fn jumpTo(self: *Editor, path: []const u8, line: usize) void {
         self.openFile(path) catch {
@@ -1048,6 +1115,7 @@ pub const Editor = struct {
             .keys => " Cheatsheet ",
             .grep => " Live Grep ",
             .recent => " Recent Files ",
+            .lines => " Buffer Lines ",
             .none => "",
         };
     }
@@ -1060,6 +1128,7 @@ pub const Editor = struct {
             .keys => cheats.len,
             .grep => self.grep_hits.items.len,
             .recent => self.oldfiles.items.len,
+            .lines => self.line_hits.items.len,
             .none => 0,
         };
     }
@@ -1072,6 +1141,7 @@ pub const Editor = struct {
             .keys => cheats[i],
             .grep => self.grep_hits.items[i].disp,
             .recent => self.oldfiles.items[i],
+            .lines => self.line_hits.items[i].disp,
             .none => "",
         };
     }
@@ -1131,6 +1201,16 @@ pub const Editor = struct {
                             self.setStatus("could not open {s}", .{path});
                         };
                     },
+                    .lines => {
+                        const target = self.line_hits.items[idx].row;
+                        self.pushJump();
+                        const b = self.cur();
+                        b.row = @min(target, b.lines.items.len -| 1);
+                        b.col = b.firstNonWs(b.row);
+                        b.goal_col = b.col;
+                        b.clampCol(false);
+                        b.scroll = b.row -| (self.last_height / 2);
+                    },
                     .keys => {},
                     .none => {},
                 }
@@ -1163,6 +1243,18 @@ pub const Editor = struct {
         switch (event) {
             .init => return ctx.requestFocus(self.widget()),
             .tick => {
+                if (self.yank_flash) |f| {
+                    const now = std.time.milliTimestamp();
+                    if (now >= f.until_ms) {
+                        self.yank_flash = null;
+                        self.yank_flash_armed = false;
+                        ctx.redraw = true;
+                    } else {
+                        // A newer yank pushed the deadline out (or a terminal
+                        // tick arrived early): re-arm for the remainder.
+                        try ctx.tick(@intCast(f.until_ms - now + 10), self.widget());
+                    }
+                } else self.yank_flash_armed = false;
                 if (self.term_view != .none) {
                     if (self.term) |*t| {
                         if (t.poll()) ctx.redraw = true;
@@ -1182,6 +1274,10 @@ pub const Editor = struct {
                 if (self.replay_depth == 0) self.dotWatch(key);
                 try self.dispatchKey(ctx, key);
                 if (self.replay_depth == 0) self.dotSettle();
+                if (self.yank_flash != null and !self.yank_flash_armed) {
+                    self.yank_flash_armed = true;
+                    try ctx.tick(@intCast(yank_flash_ms + 20), self.widget());
+                }
             },
             else => {},
         }
@@ -1245,6 +1341,7 @@ pub const Editor = struct {
         if (e <= s) return;
         try self.yankRange(s, e);
         if (op == 'y') {
+            self.recordYankFlash(s, e);
             b.setCursorFromByte(s);
             return;
         }
@@ -1555,7 +1652,12 @@ pub const Editor = struct {
         // INVARIANT this rests on: every non-.none arm of handleNormal's
         // pending switch returns before the ctrl-mods block, so
         // "pending != .none" is exactly "a pending handler consumes this".
-        if (key.mods.ctrl and self.pending == .none) return;
+        // Insert-mode Ctrl-n/Ctrl-p ARE the change (the completion engine,
+        // not a self-inserting key, produced the text), so they stay in the
+        // record even though other ctrl chords are side-effect commands.
+        const cmp_key = self.mode == .insert and
+            (key.codepoint == 'n' or key.codepoint == 'p');
+        if (key.mods.ctrl and self.pending == .none and !cmp_key) return;
         self.dot_rec.append(self.alloc, key) catch {};
     }
 
@@ -2018,6 +2120,7 @@ pub const Editor = struct {
                         const last = @min(b.row + n - 1, b.lines.items.len - 1);
                         const hi = @min(b.lines.items[last].end + 1, b.buf.items.len);
                         try self.yankRange(lo, hi);
+                        self.recordYankFlash(lo, hi);
                         self.reg_linewise = true;
                         if (self.reg.items.len == 0 or
                             self.reg.items[self.reg.items.len - 1] != '\n')
@@ -2035,17 +2138,26 @@ pub const Editor = struct {
                     'w' => {
                         const s = b.cursorByte();
                         const e = nextWordByte(b, s);
-                        if (e > s) try self.yankRange(s, e);
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            self.recordYankFlash(s, e);
+                        }
                     },
                     'e' => {
                         const s = b.cursorByte();
                         const e = wordEndByte(b, s);
-                        if (e > s) try self.yankRange(s, e);
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            self.recordYankFlash(s, e);
+                        }
                     },
                     '$' => {
                         const s = b.cursorByte();
                         const e = b.lines.items[b.row].end;
-                        if (e > s) try self.yankRange(s, e);
+                        if (e > s) {
+                            try self.yankRange(s, e);
+                            self.recordYankFlash(s, e);
+                        }
                     },
                     else => {},
                 }
@@ -2153,6 +2265,7 @@ pub const Editor = struct {
                     'f' => self.openPopup(.files),
                     'w' => self.openPopup(.grep),
                     'o' => self.openPopup(.recent),
+                    'z' => self.openPopup(.lines),
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
@@ -2584,6 +2697,19 @@ pub const Editor = struct {
             .{ pos[0] + 1, pos[1] };
     }
 
+    /// Arm the on-yank flash over [lo,hi). Invalidated by any edit: the
+    /// recorded undo_seq must still match at draw time.
+    fn recordYankFlash(self: *Editor, lo: usize, hi: usize) void {
+        if (hi <= lo or self.buffers.items.len == 0) return;
+        self.yank_flash = .{
+            .buf = self.active,
+            .seq = self.cur().undo_seq,
+            .lo = lo,
+            .hi = hi,
+            .until_ms = std.time.milliTimestamp() + yank_flash_ms,
+        };
+    }
+
     /// Charwise copy into the unnamed register.
     fn yankRange(self: *Editor, s: usize, e: usize) !void {
         const b = self.cur();
@@ -2598,6 +2724,7 @@ pub const Editor = struct {
             return self.setStatus("no object: {c}", .{kind});
         try self.yankRange(r[0], r[1]);
         if (self.obj_op == 'y') {
+            self.recordYankFlash(r[0], r[1]);
             b.setCursorFromByte(r[0]);
             b.clampCol(false);
             return;
@@ -2870,6 +2997,7 @@ pub const Editor = struct {
             'y' => {
                 if (self.selRange()) |r| {
                     try self.yankSel(r);
+                    self.recordYankFlash(r[0], r[1]);
                     // Vim leaves the cursor at the start of the yanked text.
                     if (self.mode == .visual) {
                         if (self.vis_row < b.row or
@@ -2979,8 +3107,15 @@ pub const Editor = struct {
         const b = self.cur();
         // NvChad <C-s>: write the buffer without leaving insert mode.
         if (key.mods.ctrl and key.codepoint == 's') { self.save(); return ctx.consumeAndRedraw(); }
+        if (self.cmp.active) {
+            if (try self.cmpKey(ctx, key)) return;
+        } else if (key.matches('n', .{ .ctrl = true }) or key.matches('p', .{ .ctrl = true })) {
+            try self.cmpOpen(key.codepoint == 'p');
+            return ctx.consumeAndRedraw();
+        }
         switch (key.codepoint) {
             vaxis.Key.escape => {
+                self.cmpClose();
                 self.mode = .normal;
                 if (b.col > 0) b.col = Buffer.snapToCp(b.lineText(b.row), b.col - 1);
                 b.clampCol(false);
@@ -3070,6 +3205,149 @@ pub const Editor = struct {
             b.col = @min(keep, b.lineLen(b.row));
             b.goal_col = b.col;
         }
+    }
+
+    // ---- completion -------------------------------------------------------
+
+    fn cmpClose(self: *Editor) void {
+        for (self.cmp.items.items) |it| self.alloc.free(it);
+        self.cmp.items.clearRetainingCapacity();
+        self.cmp.prefix.clearRetainingCapacity();
+        self.cmp.active = false;
+        self.cmp.sel = null;
+        self.cmp.len = 0;
+    }
+
+    /// Harvest distinct word runs (wordClass == 1, len >= 2) from every open
+    /// buffer that start with `prefix`, appending them to cmp.items.
+    fn cmpCollect(self: *Editor, prefix: []const u8) !void {
+        var seen = std.StringHashMap(void).init(self.alloc);
+        defer seen.deinit();
+        for (self.buffers.items) |*ob| {
+            const text = ob.buf.items;
+            var i: usize = 0;
+            while (i < text.len) {
+                if (Buffer.wordClass(text[i]) != 1) {
+                    i += 1;
+                    continue;
+                }
+                var j = i;
+                while (j < text.len and Buffer.wordClass(text[j]) == 1) j += 1;
+                const w = text[i..j];
+                i = j;
+                if (w.len < 2 or w.len <= prefix.len) continue; // no-op candidates
+                if (!std.mem.startsWith(u8, w, prefix)) continue;
+                if (seen.contains(w)) continue;
+                const owned = try self.alloc.dupe(u8, w);
+                try self.cmp.items.append(self.alloc, owned);
+                try seen.put(owned, {}); // key is owned by items
+                if (self.cmp.items.items.len >= Cmp.max_items) break;
+            }
+            if (self.cmp.items.items.len >= Cmp.max_items) break;
+        }
+        std.mem.sort([]u8, self.cmp.items.items, {}, struct {
+            fn less(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+    }
+
+    /// Replace the completion region with `text`, cursor just after it.
+    fn cmpApply(self: *Editor, text: []const u8) !void {
+        const b = self.cur();
+        const ls = b.lines.items[b.row].start; // edit never spans rows
+        try b.replaceRange(self.cmp.start, self.cmp.start + self.cmp.len, text);
+        self.cmp.len = text.len;
+        b.col = self.cmp.start - ls + text.len;
+        b.goal_col = b.col;
+    }
+
+    /// Drop candidates that no longer extend the typed prefix.
+    fn cmpFilter(self: *Editor) void {
+        const pre = self.cmp.prefix.items;
+        var w: usize = 0;
+        for (self.cmp.items.items) |it| {
+            if (it.len > pre.len and std.mem.startsWith(u8, it, pre)) {
+                self.cmp.items.items[w] = it;
+                w += 1;
+            } else self.alloc.free(it);
+        }
+        self.cmp.items.shrinkRetainingCapacity(w);
+        self.cmp.sel = null;
+    }
+
+    fn cmpCycle(self: *Editor, delta: isize) !void {
+        const n = self.cmp.items.items.len;
+        if (n == 0) return;
+        const cur_i: isize = if (self.cmp.sel) |s| @intCast(s) else if (delta > 0) -1 else 0;
+        const next = @mod(cur_i + delta, @as(isize, @intCast(n)));
+        self.cmp.sel = @intCast(next);
+        try self.cmpApply(self.cmp.items.items[@intCast(next)]);
+    }
+
+    /// Ctrl-n / Ctrl-p in insert mode: open the menu on the word before the
+    /// cursor (vim semantics — the first press already inserts a match).
+    fn cmpOpen(self: *Editor, back: bool) !void {
+        self.cmpClose();
+        const b = self.cur();
+        const text = b.buf.items;
+        const pos = b.lines.items[b.row].start + @min(b.col, b.lineLen(b.row));
+        var s = pos;
+        while (s > 0 and Buffer.wordClass(text[s - 1]) == 1) s -= 1;
+        try self.cmp.prefix.appendSlice(self.alloc, text[s..pos]);
+        try self.cmpCollect(self.cmp.prefix.items);
+        // No prefix match: offer every word rather than nothing.
+        if (self.cmp.items.items.len == 0 and self.cmp.prefix.items.len > 0)
+            try self.cmpCollect("");
+        if (self.cmp.items.items.len == 0) {
+            self.cmpClose();
+            return self.setStatus("no completions", .{});
+        }
+        self.cmp.active = true;
+        self.cmp.start = s;
+        self.cmp.len = pos - s;
+        self.cmp.sel = if (back) self.cmp.items.items.len - 1 else 0;
+        try self.cmpApply(self.cmp.items.items[self.cmp.sel.?]);
+    }
+
+    /// Keys while the menu is up. Returns true when the key was consumed;
+    /// false means "menu closed, handle the key normally".
+    fn cmpKey(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+        if (key.matches('n', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{})) {
+            try self.cmpCycle(1);
+            ctx.consumeAndRedraw();
+            return true;
+        }
+        if (key.matches('p', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{})) {
+            try self.cmpCycle(-1);
+            ctx.consumeAndRedraw();
+            return true;
+        }
+        // The completed text is already in the buffer, so accept and cancel
+        // both just dismiss the menu; Esc keeps you in insert mode (vim's
+        // <C-e>), a second Esc leaves it.
+        if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.tab, .{}) or
+            key.matches(vaxis.Key.escape, .{}))
+        {
+            self.cmpClose();
+            ctx.consumeAndRedraw();
+            return true;
+        }
+        // Typing a word char with nothing selected narrows the list in place.
+        if (!key.mods.ctrl and !key.mods.alt and self.cmp.sel == null) {
+            if (key.text) |t| {
+                if (t.len == 1 and Buffer.wordClass(t[0]) == 1) {
+                    try self.cmp.prefix.append(self.alloc, t[0]);
+                    try self.cmpApply(self.cmp.prefix.items);
+                    self.cmpFilter();
+                    if (self.cmp.items.items.len == 0) self.cmpClose();
+                    ctx.consumeAndRedraw();
+                    return true;
+                }
+            }
+        }
+        self.cmpClose();
+        return false;
     }
 
     fn handleCommand(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -4019,6 +4297,13 @@ pub const Editor = struct {
             else
                 null;
 
+        // highlight.on_yank: only paint while the buffer is untouched since
+        // the yank — any edit shifts the recorded byte range.
+        const flash: ?[2]usize = if (self.yank_flash) |f|
+            (if (f.buf == self.active and f.seq == b.undo_seq) [2]usize{ f.lo, f.hi } else null)
+        else
+            null;
+
         var row: u16 = 0;
         while (row < text_rows) : (row += 1) {
             const li = b.scroll + row;
@@ -4086,6 +4371,13 @@ pub const Editor = struct {
                     const abs = line.start + i;
                     if (abs >= s[0] and abs < s[1]) style.bg = th.bar_bg;
                 }
+                if (flash) |fr| {
+                    const abs = line.start + i;
+                    if (abs >= fr[0] and abs < fr[1]) {
+                        style.bg = th.orange;
+                        style.fg = th.bg;
+                    }
+                }
                 {
                     const abs = line.start + i;
                     if (abs == mp_a or abs == mp_b) {
@@ -4150,6 +4442,7 @@ pub const Editor = struct {
         }
         if (self.preview_len > 0 and self.popup.kind == .none) self.drawPreview(surface, ctx, max);
         if (self.term_view == .float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
+        if (self.cmp.active) self.drawCmp(surface, ctx, x0, gutter, text_top, text_rows, text_right);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
             return surface;
@@ -4557,6 +4850,42 @@ pub const Editor = struct {
             const sep = std.mem.indexOf(u8, row, "  ") orelse 0;
             col = writeText(surface, ctx, col, y0 + r, row[0..sep], key_style);
             _ = writeText(surface, ctx, col, y0 + r, row[sep..], text_style);
+        }
+    }
+
+    /// nvim-cmp-lite popup: candidate rows near the cursor, selected row
+    /// highlighted, below the cursor when it fits and above otherwise.
+    fn drawCmp(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, x0: u16, gutter: u16, text_top: u16, text_rows: u16, text_right: u16) void {
+        const b = self.cur();
+        const items = self.cmp.items.items;
+        if (items.len == 0) return;
+        if (b.row < b.scroll or b.row >= b.scroll + text_rows) return;
+        const th = self.theme.p;
+        const visible: u16 = @intCast(@min(items.len, Cmp.rows));
+        var w: u16 = 0;
+        for (items) |it| {
+            const iw: u16 = @intCast(@min(it.len + 2, 30));
+            if (iw > w) w = iw;
+        }
+        if (w + 2 > text_right) return;
+        const cur_row: u16 = text_top + @as(u16, @intCast(b.row - b.scroll));
+        const anchor: u16 = x0 + gutter + self.displayCol(ctx);
+        const col0: u16 = if (anchor + w <= text_right) anchor else text_right - w;
+        const below = cur_row + 1 + visible <= text_top + text_rows;
+        if (!below and cur_row < text_top + visible) return;
+        const row0: u16 = if (below) cur_row + 1 else cur_row - visible;
+        const sel = self.cmp.sel orelse std.math.maxInt(usize);
+        const start = if (sel != std.math.maxInt(usize) and sel >= visible) sel - visible + 1 else 0;
+        const body: vaxis.Style = .{ .fg = th.fg, .bg = th.bar_bg };
+        const sel_style: vaxis.Style = .{ .fg = th.bg, .bg = th.blue, .bold = true };
+        var vi: u16 = 0;
+        while (vi < visible) : (vi += 1) {
+            const idx = start + vi;
+            if (idx >= items.len) break;
+            const st = if (idx == sel) sel_style else body;
+            var c: u16 = 0;
+            while (c < w) : (c += 1) surface.writeCell(col0 + c, row0 + vi, .{ .style = st });
+            _ = writeText(surface, ctx, col0 + 1, row0 + vi, items[idx], st);
         }
     }
 
