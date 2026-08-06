@@ -1055,6 +1055,9 @@ pub const Editor = struct {
         // via `.` would e.g. write the file as a surprise. Ctrl keys that a
         // pending handler consumes (r Ctrl-a, df<C-x>) ARE the change and
         // must stay in the record or the replay dangles mid-operator.
+        // INVARIANT this rests on: every non-.none arm of handleNormal's
+        // pending switch returns before the ctrl-mods block, so
+        // "pending != .none" is exactly "a pending handler consumes this".
         if (key.mods.ctrl and self.pending == .none) return;
         self.dot_rec.append(self.alloc, key) catch {};
     }
