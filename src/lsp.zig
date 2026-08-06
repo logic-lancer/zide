@@ -20,6 +20,12 @@ pub const Lsp = struct {
     next_id: i64 = 1,
     init_id: i64 = 0,
     hover_id: i64 = 0,
+    def_id: i64 = 0,
+    /// A definition response landed; `def_loc` is its payload, null when the
+    /// server answered `null`. The editor clears the flag when it consumes it —
+    /// the flag is what distinguishes "no answer yet" from "answer: nothing".
+    def_done: bool = false,
+    def_loc: ?Loc = null,
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -39,6 +45,10 @@ pub const Lsp = struct {
     /// One publishDiagnostics: absolute path (decoded from the uri) + list,
     /// both owned by whoever pops it off `publishes`.
     pub const Publish = struct { path: []u8, diags: []Diag };
+
+    /// One resolved location: absolute path (decoded from the uri) + 0-based
+    /// line and byte column (utf-8 encoding was negotiated). `path` is owned.
+    pub const Loc = struct { path: []u8, line: u32, col: u32 };
 
     // ---- lifecycle --------------------------------------------------------
 
@@ -105,6 +115,7 @@ pub const Lsp = struct {
         }
         self.publishes.deinit(self.alloc);
         if (self.hover_text) |t| self.alloc.free(t);
+        if (self.def_loc) |l| self.alloc.free(l.path);
         self.* = undefined;
     }
 
@@ -193,6 +204,13 @@ pub const Lsp = struct {
         });
     }
 
+    pub fn definition(self: *Lsp, uri: []const u8, line: usize, col: usize) void {
+        self.def_id = self.request("textDocument/definition", .{
+            .textDocument = .{ .uri = uri },
+            .position = .{ .line = @as(i64, @intCast(line)), .character = @as(i64, @intCast(col)) },
+        });
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -276,6 +294,12 @@ pub const Lsp = struct {
         if (self.hover_id != 0 and id == self.hover_id) {
             self.hover_id = 0;
             self.onHover(root); // C4; consumed by the editor via hover_text
+            return;
+        }
+        if (self.def_id != 0 and id == self.def_id) {
+            self.def_id = 0;
+            self.onDefinition(root);
+            return;
         }
     }
 
@@ -351,6 +375,37 @@ pub const Lsp = struct {
             .array => |a| if (a.items.len > 0) markedText(a.items[0]) else null,
             else => null,
         };
+    }
+
+    // ---- goto-definition ---------------------------------------------------
+
+    /// zls 0.14 answers with a single Location object (verified live); it only
+    /// sends LocationLink to clients that advertise definition.linkSupport,
+    /// which we don't. The array and LocationLink branches are one `orelse`
+    /// each and keep any other server from silently doing nothing.
+    fn onDefinition(self: *Lsp, root: std.json.Value) void {
+        if (self.def_loc) |l| self.alloc.free(l.path);
+        self.def_loc = null;
+        self.def_done = true;
+        const res = objGet(root, "result") orelse return;
+        const first = switch (res) {
+            .object => res,
+            .array => |a| if (a.items.len > 0) a.items[0] else return,
+            else => return, // null: no definition
+        };
+        self.def_loc = self.parseLoc(first);
+    }
+
+    /// Location {uri,range} or LocationLink {targetUri,targetSelectionRange}.
+    fn parseLoc(self: *Lsp, v: std.json.Value) ?Loc {
+        const uri = getStr(v, "uri") orelse getStr(v, "targetUri") orelse return null;
+        const range = objGet(v, "range") orelse objGet(v, "targetSelectionRange") orelse
+            objGet(v, "targetRange") orelse return null;
+        const start = objGet(range, "start") orelse return null;
+        const line = getInt(start, "line") orelse return null;
+        const ch = getInt(start, "character") orelse 0;
+        const path = pathFromUri(self.alloc, uri) catch return null;
+        return .{ .path = path, .line = @intCast(@max(line, 0)), .col = @intCast(@max(ch, 0)) };
     }
 
     // ---- json helpers (switch-based: no tagged-union equality) ------------

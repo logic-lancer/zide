@@ -119,6 +119,9 @@ pub const Editor = struct {
     lsp_failed: bool = false,
     /// Absolute cwd captured when the client starts, for uri <-> buffer matching.
     lsp_root: ?[]u8 = null,
+    /// Where `gd` was pressed. The answer lands a poll tick later, so the
+    /// jumplist entry must point here and not at wherever the cursor drifted.
+    lsp_req: ?struct { buf: usize, row: usize, col: usize } = null,
     /// Ticks currently in flight. The terminal/LSP poll chain re-arms only at
     /// zero, so overlapping arm sites can never multiply into extra chains.
     ticks: u8 = 0,
@@ -1098,6 +1101,7 @@ pub const Editor = struct {
         // Buffer indices shift: a flash or completion region keyed on the
         // old index/offsets must not survive.
         self.yank_flash = null;
+        self.lsp_req = null; // indices shift; a pending gd must not push a stale jump
         if (self.cmp.active) self.cmpClose();
         self.lspDidClose(b);
         var removed = self.buffers.orderedRemove(self.active);
@@ -1155,6 +1159,25 @@ pub const Editor = struct {
         const abs = self.absPath(b) orelse return null;
         defer self.alloc.free(abs);
         return Lsp.uriFromPath(self.alloc, abs) catch null;
+    }
+
+    /// Editor-facing name for an absolute path from the server: the file_name
+    /// of an open buffer that resolves to it, else a cwd-relative path, else
+    /// the absolute one. Keeps openFile's exact-string match from opening a
+    /// second buffer for a file spelled differently. Caller frees.
+    fn lspLocalPath(self: *Editor, abs: []const u8) ?[]u8 {
+        for (self.buffers.items) |*b| {
+            const a = self.absPath(b) orelse continue;
+            defer self.alloc.free(a);
+            if (std.mem.eql(u8, a, abs)) return self.alloc.dupe(u8, b.file_name) catch null;
+        }
+        if (self.lsp_root) |root| {
+            if (std.fs.path.relative(self.alloc, root, abs) catch null) |rel| {
+                if (rel.len > 0 and !std.mem.startsWith(u8, rel, "..")) return rel;
+                self.alloc.free(rel); // outside the project: keep it absolute
+            }
+        }
+        return self.alloc.dupe(u8, abs) catch null;
     }
 
     /// didOpen for a zig buffer, spawning the client if needed. Before the
@@ -1218,6 +1241,7 @@ pub const Editor = struct {
                 b.diags.clearRetainingCapacity();
                 b.lsp_opened = false;
             }
+            self.lsp_req = null;
             self.setStatus("zls exited — LSP off", .{});
             return true;
         }
@@ -1276,7 +1300,41 @@ pub const Editor = struct {
             }
             changed = true;
         }
+        if (l.def_done) {
+            l.def_done = false;
+            const loc = l.def_loc;
+            l.def_loc = null;
+            self.applyDefinition(loc);
+            changed = true;
+        }
         return changed;
+    }
+
+    /// The definition answer, ~one poll tick after `gd`. vim semantics: jump
+    /// even if the cursor moved meanwhile — but the jumplist entry points at
+    /// where `gd` was pressed, so Ctrl-o returns to the request point.
+    fn applyDefinition(self: *Editor, loc: ?Lsp.Loc) void {
+        const req = self.lsp_req;
+        self.lsp_req = null;
+        const l = loc orelse {
+            // zls had no answer (not on a resolvable symbol). Fall back to the
+            // local search, but only while the user is still in the buffer
+            // that asked.
+            if (req) |r| if (r.buf == self.active) return self.gotoDefLocal();
+            return self.setStatus("gd: no definition found", .{});
+        };
+        defer self.alloc.free(l.path);
+        const name = self.lspLocalPath(l.path) orelse return;
+        defer self.alloc.free(name);
+        if (req) |r| {
+            if (r.buf < self.buffers.items.len) self.pushJumpAt(r.buf, r.row, r.col);
+        }
+        if (!self.jumpTo(name, l.line + 1)) return; // jumpTo is 1-based, LSP is 0-based
+        const b = self.cur();
+        b.col = @min(l.col, b.lineLen(b.row)); // byte column: utf-8 negotiated
+        b.goal_col = b.col;
+        b.clampCol(false);
+        self.setStatus("{s}:{d}:{d}", .{ name, l.line + 1, l.col + 1 });
     }
 
     // ---- status line ------------------------------------------------------
@@ -1864,16 +1922,22 @@ pub const Editor = struct {
     fn pushJump(self: *Editor) void {
         if (self.buffers.items.len == 0) return;
         const b = self.cur();
+        self.pushJumpAt(self.active, b.row, b.col);
+    }
+
+    /// pushJump for a position that is no longer the current one — an async LSP
+    /// jump records where `gd` was pressed, several poll ticks earlier.
+    fn pushJumpAt(self: *Editor, buf: usize, row: usize, col: usize) void {
         self.jumps.shrinkRetainingCapacity(self.jump_idx);
         if (self.jumps.items.len > 0) {
             const last = self.jumps.items[self.jumps.items.len - 1];
-            if (last.buf == self.active and last.row == b.row) {
+            if (last.buf == buf and last.row == row) {
                 self.jump_idx = self.jumps.items.len;
                 return;
             }
         }
         if (self.jumps.items.len >= 100) _ = self.jumps.orderedRemove(0);
-        self.jumps.append(self.alloc, .{ .buf = self.active, .row = b.row, .col = b.col }) catch {};
+        self.jumps.append(self.alloc, .{ .buf = buf, .row = row, .col = col }) catch {};
         self.jump_idx = self.jumps.items.len;
     }
 
@@ -1950,10 +2014,32 @@ pub const Editor = struct {
         }
     }
 
-    /// `gd`: goto local definition, vim-flavored — jump to the first
+    /// `gd`: zls first, buffer-local whole-word search when there is no server
+    /// to ask. The LSP path returns immediately; `applyDefinition` finishes it.
+    fn gotoDefinition(self: *Editor) void {
+        if (self.buffers.items.len == 0) return;
+        if (!self.lspDefRequest()) self.gotoDefLocal();
+    }
+
+    /// False when the request could not be sent at all (non-zig buffer, no /
+    /// dead / not-yet-initialized server), which is the caller's cue to fall back.
+    fn lspDefRequest(self: *Editor) bool {
+        const b = self.cur();
+        if (!b.isZig()) return false;
+        const l = self.ensureLsp() orelse return false;
+        if (!l.initialized or !b.lsp_opened) return false;
+        const uri = self.bufUri(b) orelse return false;
+        defer self.alloc.free(uri);
+        l.definition(uri, b.row, b.col);
+        self.lsp_req = .{ .buf = self.active, .row = b.row, .col = b.col };
+        return true;
+    }
+
+    /// `gd` fallback: goto local definition, vim-flavored — jump to the first
     /// whole-word occurrence of the identifier under the cursor, loading
-    /// the search register so n/N continue from there.
-    fn gotoDef(self: *Editor) void {
+    /// the search register so n/N continue from there. Used directly when
+    /// there is no LSP to ask, and by `applyDefinition` when zls answers null.
+    fn gotoDefLocal(self: *Editor) void {
         if (self.buffers.items.len == 0) return;
         const b = self.cur();
         const text = b.buf.items;
@@ -2337,7 +2423,9 @@ pub const Editor = struct {
                 } else if (cp == 'f') {
                     self.gotoFile() catch {};
                 } else if (cp == 'd') {
-                    self.gotoDef();
+                    // No tick arming needed here: the .key_press tail
+                    // re-arms after dispatchKey when lspAlive.
+                    self.gotoDefinition();
                 } else if (cp == 'c') {
                     self.pending = .g_comment;
                 }
