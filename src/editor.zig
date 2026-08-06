@@ -6,6 +6,7 @@ const themes = @import("theme.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const Tree = @import("tree.zig").Tree;
 const Term = @import("term.zig").Term;
+const Lsp = @import("lsp.zig").Lsp;
 
 /// Modal (vim-style) editor widget multiplexing several buffers.
 /// Layout: tabline on top, text area, status line at the bottom.
@@ -111,6 +112,16 @@ pub const Editor = struct {
     line_hits: std.ArrayListUnmanaged(LineHit) = .{},
     /// `Space f s` outline rows (see SymbolHit); cleared on popup close.
     symbol_hits: std.ArrayListUnmanaged(SymbolHit) = .{},
+    /// zls client; null when never started, spawn-failed, or dead.
+    lsp: ?Lsp = null,
+    /// A spawn failure or a crash disables LSP for the session — never a
+    /// respawn loop.
+    lsp_failed: bool = false,
+    /// Absolute cwd captured when the client starts, for uri <-> buffer matching.
+    lsp_root: ?[]u8 = null,
+    /// Ticks currently in flight. The terminal/LSP poll chain re-arms only at
+    /// zero, so overlapping arm sites can never multiply into extra chains.
+    ticks: u8 = 0,
 
     const TermView = enum { none, split, vert, float };
 
@@ -1019,6 +1030,8 @@ pub const Editor = struct {
         self.dot.deinit(self.alloc);
         self.dot_rec.deinit(self.alloc);
         if (self.term) |*t| t.deinit();
+        if (self.lsp) |*l| l.deinit();
+        if (self.lsp_root) |r| self.alloc.free(r);
     }
 
     pub fn widget(self: *Editor) vxfw.Widget {
@@ -1057,6 +1070,7 @@ pub const Editor = struct {
         try self.buffers.append(self.alloc, buffer);
         self.active = self.buffers.items.len - 1;
         self.refreshGitSigns(self.cur());
+        self.lspDidOpen(self.cur());
         self.recordOldfile(path);
         self.saveSession();
     }
@@ -1083,6 +1097,7 @@ pub const Editor = struct {
         // old index/offsets must not survive.
         self.yank_flash = null;
         if (self.cmp.active) self.cmpClose();
+        self.lspDidClose(b);
         var removed = self.buffers.orderedRemove(self.active);
         removed.deinit();
         if (self.buffers.items.len == 0) {
@@ -1108,6 +1123,118 @@ pub const Editor = struct {
         self.setStatus("theme: {s}", .{t.name});
     }
 
+    // ---- LSP --------------------------------------------------------------
+
+    /// Start zls on first use. A failure is permanent for the session.
+    fn ensureLsp(self: *Editor) ?*Lsp {
+        if (self.lsp) |*l| return if (l.alive) l else null;
+        if (self.lsp_failed) return null;
+        const root = std.process.getCwdAlloc(self.alloc) catch {
+            self.lsp_failed = true;
+            return null;
+        };
+        self.lsp = Lsp.spawn(self.alloc, root) catch {
+            self.alloc.free(root);
+            self.lsp_failed = true;
+            self.setStatus("zls not found — LSP disabled", .{});
+            return null;
+        };
+        self.lsp_root = root; // owned, freed in deinit
+        return &self.lsp.?;
+    }
+
+    /// Absolute path for a buffer (file_name may be relative to the cwd).
+    fn absPath(self: *Editor, b: *const Buffer) ?[]u8 {
+        const root = self.lsp_root orelse return null;
+        return std.fs.path.resolve(self.alloc, &.{ root, b.file_name }) catch null;
+    }
+
+    fn bufUri(self: *Editor, b: *const Buffer) ?[]u8 {
+        const abs = self.absPath(b) orelse return null;
+        defer self.alloc.free(abs);
+        return Lsp.uriFromPath(self.alloc, abs) catch null;
+    }
+
+    /// didOpen for a zig buffer, spawning the client if needed. Before the
+    /// initialize response lands this is a no-op: lspTick opens it later.
+    fn lspDidOpen(self: *Editor, b: *Buffer) void {
+        if (!b.isZig()) return;
+        const l = self.ensureLsp() orelse return;
+        if (!l.initialized or b.lsp_opened) return;
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        b.lsp_version = 1;
+        l.didOpen(uri, b.buf.items, b.lsp_version);
+        b.lsp_opened = true;
+        b.lsp_dirty = false;
+    }
+
+    fn lspDidClose(self: *Editor, b: *Buffer) void {
+        const l = if (self.lsp) |*p| p else return;
+        if (!l.alive or !b.lsp_opened) return;
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        l.didClose(uri);
+        b.lsp_opened = false;
+    }
+
+    fn lspDidSave(self: *Editor, b: *Buffer) void {
+        const l = if (self.lsp) |*p| p else return;
+        if (!l.alive or !b.lsp_opened) return;
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        l.didSave(uri);
+    }
+
+    /// Pump the client from the poll tick: I/O, deferred didOpen, debounced
+    /// didChange, diagnostics, hover. Returns true when the screen must repaint.
+    fn lspTick(self: *Editor) bool {
+        if (self.lsp == null) return false;
+        var changed = self.lsp.?.poll();
+        if (!self.lsp.?.alive) {
+            self.lsp.?.deinit();
+            self.lsp = null;
+            self.lsp_failed = true; // report once, never respawn
+            self.setStatus("zls exited — LSP off", .{});
+            return true;
+        }
+        const l = &self.lsp.?;
+        if (l.initialized) {
+            for (self.buffers.items) |*b| {
+                if (!b.isZig()) continue;
+                if (!b.lsp_opened) {
+                    self.lspDidOpen(b);
+                    continue;
+                }
+                if (!b.lsp_dirty) continue;
+                const uri = self.bufUri(b) orelse continue;
+                defer self.alloc.free(uri);
+                b.lsp_version += 1;
+                l.didChange(uri, b.buf.items, b.lsp_version);
+                b.lsp_dirty = false;
+            }
+        }
+        while (l.publishes.pop()) |p| {
+            defer self.alloc.free(p.path);
+            var owner: ?*Buffer = null;
+            for (self.buffers.items) |*b| {
+                const abs = self.absPath(b) orelse continue;
+                defer self.alloc.free(abs);
+                if (std.mem.eql(u8, abs, p.path)) {
+                    owner = b;
+                    break;
+                }
+            }
+            if (owner) |b| {
+                b.setDiags(self.alloc, p.diags);
+                changed = true;
+            } else Lsp.freeDiags(self.alloc, p.diags);
+        }
+        // hover drain: placeholder in commit 1, filled by commit 3:
+        // if (l.hover_text) |txt| { ... }
+        return changed;
+    }
+
     // ---- status line ------------------------------------------------------
 
     fn setStatus(self: *Editor, comptime fmt: []const u8, args: anytype) void {
@@ -1123,6 +1250,7 @@ pub const Editor = struct {
         };
         self.setStatus("\"{s}\" {d}L, {d}B written", .{ b.file_name, b.lines.items.len, b.buf.items.len });
         self.refreshGitSigns(b);
+        self.lspDidSave(b);
         self.saveSession();
     }
 
@@ -1456,8 +1584,13 @@ pub const Editor = struct {
     fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *Editor = @ptrCast(@alignCast(ptr));
         switch (event) {
-            .init => return ctx.requestFocus(self.widget()),
+            .init => {
+                // Files from argv opened before app.run may already have spawned zls.
+                if (self.lsp != null and self.ticks == 0) self.armTick(ctx, poll_tick_ms);
+                return ctx.requestFocus(self.widget());
+            },
             .tick => {
+                self.ticks -|= 1;
                 if (self.yank_flash) |f| {
                     if (std.time.milliTimestamp() >= f.until_ms) {
                         self.yank_flash = null;
@@ -1473,8 +1606,11 @@ pub const Editor = struct {
                     if (self.term) |*t| {
                         if (t.poll()) ctx.redraw = true;
                     }
-                    try ctx.tick(80, self.widget());
                 }
+                if (self.lspTick()) ctx.redraw = true;
+                // One chain, re-armed once per tick event (see `ticks`).
+                if ((self.term_view != .none or self.lspAlive()) and self.ticks == 0)
+                    self.armTick(ctx, poll_tick_ms);
                 return;
             },
             .mouse => |m| return self.handleMouse(ctx, m),
@@ -1490,8 +1626,9 @@ pub const Editor = struct {
                 if (self.replay_depth == 0) self.dotSettle();
                 if (self.yank_flash != null and !self.yank_flash_armed) {
                     self.yank_flash_armed = true;
-                    try ctx.tick(@intCast(yank_flash_ms + 20), self.widget());
+                    self.armTick(ctx, @intCast(yank_flash_ms + 20));
                 }
+                if (self.lspAlive() and self.ticks == 0) self.armTick(ctx, poll_tick_ms);
             },
             else => {},
         }
@@ -4016,6 +4153,19 @@ pub const Editor = struct {
 
     // ---- integrated terminal (NvTerm-style) -------------------------------
 
+    const poll_tick_ms: u32 = 80;
+
+    /// Arm one tick and account for it. Every ctx.tick call in the editor goes
+    /// through here.
+    fn armTick(self: *Editor, ctx: *vxfw.EventContext, ms: u32) void {
+        ctx.tick(ms, self.widget()) catch return;
+        self.ticks +|= 1;
+    }
+
+    fn lspAlive(self: *Editor) bool {
+        return if (self.lsp) |*l| l.alive else false;
+    }
+
     /// Alt-h (split) / Alt-v (vertical) / Alt-i (float): show/hide the
     /// terminal, spawning the shell lazily. All views share one PTY session.
     fn toggleTerm(self: *Editor, ctx: *vxfw.EventContext, view: TermView) !void {
@@ -4042,7 +4192,7 @@ pub const Editor = struct {
         }
         self.term_view = view;
         self.focus = .term;
-        try ctx.tick(80, self.widget());
+        if (self.ticks == 0) self.armTick(ctx, poll_tick_ms);
         ctx.consumeAndRedraw();
     }
 

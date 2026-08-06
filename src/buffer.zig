@@ -2,6 +2,7 @@ const std = @import("std");
 const ts = @import("tree-sitter");
 const syntax = @import("syntax.zig");
 const themes = @import("theme.zig");
+const lsp = @import("lsp.zig");
 
 /// One open file: text storage, line table, cursor/scroll state and its own
 /// syntax highlighter (tree-sitter trees are per-buffer). The last line of
@@ -24,6 +25,16 @@ pub const Buffer = struct {
     /// Per-line git status vs HEAD (gitsigns-style gutter markers).
     /// Refreshed on open/save; may be shorter than `lines` after edits.
     git_signs: std.ArrayListUnmanaged(Sign) = .{},
+
+    /// LSP state. `lsp_version` is the didChange counter; `lsp_dirty` is set by
+    /// every edit and cleared when the editor flushes a didChange on the poll
+    /// tick (a free ~80ms debounce over a keystroke burst).
+    lsp_opened: bool = false,
+    lsp_dirty: bool = false,
+    lsp_version: i32 = 0,
+    /// Diagnostics from the last publishDiagnostics, sorted by (line, col).
+    /// May be older than the buffer: line indexes are clamped at use sites.
+    diags: std.ArrayListUnmanaged(lsp.Lsp.Diag) = .{},
 
     /// a-z vim marks (`m{a-z}`); positions are clamped when jumped to, so
     /// stale marks after edits degrade gracefully instead of invalidating.
@@ -93,6 +104,8 @@ pub const Buffer = struct {
         self.buf.deinit(self.alloc);
         self.lines.deinit(self.alloc);
         self.git_signs.deinit(self.alloc);
+        for (self.diags.items) |d| self.alloc.free(d.message);
+        self.diags.deinit(self.alloc);
         self.hl.deinit();
         self.alloc.free(self.file_name);
     }
@@ -105,6 +118,29 @@ pub const Buffer = struct {
     pub fn signFor(self: *const Buffer, row_idx: usize) Sign {
         if (row_idx < self.git_signs.items.len) return self.git_signs.items[row_idx];
         return .none;
+    }
+
+    pub fn isZig(self: *const Buffer) bool {
+        return std.mem.eql(u8, std.fs.path.extension(self.file_name), ".zig");
+    }
+
+    /// Take ownership of a fresh diagnostic list, replacing the old one
+    /// (LSP publishDiagnostics semantics: the last publish wins).
+    pub fn setDiags(self: *Buffer, alloc: std.mem.Allocator, diags: []lsp.Lsp.Diag) void {
+        for (self.diags.items) |d| self.alloc.free(d.message);
+        self.diags.clearRetainingCapacity();
+        self.diags.appendSlice(self.alloc, diags) catch {};
+        alloc.free(diags); // the elements moved; only the slice is released
+    }
+
+    /// Highest-priority (lowest) severity on `row`, or null.
+    pub fn diagFor(self: *const Buffer, row: usize) ?u8 {
+        var best: ?u8 = null;
+        for (self.diags.items) |d| {
+            if (d.line != row) continue;
+            if (best == null or d.severity < best.?) best = d.severity;
+        }
+        return best;
     }
 
     /// Short name shown in the tabline.
@@ -191,6 +227,7 @@ pub const Buffer = struct {
         try self.rebuildLines();
         try self.hl.update(self.buf.items, edit);
         self.dirty = true;
+        self.lsp_dirty = true;
     }
 
     // ---- undo -------------------------------------------------------------
