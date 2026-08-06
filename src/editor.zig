@@ -171,6 +171,24 @@ pub const Editor = struct {
         ":w :q :wq    write / quit",
     };
 
+    /// Which-key: hint rows for a pending prefix, or null for prefixes that
+    /// take arbitrary input (find-char, marks, registers, ...).
+    fn whichKeyRows(p: Pending) ?[]const []const u8 {
+        return switch (p) {
+            .leader => &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files" },
+            .leader_c => &.{ "h  cheatsheet" },
+            .g => &.{ "g  goto top", "v  reselect visual", "f  goto file", "d  goto definition" },
+            .z => &.{ "z  center cursor", "t  cursor to top", "b  cursor to bottom" },
+            .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "i  +inner object", "a  +around object" },
+            .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "i  +inner object", "a  +around object", "s  change surround" },
+            .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "i  +inner object", "a  +around object" },
+            .bracket_f => &.{ "c  next git hunk" },
+            .bracket_b => &.{ "c  prev git hunk" },
+            else => null,
+        };
+    }
+
     pub fn init(alloc: std.mem.Allocator) Editor {
         var self: Editor = .{ .alloc = alloc, .tree = Tree.init(alloc) };
         self.loadGitBranch();
@@ -3253,6 +3271,9 @@ pub const Editor = struct {
         if (term_total > 0) self.drawTerm(surface, ctx, 0, text_top + text_rows, term_rows, max.width);
         if (term_w > 0) self.drawTerm(surface, ctx, text_right, text_top, text_rows - 1, term_w);
         self.drawStatus(surface, ctx, max.height - 1, max.width);
+        if (self.focus == .editor and self.popup.kind == .none and (self.mode == .normal or self.mode == .visual or self.mode == .visual_line) and self.pending != .none and whichKeyRows(self.pending) != null) {
+            self.drawWhichKey(surface, ctx, max);
+        }
         if (self.term_view == .float) self.drawTermFloat(surface, ctx, max.width, max.height - 1);
         if (self.popup.kind != .none) {
             try self.drawPopup(&surface, ctx, max);
@@ -3612,6 +3633,74 @@ pub const Editor = struct {
             }) catch return;
             if (right.len < width) {
                 _ = writeText(surface, ctx, @intCast(width - right.len), status_row, right, mode_style);
+            }
+        }
+    }
+
+    fn drawWhichKey(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, max: vxfw.Size) void {
+        const rows = whichKeyRows(self.pending) orelse return;
+        const th = self.theme.p;
+
+        // Cap at 12 rows.
+        const row_count: usize = @min(rows.len, 12);
+        if (row_count == 0) return;
+
+        // Calculate panel width: longest row + 2 (left-pad 1 col + right margin 1).
+        var max_width: u16 = 0;
+        for (rows[0..row_count]) |row| {
+            const w: u16 = @intCast(@min(ctx.stringWidth(row), max.width));
+            if (w > max_width) max_width = w;
+        }
+        const panel_w = max_width + 2;
+        if (panel_w == 2 or max.width < panel_w) return;
+
+        const panel_h: u16 = @intCast(row_count);
+        const status_row = max.height -| 1;
+        if (status_row < panel_h) return;
+
+        const x0 = max.width -| panel_w; // right-aligned
+        const y0 = status_row -| panel_h;
+
+        const bg_style: vaxis.Style = .{ .bg = th.bar_bg };
+        const text_style: vaxis.Style = .{ .fg = th.fg, .bg = th.bar_bg };
+        const key_style: vaxis.Style = .{ .fg = th.blue, .bg = th.bar_bg, .bold = true };
+
+        // Fill background.
+        var r: u16 = 0;
+        while (r < panel_h) : (r += 1) {
+            var c: u16 = 0;
+            while (c < panel_w) : (c += 1) {
+                surface.writeCell(x0 + c, y0 + r, .{ .style = bg_style });
+            }
+        }
+
+        // Draw each row.
+        r = 0;
+        while (r < row_count) : (r += 1) {
+            const row = rows[r];
+            var col = x0 + 1; // left-pad 1 col
+
+            // Find the first space to separate key from description.
+            var space_idx: ?usize = null;
+            for (row, 0..) |ch, i| {
+                if (ch == ' ') {
+                    space_idx = i;
+                    break;
+                }
+            }
+
+            if (space_idx) |idx| {
+                // Draw key character(s) in blue bold.
+                const key_part = row[0..idx];
+                _ = writeText(surface, ctx, col, y0 + r, key_part, key_style);
+                col += @intCast(@min(ctx.stringWidth(key_part), max.width - col));
+
+                // Draw the rest (including spaces and description) in normal text style.
+                const desc_part = row[idx..];
+                _ = writeText(surface, ctx, col, y0 + r, desc_part, text_style);
+            } else {
+                // No space found, draw entire row in normal text style.
+                _ = writeText(surface, ctx, col, y0 + r, row, text_style);
             }
         }
     }
