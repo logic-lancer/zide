@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const ts = @import("tree-sitter");
 const themes = @import("theme.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const Tree = @import("tree.zig").Tree;
@@ -104,6 +105,8 @@ pub const Editor = struct {
     yank_flash_armed: bool = false,
     /// `Space f z` picker rows (see LineHit); cleared on popup close.
     line_hits: std.ArrayListUnmanaged(LineHit) = .{},
+    /// `Space f s` outline rows (see SymbolHit); cleared on popup close.
+    symbol_hits: std.ArrayListUnmanaged(SymbolHit) = .{},
 
     const TermView = enum { none, split, vert, float };
 
@@ -133,12 +136,13 @@ pub const Editor = struct {
         filter: std.ArrayListUnmanaged(u8) = .{},
         selected: usize = 0,
 
-        const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines };
+        const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols };
         const max_items = 64;
         const max_files = 2000;
         /// Per-buffer cap for the `Space f z` line picker (distinct from
         /// the per-project max_files).
         const max_lines = 10000;
+        const max_symbols = 2000;
         const max_file_size = 1024 * 1024;
     };
 
@@ -171,6 +175,80 @@ pub const Editor = struct {
     /// owned "NNNN: text" display row.
     const LineHit = struct { row: usize, disp: []u8 };
 
+    /// One outline row for the `Space f s` picker: 0-based row + owned
+    /// "kind   name" display row.
+    const SymbolHit = struct { row: usize, disp: []u8 };
+
+    /// A declaration's keyword and name; `name` borrows the buffer text and
+    /// `kw` is either a literal or a slice of a static tree-sitter kind name.
+    const Crumb = struct { kw: []const u8, name: []const u8 };
+
+    fn isContainerKind(kind: []const u8) bool {
+        return std.mem.eql(u8, kind, "struct_declaration") or
+            std.mem.eql(u8, kind, "enum_declaration") or
+            std.mem.eql(u8, kind, "union_declaration") or
+            std.mem.eql(u8, kind, "opaque_declaration");
+    }
+
+    fn nodeText(src: []const u8, node: ts.Node) []const u8 {
+        const s = @min(@as(usize, node.startByte()), src.len);
+        var e = @min(@as(usize, node.endByte()), src.len);
+        if (e > s + 64) e = s + 64;
+        while (e > s and (src[e - 1] & 0xC0) == 0x80) e -= 1; // utf-8 boundary
+        return src[s..e];
+    }
+
+    /// Keyword + name for a declaration node, or null when `node` is not one
+    /// we surface. tree-sitter-zig v1.1.2 shapes: `function_declaration` has a
+    /// `name` field; `test_declaration` carries a string/identifier child;
+    /// `variable_declaration` holds its identifier as the first named child and
+    /// (for `const X = struct {…}`) the container node as a later child, since
+    /// container declarations are anonymous in this grammar. Only
+    /// container-level variable declarations qualify — including locals would
+    /// put ~1300 rows in the outline of a file this size.
+    fn declCrumb(b: *const Buffer, node: ts.Node) ?Crumb {
+        const kind = node.kind();
+        const src = b.buf.items;
+        if (std.mem.eql(u8, kind, "function_declaration")) {
+            const nm = node.childByFieldName("name") orelse return null;
+            return .{ .kw = "fn", .name = nodeText(src, nm) };
+        }
+        if (std.mem.eql(u8, kind, "test_declaration")) {
+            const n = node.namedChildCount();
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const ch = node.namedChild(i) orelse continue;
+                const ck = ch.kind();
+                if (std.mem.eql(u8, ck, "string") or std.mem.eql(u8, ck, "identifier"))
+                    return .{ .kw = "test", .name = nodeText(src, ch) };
+            }
+            return .{ .kw = "test", .name = "" };
+        }
+        if (!std.mem.eql(u8, kind, "variable_declaration")) return null;
+        const pk = (node.parent() orelse return null).kind();
+        if (!isContainerKind(pk) and !std.mem.eql(u8, pk, "source_file")) return null;
+        var name: ?ts.Node = null;
+        var kw: []const u8 = "const";
+        const n = node.namedChildCount();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const ch = node.namedChild(i) orelse continue;
+            const ck = ch.kind();
+            if (name == null and std.mem.eql(u8, ck, "identifier")) {
+                name = ch;
+            } else if (isContainerKind(ck)) {
+                // "struct_declaration" -> "struct"; kind() is a static string.
+                kw = ck[0 .. std.mem.indexOfScalar(u8, ck, '_') orelse ck.len];
+            }
+        }
+        const nm = name orelse return null;
+        if (std.mem.eql(u8, kw, "const")) {
+            const head = src[@min(@as(usize, node.startByte()), src.len)..@min(@as(usize, nm.startByte()), src.len)];
+            if (std.mem.indexOf(u8, head, "var") != null) kw = "var";
+        }
+        return .{ .kw = kw, .name = nodeText(src, nm) };
+    }
+
     /// NvCheatsheet-style keybinding reference, shown via `Space c h`.
     const cheats = [_][]const u8{
         "Tab          next buffer",
@@ -183,6 +261,7 @@ pub const Editor = struct {
         "Space f f    find files",
         "Space f w    live grep",
         "Space f o    recent files",
+        "Space f s    document symbols",
         "Space f z    buffer lines",
         "Space g b    blame line",
         "Space g p    preview hunk",
@@ -238,7 +317,7 @@ pub const Editor = struct {
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
             .leader => if (visual) &.{ "/  toggle comment" } else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
-            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "z  buffer lines" },
+            .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines" },
             .leader_c => &.{ "h  cheatsheet", "r  rename word" },
             .leader_r => &.{ "n  toggle relative numbers" },
             .leader_g => &.{ "b  blame line", "p  preview hunk", "r  reset hunk", "s  stage hunk" },
@@ -893,6 +972,8 @@ pub const Editor = struct {
         self.cmp.prefix.deinit(self.alloc);
         self.clearLines();
         self.line_hits.deinit(self.alloc);
+        self.clearSymbols();
+        self.symbol_hits.deinit(self.alloc);
         self.tree.deinit();
         for (&self.macros) |*m| m.deinit(self.alloc);
         self.dot.deinit(self.alloc);
@@ -1011,6 +1092,7 @@ pub const Editor = struct {
         if (kind == .files or kind == .grep) self.refreshFiles();
         if (kind == .grep) self.clearGrep();
         if (kind == .lines) self.refreshLines();
+        if (kind == .symbols) self.refreshSymbols();
         self.popup.kind = kind;
         self.popup.selected = 0;
         self.popup.filter.clearRetainingCapacity();
@@ -1100,6 +1182,41 @@ pub const Editor = struct {
         }
     }
 
+    fn clearSymbols(self: *Editor) void {
+        for (self.symbol_hits.items) |h| self.alloc.free(h.disp);
+        self.symbol_hits.clearRetainingCapacity();
+    }
+
+    /// Fill the outline picker by walking the active buffer's syntax tree.
+    /// Buffers that are not Zig still parse (one grammar), they just yield no
+    /// declarations — hence the empty-result status.
+    fn refreshSymbols(self: *Editor) void {
+        self.clearSymbols();
+        if (self.buffers.items.len == 0) return;
+        const b = self.cur();
+        const tree = b.hl.tree orelse return;
+        self.walkSymbols(b, tree.rootNode());
+        if (self.symbol_hits.items.len == 0)
+            self.setStatus("no symbols in {s}", .{b.displayName()});
+    }
+
+    fn walkSymbols(self: *Editor, b: *const Buffer, node: ts.Node) void {
+        if (self.symbol_hits.items.len >= Popup.max_symbols) return;
+        if (declCrumb(b, node)) |c| {
+            const disp = std.fmt.allocPrint(self.alloc, "{s: <7}{s}", .{ c.kw, c.name }) catch return;
+            self.symbol_hits.append(self.alloc, .{
+                .row = @intCast(node.startPoint().row),
+                .disp = disp,
+            }) catch {
+                self.alloc.free(disp);
+                return;
+            };
+        }
+        const n = node.namedChildCount();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) self.walkSymbols(b, node.namedChild(i) orelse continue);
+    }
+
     /// Open `path` and place the cursor on `line` (1-based), roughly centered.
     fn jumpTo(self: *Editor, path: []const u8, line: usize) void {
         self.openFile(path) catch {
@@ -1124,6 +1241,7 @@ pub const Editor = struct {
             .grep => " Live Grep ",
             .recent => " Recent Files ",
             .lines => " Buffer Lines ",
+            .symbols => " Document Symbols ",
             .none => "",
         };
     }
@@ -1137,6 +1255,7 @@ pub const Editor = struct {
             .grep => self.grep_hits.items.len,
             .recent => self.oldfiles.items.len,
             .lines => self.line_hits.items.len,
+            .symbols => self.symbol_hits.items.len,
             .none => 0,
         };
     }
@@ -1150,6 +1269,7 @@ pub const Editor = struct {
             .grep => self.grep_hits.items[i].disp,
             .recent => self.oldfiles.items[i],
             .lines => self.line_hits.items[i].disp,
+            .symbols => self.symbol_hits.items[i].disp,
             .none => "",
         };
     }
@@ -1187,6 +1307,7 @@ pub const Editor = struct {
         if (key.matches(vaxis.Key.escape, .{})) {
             self.closePopup();
             self.clearLines(); // line-picker rows: thousands of heap strings
+            self.clearSymbols();
         } else if (key.matches(vaxis.Key.enter, .{})) {
             if (n > 0) {
                 const idx = matches[@min(self.popup.selected, n - 1)];
@@ -1210,8 +1331,11 @@ pub const Editor = struct {
                             self.setStatus("could not open {s}", .{path});
                         };
                     },
-                    .lines => {
-                        const target = self.line_hits.items[idx].row;
+                    .lines, .symbols => {
+                        const target = if (kind == .lines)
+                            self.line_hits.items[idx].row
+                        else
+                            self.symbol_hits.items[idx].row;
                         self.pushJump();
                         const b = self.cur();
                         b.row = @min(target, b.lines.items.len -| 1);
@@ -1226,9 +1350,11 @@ pub const Editor = struct {
                 // After the switch: the .lines arm reads line_hits above,
                 // so the release must not happen inside closePopup.
                 self.clearLines();
+                self.clearSymbols();
             } else {
                 self.closePopup();
                 self.clearLines(); // zero-match Enter must release rows too
+                self.clearSymbols();
             }
         } else if (key.matches(vaxis.Key.down, .{}) or
             key.matches('n', .{ .ctrl = true }) or key.matches('j', .{ .ctrl = true }))
@@ -2279,6 +2405,7 @@ pub const Editor = struct {
                     'f' => self.openPopup(.files),
                     'w' => self.openPopup(.grep),
                     'o' => self.openPopup(.recent),
+                    's' => self.openPopup(.symbols),
                     'z' => self.openPopup(.lines),
                     else => {},
                 }
