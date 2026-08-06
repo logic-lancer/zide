@@ -42,6 +42,10 @@ pub const Editor = struct {
     /// Recently opened files, most recent first (persisted, NvDash "recent").
     oldfiles: std.ArrayListUnmanaged([]u8) = .{},
     grep_hits: std.ArrayListUnmanaged(GrepHit) = .{},
+    /// ]q / [q cursor into grep_hits; `qf_seen` makes the first jump land on
+    /// the current entry instead of skipping it.
+    qf_idx: usize = 0,
+    qf_seen: bool = false,
     tree: Tree,
     tree_open: bool = false,
     /// Space n / Space r n: absolute + relative line-number display.
@@ -308,6 +312,7 @@ pub const Editor = struct {
         "H / M / L    screen top/mid/bottom",
         "/ then n/N   search / next/prev",
         "]c / [c      next/prev git hunk",
+        "]q / [q      next/prev grep hit",
         "gg / G       top / bottom",
         "gf           goto file under cursor",
         "gcc / Ngcc   toggle comment",
@@ -350,8 +355,8 @@ pub const Editor = struct {
             .d => &.{ "d  delete line", "w  delete word", "$  delete to eol", "s  delete surround", "f F t T  find-char", "i  +inner object", "a  +around object" },
             .c_op => &.{ "c  change line", "w  change word", "$  change to eol", "e  change to word end", "f F t T  find-char", "i  +inner object", "a  +around object", "s  change surround" },
             .y_op => &.{ "y  yank line", "w  yank word", "$  yank to eol", "e  yank to word end", "f F t T  find-char", "i  +inner object", "a  +around object" },
-            .bracket_f => &.{ "c  next git hunk" },
-            .bracket_b => &.{ "c  prev git hunk" },
+            .bracket_f => &.{ "c  next git hunk", "q  next grep hit" },
+            .bracket_b => &.{ "c  prev git hunk", "q  prev grep hit" },
             else => null,
         };
     }
@@ -1134,6 +1139,8 @@ pub const Editor = struct {
     }
 
     fn clearGrep(self: *Editor) void {
+        self.qf_idx = 0;
+        self.qf_seen = false;
         for (self.grep_hits.items) |h| {
             self.alloc.free(h.path);
             self.alloc.free(h.disp);
@@ -1253,6 +1260,21 @@ pub const Editor = struct {
         b.scroll = b.row -| (self.last_height / 2);
     }
 
+    /// vim quickfix analog over the last `Space f w` results, which outlive
+    /// the picker (clearGrep only runs on a new grep or teardown).
+    fn jumpQuickfix(self: *Editor, dir: i2) void {
+        const n = self.grep_hits.items.len;
+        if (n == 0) return self.setStatus("quickfix empty (Space f w to grep)", .{});
+        if (self.qf_seen) {
+            const i: isize = @intCast(self.qf_idx);
+            self.qf_idx = @intCast(@mod(i + dir, @as(isize, @intCast(n))));
+        } else self.qf_seen = true;
+        if (self.qf_idx >= n) self.qf_idx = 0;
+        const h = self.grep_hits.items[self.qf_idx];
+        self.jumpTo(h.path, h.line);
+        self.setStatus("quickfix {d}/{d}: {s}:{d}", .{ self.qf_idx + 1, n, h.path, h.line });
+    }
+
     fn popupTitle(self: *const Editor) []const u8 {
         return switch (self.popup.kind) {
             .buffers => " Buffers ",
@@ -1342,6 +1364,8 @@ pub const Editor = struct {
                     },
                     .grep => {
                         const h = self.grep_hits.items[idx];
+                        self.qf_idx = idx;
+                        self.qf_seen = true;
                         self.jumpTo(h.path, h.line);
                     },
                     .recent => {
@@ -2475,12 +2499,20 @@ pub const Editor = struct {
             },
             .bracket_f => {
                 self.pending = .none;
-                if (cp == 'c') self.jumpHunk(1);
+                switch (cp) {
+                    'c' => self.jumpHunk(1),
+                    'q' => self.jumpQuickfix(1),
+                    else => {},
+                }
                 return ctx.consumeAndRedraw();
             },
             .bracket_b => {
                 self.pending = .none;
-                if (cp == 'c') self.jumpHunk(-1);
+                switch (cp) {
+                    'c' => self.jumpHunk(-1),
+                    'q' => self.jumpQuickfix(-1),
+                    else => {},
+                }
                 return ctx.consumeAndRedraw();
             },
         }
