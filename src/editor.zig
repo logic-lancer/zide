@@ -586,6 +586,55 @@ pub const Editor = struct {
         }
     }
 
+    /// UTC `YYYY-MM-DD` for a unix timestamp.
+    fn fmtDate(buf: []u8, secs: i64) []const u8 {
+        if (secs <= 0) return "?";
+        const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(secs) };
+        const yd = es.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2}", .{
+            yd.year, md.month.numeric(), md.day_index + 1,
+        }) catch "?";
+    }
+
+    /// `Space g b` (gitsigns blame_line): author, date and summary for the
+    /// cursor line, in the status line.
+    fn blameLine(self: *Editor) void {
+        const b = self.gitTarget() orelse return;
+        var lbuf: [40]u8 = undefined;
+        const spec = std.fmt.bufPrint(&lbuf, "{d},{d}", .{ b.row + 1, b.row + 1 }) catch return;
+        const res = std.process.Child.run(.{
+            .allocator = self.alloc,
+            .argv = &.{ "git", "blame", "-L", spec, "--line-porcelain", "--", b.file_name },
+            .max_output_bytes = 1 << 16,
+        }) catch return self.setStatus("git blame: failed to run", .{});
+        defer self.alloc.free(res.stdout);
+        defer self.alloc.free(res.stderr);
+        if (res.term != .Exited or res.term.Exited != 0) {
+            const msg = std.mem.sliceTo(std.mem.trim(u8, res.stderr, " \r\n"), '\n');
+            return self.setStatus("git blame: {s}", .{if (msg.len > 0) msg else "not tracked"});
+        }
+        var author: []const u8 = "";
+        var summary: []const u8 = "";
+        var when: i64 = 0;
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |ln| {
+            if (std.mem.startsWith(u8, ln, "author ")) {
+                author = ln["author ".len..];
+            } else if (std.mem.startsWith(u8, ln, "author-time ")) {
+                when = std.fmt.parseInt(i64, ln["author-time ".len..], 10) catch 0;
+            } else if (std.mem.startsWith(u8, ln, "summary ")) {
+                summary = ln["summary ".len..];
+            } else if (std.mem.startsWith(u8, ln, "\t")) break; // line content ends the header
+        }
+        if (std.mem.eql(u8, author, "Not Committed Yet"))
+            return self.setStatus("line {d}: not committed yet", .{b.row + 1});
+        var dbuf: [16]u8 = undefined;
+        const date = fmtDate(&dbuf, when);
+        const sum = summary[0..@min(summary.len, 120)];
+        self.setStatus("{s}, {s}: {s}", .{ author, date, sum });
+    }
+
     pub fn deinit(self: *Editor) void {
         for (self.buffers.items) |*b| b.deinit();
         self.buffers.deinit(self.alloc);
@@ -1882,7 +1931,7 @@ pub const Editor = struct {
                 switch (cp) {
                     'r' => self.resetHunk() catch {},
                     'p' => self.previewHunk(),
-                    'b' => {},
+                    'b' => self.blameLine(),
                     else => {},
                 }
                 return ctx.consumeAndRedraw();
