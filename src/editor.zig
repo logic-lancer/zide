@@ -61,6 +61,10 @@ pub const Editor = struct {
     /// In-progress change capture (from change-starting key until normal mode).
     dot_rec: std.ArrayListUnmanaged(vaxis.Key) = .{},
     dot_capturing: bool = false,
+    /// Buffer + its undo_seq at capture start: a settle only commits when
+    /// the capture actually edited that buffer.
+    dot_buf0: usize = 0,
+    dot_seq0: u32 = 0,
     /// Pending count prefix for normal-mode commands (0 = none).
     count: u32 = 0,
     /// Visual-mode anchor (the end of the selection that does not move).
@@ -1028,6 +1032,8 @@ pub const Editor = struct {
             }
             self.dot_capturing = true;
             self.dot_rec.clearRetainingCapacity();
+            self.dot_buf0 = self.active;
+            self.dot_seq0 = self.cur().undo_seq;
             // Fold an active count prefix into the capture so `.` repeats
             // e.g. `3x` in full.
             if (self.count > 0) {
@@ -1047,6 +1053,12 @@ pub const Editor = struct {
         if (!self.dot_capturing) return;
         if (self.mode != .normal or self.pending != .none) return;
         self.dot_capturing = false;
+        // Commit only when the capture actually edited the buffer it
+        // started in: an aborted operator (`d` then Esc/z/q) or a failed
+        // edit would otherwise overwrite the register with a no-op,
+        // losing the real last change.
+        if (self.buffers.items.len == 0 or self.active != self.dot_buf0 or
+            self.cur().undo_seq == self.dot_seq0) return;
         std.mem.swap(std.ArrayListUnmanaged(vaxis.Key), &self.dot, &self.dot_rec);
     }
 
