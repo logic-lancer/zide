@@ -192,6 +192,9 @@ pub const list = [_]Theme{
             // enough to see as a selection washes out the (darker-than-
             // ground) syntax hues; a tint reads by hue instead, so it can
             // stay light enough that selected text keeps its contrast.
+            // Red still sits at ~2.8 on it -- accepted: red must stay light
+            // enough to keep its identity on the near-white ground and as
+            // the diagnostic dot, and no selection tone does better.
             .sel_bg = c(0xd2e3fa),
             .badge_fg = c(0xfafafa),
             .red = c(0xe45649),
