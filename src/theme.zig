@@ -170,23 +170,32 @@ pub const list = [_]Theme{
     // bar_bg doubles as the selection background so it must read against
     // the near-white ground, and gray must stay visibly dim on white
     // (comments, inlay hints, which-key descriptions).
-    .{ .name = "white", .p = .{
-        .bg = c(0xfafafa),
-        .fg = c(0x383a42),
-        .gutter = c(0xc2c2c3),
-        .gutter_active = c(0x696c77),
-        .bar_bg = c(0xdfdfe0),
-        .bar_fg = c(0x424243),
-        .badge_fg = c(0xfafafa),
-        .red = c(0xe45649),
-        .orange = c(0x986801),
-        .yellow = c(0xc18401),
-        .green = c(0x50a14f),
-        .cyan = c(0x0184bc),
-        .blue = c(0x4078f2),
-        .purple = c(0xa626a4),
-        .gray = c(0xa0a1a7),
-    } },
+    .{
+        .name = "white",
+        .p = .{
+            .bg = c(0xfafafa),
+            .fg = c(0x383a42),
+            .gutter = c(0xc2c2c3),
+            .gutter_active = c(0x696c77),
+            // Doubles as the selection background: deep enough that mid-tone
+            // syntax hues stay past the 3.0 contrast floor inside a selection.
+            .bar_bg = c(0xd6d6d8),
+            .bar_fg = c(0x424243),
+            .badge_fg = c(0xfafafa),
+            .red = c(0xe45649),
+            .orange = c(0x986801),
+            // yellow/green run darker than stock One Light: yellow is also the
+            // search-highlight backing for near-white text, and both are the
+            // hues a light ground washes out first (measured 3.06/3.07 at the
+            // stock values).
+            .yellow = c(0xa66f00),
+            .green = c(0x398a38),
+            .cyan = c(0x0184bc),
+            .blue = c(0x4078f2),
+            .purple = c(0xa626a4),
+            .gray = c(0xa0a1a7),
+        },
+    },
 };
 
 /// Space-separated theme names, built at comptime (for :themes / errors).
