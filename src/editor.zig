@@ -111,9 +111,12 @@ pub const Editor = struct {
     term_cols: u16 = 80,
     /// mouse=a: layout snapshot + tabline hit spans from the last draw.
     mlay: MouseLayout = .{},
-    /// Last frame's DrawContext, stashed for the mouse path. Safe forever:
-    /// stringWidth reads only container-level unicode statics set at app
-    /// init — the per-frame arena inside this copy is never dereferenced.
+    /// Last frame's DrawContext, stashed for the mouse path — only its
+    /// stringWidth is ever used, which reads container-level unicode
+    /// statics set at app init. The copy's per-frame arena is DEAD by the
+    /// time this is read, so the stash poisons it (see typeErasedDrawFn):
+    /// a future accidental `ctx.arena` use fails as OutOfMemory instead
+    /// of dereferencing freed memory with no compiler help.
     last_draw_ctx: ?vxfw.DrawContext = null,
     tab_spans: [32]TabSpan = undefined,
     tab_span_count: usize = 0,
@@ -197,6 +200,8 @@ pub const Editor = struct {
     const Jump = struct { buf: usize, row: usize, col: usize };
     const Focus = enum { editor, tree, term };
     const tree_width_max: u16 = 30;
+    /// Zero-capacity backing for last_draw_ctx's poisoned arena.
+    var poison_fba = std.heap.FixedBufferAllocator.init(&[_]u8{});
     const yank_flash_ms: i64 = 180;
 
     /// Floating picker overlay (buffers / themes), telescope-flavored:
@@ -5701,7 +5706,11 @@ pub const Editor = struct {
 
     fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Editor = @ptrCast(@alignCast(ptr));
-        self.last_draw_ctx = ctx; // width source for the mouse path
+        // Width source for the mouse path — with the dead per-frame arena
+        // swapped for a zero-capacity allocator so misuse fails cleanly.
+        var stashed = ctx;
+        stashed.arena = poison_fba.allocator();
+        self.last_draw_ctx = stashed;
         const max = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), max);
         self.mlay.valid = false;
