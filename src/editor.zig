@@ -5384,21 +5384,81 @@ pub const Editor = struct {
         b.col = Buffer.snapToCp(line, e);
     }
 
-    /// Inverse of displayCol: byte offset whose display column reaches `want`.
-    fn byteColForWidth(text: []const u8, want: u16) usize {
-        var disp: u16 = 0;
-        var i: usize = 0;
-        while (i < text.len and disp < want) {
-            const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-            const end = @min(i + cp_len, text.len);
-            if (text[i] == '\t') {
-                disp = (disp / 4 + 1) * 4;
-            } else {
-                disp += 1;
-            }
-            i = end;
+    /// One text row's byte -> display-column mapping, walked left to right.
+    /// This is the single place the advance rule lives: the draw loop, the
+    /// cursor's display column and the mouse's inverse mapping all step
+    /// through it, so the screen, the cursor and the pointer cannot disagree
+    /// about where a byte is.
+    const RowIter = struct {
+        text: []const u8,
+        /// null on the mouse path, which runs from an event handler that has
+        /// no DrawContext and has always counted every non-tab codepoint as
+        /// one column. Keeping that exact rule here is what makes routing
+        /// clicks through this iterator a no-op on wide (CJK) lines.
+        ctx: ?vxfw.DrawContext,
+        /// Next byte to emit.
+        i: usize = 0,
+        /// Display column the next unit starts at; 0 is the first text cell.
+        disp: u16 = 0,
+
+        const tab_stop: u16 = 4;
+
+        const Unit = struct {
+            /// Byte range in `text` this unit covers.
+            start: usize,
+            end: usize,
+            /// Column the unit starts at, and how many columns it consumes.
+            /// For a tab, `width` is the distance to the next stop.
+            disp: u16,
+            width: u16,
+            is_tab: bool,
+        };
+
+        fn init(text: []const u8, ctx: ?vxfw.DrawContext) RowIter {
+            return .{ .text = text, .ctx = ctx };
         }
-        return i;
+
+        fn next(self: *RowIter) ?Unit {
+            if (self.i >= self.text.len) return null;
+            const cp_len = std.unicode.utf8ByteSequenceLength(self.text[self.i]) catch 1;
+            const end = @min(self.i + cp_len, self.text.len);
+            const slice = self.text[self.i..end];
+            const start = self.i;
+            const d = self.disp;
+            self.i = end;
+            if (slice[0] == '\t') {
+                const stop = (d / tab_stop + 1) * tab_stop;
+                self.disp = stop;
+                return .{ .start = start, .end = end, .disp = d, .width = stop - d, .is_tab = true };
+            }
+            const w: u16 = if (self.ctx) |c| @intCast(@min(c.stringWidth(slice), 4)) else 1;
+            self.disp = d + w;
+            return .{ .start = start, .end = end, .disp = d, .width = w, .is_tab = false };
+        }
+
+        /// Display column at which byte `byte` renders.
+        fn colOf(self: *RowIter, byte: usize) u16 {
+            while (self.i < byte) {
+                _ = self.next() orelse break;
+            }
+            return self.disp;
+        }
+
+        /// Inverse: the byte whose display column reaches `want`.
+        fn byteAtCol(self: *RowIter, want: u16) usize {
+            while (self.disp < want) {
+                _ = self.next() orelse break;
+            }
+            return self.i;
+        }
+    };
+
+    /// Inverse of displayCol: byte offset whose display column reaches `want`.
+    /// No DrawContext here (mouse events carry an EventContext), so every
+    /// non-tab codepoint counts as one column — see RowIter.ctx.
+    fn byteColForWidth(text: []const u8, want: u16) usize {
+        var it = RowIter.init(text, null);
+        return it.byteAtCol(want);
     }
 
     fn handleTree(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -5592,11 +5652,12 @@ pub const Editor = struct {
             else
                 null;
             var cspan: ?ColorSpan = findColorSpan(text, 0);
+            var it = RowIter.init(text, ctx);
             var col: u16 = x0 + gutter;
-            var i: usize = 0;
-            while (i < text.len and col < text_right) {
-                const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-                const end = @min(i + cp_len, text.len);
+            while (col < text_right) {
+                const u = it.next() orelse break;
+                const i = u.start;
+                const end = u.end;
                 const slice = text[i..end];
                 var style = b.hl.styleAt(line.start + i);
                 if (cspan) |c| {
@@ -5647,13 +5708,13 @@ pub const Editor = struct {
                         if (i >= ia and i < ia + il.word.len) style.ul_style = .single;
                     }
                 }
-                if (slice[0] == '\t') {
-                    const stop = x0 + gutter + (((col - x0 - gutter) / 4) + 1) * 4;
+                if (u.is_tab) {
+                    const stop = col + u.width;
                     while (col < stop and col < text_right) : (col += 1) {
                         surface.writeCell(col, draw_row, .{ .style = style });
                     }
                 } else {
-                    const w: u16 = @intCast(@min(ctx.stringWidth(slice), 4));
+                    const w = u.width;
                     if (w > 0) {
                         if (col + w > text_right) break;
                         surface.writeCell(col, draw_row, .{
@@ -5663,7 +5724,6 @@ pub const Editor = struct {
                         col += w;
                     }
                 }
-                i = end;
             }
 
             // indent-blankline style guides at each indent step, drawn over
@@ -5963,20 +6023,8 @@ pub const Editor = struct {
     /// Display column of the cursor within its line (tabs expand to 4-stops).
     fn displayCol(self: *Editor, ctx: vxfw.DrawContext) u16 {
         const b = self.cur();
-        const text = b.lineText(b.row);
-        var disp: u16 = 0;
-        var i: usize = 0;
-        while (i < text.len and i < b.col) {
-            const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-            const end = @min(i + cp_len, text.len);
-            if (text[i] == '\t') {
-                disp = (disp / 4 + 1) * 4;
-            } else {
-                disp += @intCast(@min(ctx.stringWidth(text[i..end]), 4));
-            }
-            i = end;
-        }
-        return disp;
+        var it = RowIter.init(b.lineText(b.row), ctx);
+        return it.colOf(b.col);
     }
 
     fn drawStatus(self: *Editor, surface: vxfw.Surface, ctx: vxfw.DrawContext, status_row: u16, width: u16) void {
