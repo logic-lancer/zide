@@ -5901,12 +5901,15 @@ pub const Editor = struct {
                 if (match) |m| {
                     if (i >= m + pat.len) match = std.mem.indexOfPos(u8, text, i, pat);
                 }
-                if (match) |m| {
-                    if (i >= m and i < m + pat.len) style = search_style;
-                }
+                const matched = if (match) |m| i >= m and i < m + pat.len else false;
+                if (matched) style = search_style;
                 if (sel) |s| {
                     const abs = line.start + i;
-                    if (abs >= s[0] and abs < s[1]) style.bg = th.bar_bg;
+                    // Search wins over selection, like flash and matchparen
+                    // below: overlaying only the selection bg under the
+                    // search style's inverted fg made matched text inside a
+                    // selection unreadable (contrast ~1.3 in every theme).
+                    if (abs >= s[0] and abs < s[1] and !matched) style.bg = th.bar_bg;
                 }
                 if (flash) |fr| {
                     const abs = line.start + i;
