@@ -6084,7 +6084,7 @@ pub const Editor = struct {
         for (logo) |line| {
             if (y >= max.height -| 1) break;
             const lx: u16 = x_off + (area_w -| logo_w) / 2;
-            _ = writeText(surface, ctx, lx, y, line, .{ .fg = th.blue, .bold = true });
+            _ = writeText(surface, ctx, lx, y, line, .{ .fg = th.blue, .bg = th.bg, .bold = true });
             y += 1;
         }
         y += 1;
@@ -6118,9 +6118,9 @@ pub const Editor = struct {
                 }
                 const bx: u16 = x_off + (area_w -| btn_w) / 2;
                 const digit = std.fmt.allocPrint(ctx.arena, "{d}", .{ri + 1}) catch "?";
-                var col = writeText(surface, ctx, bx, y, digit, .{ .fg = th.yellow, .bold = true });
-                col = writeText(surface, ctx, col, y, "  ", .{});
-                _ = writeText(surface, ctx, col, y, tail, .{ .fg = th.fg });
+                var col = writeText(surface, ctx, bx, y, digit, .{ .fg = th.yellow, .bg = th.bg, .bold = true });
+                col = writeText(surface, ctx, col, y, "  ", .{ .bg = th.bg });
+                _ = writeText(surface, ctx, col, y, tail, .{ .fg = th.fg, .bg = th.bg });
                 y += 1;
             }
             y += 1;
@@ -6128,7 +6128,7 @@ pub const Editor = struct {
         if (y < max.height -| 1) {
             const hint = "zide — :e <path> to open a file";
             const hx: u16 = x_off + (area_w -| @as(u16, @intCast(ctx.stringWidth(hint)))) / 2;
-            _ = writeText(surface, ctx, hx, y, hint, .{ .fg = th.gray });
+            _ = writeText(surface, ctx, hx, y, hint, .{ .fg = th.gray, .bg = th.bg });
         }
 
         if (tree_w > 0) self.drawTree(surface, ctx, 0, max.height - 1, tree_w);
