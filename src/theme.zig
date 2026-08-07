@@ -211,6 +211,84 @@ pub const list = [_]Theme{
             .gray = c(0xa0a1a7),
         },
     },
+    // The remaining light themes follow the same rules as "white": accents
+    // dark enough for bg-colored text on them (search/badge/flash), a hue-
+    // tinted sel_bg (cool tint on the warm grounds so it reads by hue), and
+    // any stock hue measured near/below 3.0 on its ground runs darker here.
+    .{
+        .name = "gruvbox-light",
+        .p = .{
+            .bg = c(0xfbf1c7),
+            .fg = c(0x3c3836),
+            .gutter = c(0xd5c4a1),
+            .gutter_active = c(0x665c54),
+            .bar_bg = c(0xebdbb2),
+            .bar_fg = c(0x504945),
+            .sel_bg = c(0xd1dce5),
+            .badge_fg = c(0xfbf1c7),
+            .red = c(0x9d0006),
+            .orange = c(0xaf3a03),
+            // Faded yellow 0xb57614 measures ~3.3 as the search backing on
+            // the cream ground; run darker.
+            .yellow = c(0xa06a0e),
+            .green = c(0x79740e),
+            .cyan = c(0x427b58),
+            .blue = c(0x076678),
+            .purple = c(0x8f3f71),
+            .gray = c(0x928374),
+        },
+    },
+    // Solarized is deliberately soft: fg is base01 (the "emphasized" tone,
+    // ~4.9 on the paper ground) — the strongest tone the scheme intends for
+    // body text.
+    .{
+        .name = "solarized-light",
+        .p = .{
+            .bg = c(0xfdf6e3),
+            .fg = c(0x586e75),
+            .gutter = c(0xc9c2ad),
+            .gutter_active = c(0x657b83),
+            .bar_bg = c(0xeee8d5),
+            .bar_fg = c(0x586e75),
+            .sel_bg = c(0xd3e3e8),
+            .badge_fg = c(0xfdf6e3),
+            .red = c(0xdc322f),
+            .orange = c(0xcb4b16),
+            // Stock yellow 0xb58900 / green 0x859900 / cyan 0x2aa198 all sit
+            // at ~2.9 on the paper ground; run darker.
+            .yellow = c(0x9a7500),
+            .green = c(0x6e7f00),
+            .cyan = c(0x1f8a82),
+            .blue = c(0x268bd2),
+            .purple = c(0x6c71c4),
+            .gray = c(0x93a1a1),
+        },
+    },
+    // Catppuccin Latte.
+    .{
+        .name = "latte",
+        .p = .{
+            .bg = c(0xeff1f5),
+            .fg = c(0x4c4f69),
+            .gutter = c(0xbcc0cc),
+            .gutter_active = c(0x6c6f85),
+            .bar_bg = c(0xdce0e8),
+            .bar_fg = c(0x5c5f77),
+            .sel_bg = c(0xd0dcf5),
+            .badge_fg = c(0xeff1f5),
+            .red = c(0xd20f39),
+            // Stock peach 0xfe640b is too light to back bg-colored text
+            // (yank flash ~2.7); stock yellow 0xdf8e1d / green 0x40a02b
+            // measure ~2.3/3.0 on the ground; all run darker.
+            .orange = c(0xd0570a),
+            .yellow = c(0x9c6e0a),
+            .green = c(0x358a24),
+            .cyan = c(0x179299),
+            .blue = c(0x1e66f5),
+            .purple = c(0x8839ef),
+            .gray = c(0x8c8fa1),
+        },
+    },
 };
 
 /// Space-separated theme names, built at comptime (for :themes / errors).
