@@ -111,6 +111,10 @@ pub const Editor = struct {
     term_cols: u16 = 80,
     /// mouse=a: layout snapshot + tabline hit spans from the last draw.
     mlay: MouseLayout = .{},
+    /// Last frame's DrawContext, stashed for the mouse path. Safe forever:
+    /// stringWidth reads only container-level unicode statics set at app
+    /// init — the per-frame arena inside this copy is never dereferenced.
+    last_draw_ctx: ?vxfw.DrawContext = null,
     tab_spans: [32]TabSpan = undefined,
     tab_span_count: usize = 0,
     /// nvim-cmp-lite: insert-mode Ctrl-n/Ctrl-p word completion.
@@ -5512,10 +5516,11 @@ pub const Editor = struct {
     /// about where a byte is.
     const RowIter = struct {
         text: []const u8,
-        /// null on the mouse path, which runs from an event handler that has
-        /// no DrawContext and has always counted every non-tab codepoint as
-        /// one column. Keeping that exact rule here is what makes routing
-        /// clicks through this iterator a no-op on wide (CJK) lines.
+        /// Width source. The mouse path passes the stashed last-frame
+        /// context (see Editor.last_draw_ctx), so draw, cursor and clicks
+        /// all measure wide glyphs identically; null falls back to one
+        /// column per non-tab codepoint (only before the first frame,
+        /// when no mouse event can arrive anyway — mlay.valid gates it).
         ctx: ?vxfw.DrawContext,
         /// Next byte to emit.
         i: usize = 0,
@@ -5606,7 +5611,7 @@ pub const Editor = struct {
     /// the byte the hint is anchored to — phantoms move the column without
     /// moving the byte.
     fn byteColForWidth(self: *const Editor, text: []const u8, row: usize, want: u16) usize {
-        var it = RowIter.init(text, null, self.rowHints(row));
+        var it = RowIter.init(text, self.last_draw_ctx, self.rowHints(row));
         return it.byteAtCol(want);
     }
 
@@ -5696,6 +5701,7 @@ pub const Editor = struct {
 
     fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Editor = @ptrCast(@alignCast(ptr));
+        self.last_draw_ctx = ctx; // width source for the mouse path
         const max = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), max);
         self.mlay.valid = false;
