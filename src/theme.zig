@@ -19,6 +19,11 @@ pub const Palette = struct {
     gutter_active: vaxis.Color,
     bar_bg: vaxis.Color,
     bar_fg: vaxis.Color,
+    /// Visual-selection backing. Dark themes reuse bar_bg; a light theme
+    /// needs its own slot: every syntax hue is darker than the ground, so a
+    /// gray step dark enough to see washes the text out — a hue tint stays
+    /// unmistakable while keeping the luminance (and the text's contrast) up.
+    sel_bg: vaxis.Color,
     /// Dark text drawn on top of the colored mode badge.
     badge_fg: vaxis.Color,
 
@@ -85,6 +90,7 @@ pub const list = [_]Theme{
         .gutter = c(0x4b5263),
         .gutter_active = c(0x9da5b4),
         .bar_bg = c(0x3e4452),
+        .sel_bg = c(0x3e4452),
         .bar_fg = c(0xabb2bf),
         .badge_fg = c(0x282c34),
         .red = c(0xe06c75),
@@ -102,6 +108,7 @@ pub const list = [_]Theme{
         .gutter = c(0x665c54),
         .gutter_active = c(0xbdae93),
         .bar_bg = c(0x3c3836),
+        .sel_bg = c(0x3c3836),
         .bar_fg = c(0xa89984),
         .badge_fg = c(0x282828),
         .red = c(0xfb4934),
@@ -119,6 +126,7 @@ pub const list = [_]Theme{
         .gutter = c(0x3b4261),
         .gutter_active = c(0x737aa2),
         .bar_bg = c(0x292e42),
+        .sel_bg = c(0x292e42),
         .bar_fg = c(0xa9b1d6),
         .badge_fg = c(0x1a1b26),
         .red = c(0xf7768e),
@@ -136,6 +144,7 @@ pub const list = [_]Theme{
         .gutter = c(0x45475a),
         .gutter_active = c(0xb4befe),
         .bar_bg = c(0x313244),
+        .sel_bg = c(0x313244),
         .bar_fg = c(0xbac2de),
         .badge_fg = c(0x1e1e2e),
         .red = c(0xf38ba8),
@@ -153,6 +162,7 @@ pub const list = [_]Theme{
         .gutter = c(0x4c566a),
         .gutter_active = c(0xd8dee9),
         .bar_bg = c(0x3b4252),
+        .sel_bg = c(0x3b4252),
         .bar_fg = c(0xd8dee9),
         .badge_fg = c(0x2e3440),
         .red = c(0xbf616a),
@@ -167,9 +177,8 @@ pub const list = [_]Theme{
     // Light theme (Atom One Light). Every slot is picked against its real
     // consumers: accents stay dark enough that `bg`-colored text (search,
     // completion selection, yank flash, mode badge) is legible on them,
-    // bar_bg doubles as the selection background so it must read against
-    // the near-white ground, and gray must stay visibly dim on white
-    // (comments, inlay hints, which-key descriptions).
+    // and gray must stay visibly dim on white (comments, inlay hints,
+    // which-key descriptions).
     .{
         .name = "white",
         .p = .{
@@ -177,10 +186,13 @@ pub const list = [_]Theme{
             .fg = c(0x383a42),
             .gutter = c(0xc2c2c3),
             .gutter_active = c(0x696c77),
-            // Doubles as the selection background: deep enough that mid-tone
-            // syntax hues stay past the 3.0 contrast floor inside a selection.
-            .bar_bg = c(0xd6d6d8),
+            .bar_bg = c(0xdfdfe0),
             .bar_fg = c(0x424243),
+            // Blue tint, not a gray step: on a light ground a gray dark
+            // enough to see as a selection washes out the (darker-than-
+            // ground) syntax hues; a tint reads by hue instead, so it can
+            // stay light enough that selected text keeps its contrast.
+            .sel_bg = c(0xd2e3fa),
             .badge_fg = c(0xfafafa),
             .red = c(0xe45649),
             .orange = c(0x986801),

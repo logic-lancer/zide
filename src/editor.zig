@@ -5909,7 +5909,7 @@ pub const Editor = struct {
                     // below: overlaying only the selection bg under the
                     // search style's inverted fg made matched text inside a
                     // selection unreadable (contrast ~1.3 in every theme).
-                    if (abs >= s[0] and abs < s[1] and !matched) style.bg = th.bar_bg;
+                    if (abs >= s[0] and abs < s[1] and !matched) style.bg = th.sel_bg;
                 }
                 if (flash) |fr| {
                     const abs = line.start + i;
