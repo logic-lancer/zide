@@ -50,6 +50,18 @@ pub const Lsp = struct {
     sig_param: ?[]u8 = null, // active parameter's label, when there is one
     sig_active: i64 = -1, // activeParameter index, -1 when absent
     sig_total: usize = 0, // parameters.len
+    hints_id: i64 = 0,
+    /// An inlayHint response landed; `hints` is its payload (empty when the
+    /// server answered null). Taken and freed by the editor.
+    hints_done: bool = false,
+    hints: []Hint = &.{},
+    /// Row window the in-flight request asked for. zls answers with every
+    /// hint in every AST node the range touches, so a 45-row request whose
+    /// range reaches a container's opening line comes back with the whole
+    /// file (measured: 1612 hints for editor.zig). The reply is cut back to
+    /// this window before anything is duplicated.
+    hints_lo: u32 = 0,
+    hints_hi: u32 = 0,
     /// Inbox drained by the editor: one entry per publishDiagnostics.
     publishes: std.ArrayListUnmanaged(Publish) = .{},
     /// Last hover result, owned; the editor takes and frees it.
@@ -93,6 +105,19 @@ pub const Lsp = struct {
         end_col: u32,
         new_text: []u8, // owned
     };
+
+    /// One inlay hint: 0-based row, 0-based BYTE column (utf-8 position
+    /// encoding was negotiated) and the label with zls's padding already
+    /// folded in. Labels are ASCII-only by construction (see onInlayHint),
+    /// so one byte is one display column.
+    pub const Hint = struct { line: u32, col: u32, label: []u8 };
+
+    /// Hard cap on one viewport's hints. editor.zig's densest 45-row window
+    /// holds 128 after row filtering; anything past this is a runaway server.
+    const max_hints = 512;
+    /// Labels are cut here (measured max: 20 bytes) so a hint can never
+    /// dominate a row.
+    const max_hint_label = 32;
 
     // ---- lifecycle --------------------------------------------------------
 
@@ -143,6 +168,7 @@ pub const Lsp = struct {
                             .activeParameterSupport = true,
                         },
                     },
+                    .inlayHint = .{ .dynamicRegistration = false },
                 },
             },
         });
@@ -180,6 +206,7 @@ pub const Lsp = struct {
         freeEdits(self.alloc, self.rename_edits);
         if (self.sig_label) |t| self.alloc.free(t);
         if (self.sig_param) |t| self.alloc.free(t);
+        freeHints(self.alloc, self.hints);
         self.* = undefined;
     }
 
@@ -326,6 +353,32 @@ pub const Lsp = struct {
         });
     }
 
+    /// Hints for rows [lo, hi]. The end line is inclusive in practice (zls
+    /// returns hints on it) and both characters are 0 on purpose: zls
+    /// resolves a position as line_start + character with no clamping, so a
+    /// non-zero end character runs into the next declaration and the answer
+    /// balloons to the whole file (measured).
+    pub fn inlayHint(self: *Lsp, uri: []const u8, lo: u32, hi: u32) void {
+        // An inverted range is fatal: zls 0.14 never answers it and the
+        // process is dead by the next request (measured). The editor cannot
+        // build one, and this is the belt to that pair of braces.
+        if (lo > hi) return;
+        self.hints_lo = lo;
+        self.hints_hi = hi;
+        self.hints_id = self.request("textDocument/inlayHint", .{
+            .textDocument = .{ .uri = uri },
+            .range = .{
+                .start = .{ .line = @as(i64, lo), .character = @as(i64, 0) },
+                .end = .{ .line = @as(i64, hi), .character = @as(i64, 0) },
+            },
+        });
+    }
+
+    pub fn freeHints(alloc: std.mem.Allocator, hints: []Hint) void {
+        for (hints) |h| alloc.free(h.label);
+        alloc.free(hints);
+    }
+
     // ---- receiving --------------------------------------------------------
 
     /// Drain the pipes and handle every complete frame. Returns true when
@@ -434,6 +487,11 @@ pub const Lsp = struct {
         if (self.sig_id != 0 and id == self.sig_id) {
             self.sig_id = 0;
             self.onSignatureHelp(root);
+            return;
+        }
+        if (self.hints_id != 0 and id == self.hints_id) {
+            self.hints_id = 0;
+            self.onInlayHint(root);
             return;
         }
     }
@@ -755,6 +813,76 @@ pub const Lsp = struct {
         }
     }
 
+    /// zls 0.14 sends `label` as a plain string (1612/1612 measured), never
+    /// InlayHintLabelPart[], and pads exactly one way: kind 2 (parameter)
+    /// always paddingRight, kind 1 (type) never pads. The padding is folded
+    /// into the stored label so the editor's column math is `label.len`.
+    fn onInlayHint(self: *Lsp, root: std.json.Value) void {
+        freeHints(self.alloc, self.hints);
+        self.hints = &.{};
+        self.hints_done = true;
+        const arr = switch (objGet(root, "result") orelse return) {
+            .array => |a| a,
+            else => return, // null: nothing to show here
+        };
+        var list: std.ArrayListUnmanaged(Hint) = .{};
+        errdefer {
+            for (list.items) |h| self.alloc.free(h.label);
+            list.deinit(self.alloc);
+        }
+        for (arr.items) |item| {
+            if (list.items.len >= max_hints) break;
+            const pos = objGet(item, "position") orelse continue;
+            const ln = getInt(pos, "line") orelse continue;
+            const ch = getInt(pos, "character") orelse continue;
+            if (ln < 0 or ch < 0) continue;
+            const line: u32 = @intCast(ln);
+            // The reply covers whole AST nodes, not the request: cut it back
+            // to the window before duplicating anything.
+            if (line < self.hints_lo or line > self.hints_hi) continue;
+            const text = getStr(item, "label") orelse continue; // parts[]: skipped, not half-drawn
+            if (text.len == 0) continue;
+            var buf: [max_hint_label + 2]u8 = undefined;
+            var n: usize = 0;
+            if (getBool(item, "paddingLeft")) {
+                buf[n] = ' ';
+                n += 1;
+            }
+            var ok = true;
+            for (text) |c| {
+                if (n >= max_hint_label + 1) break;
+                // ASCII only: one byte has to be one display column, or the
+                // mouse mapping would need a DrawContext it cannot reach.
+                // 0 of 1612 measured labels contained a byte outside this.
+                if (c < 0x20 or c > 0x7e) {
+                    ok = false;
+                    break;
+                }
+                buf[n] = c;
+                n += 1;
+            }
+            if (!ok or n == 0) continue;
+            if (getBool(item, "paddingRight")) {
+                buf[n] = ' ';
+                n += 1;
+            }
+            const owned = self.alloc.dupe(u8, buf[0..n]) catch break;
+            list.append(self.alloc, .{ .line = line, .col = @intCast(ch), .label = owned }) catch {
+                self.alloc.free(owned);
+                break;
+            };
+        }
+        // zls returns them in analysis order (measured: NOT ascending). Both
+        // the editor's per-row lookup and RowIter need (line, col) order.
+        std.mem.sort(Hint, list.items, {}, lessHint);
+        self.hints = list.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    fn lessHint(_: void, a: Hint, b: Hint) bool {
+        if (a.line != b.line) return a.line < b.line;
+        return a.col < b.col;
+    }
+
     // ---- json helpers (switch-based: no tagged-union equality) ------------
 
     fn objGet(v: std.json.Value, key: []const u8) ?std.json.Value {
@@ -775,6 +903,13 @@ pub const Lsp = struct {
         return switch (objGet(v, key) orelse return null) {
             .integer => |i| i,
             else => null,
+        };
+    }
+
+    fn getBool(v: std.json.Value, key: []const u8) bool {
+        return switch (objGet(v, key) orelse return false) {
+            .bool => |b| b,
+            else => false,
         };
     }
 

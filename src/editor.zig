@@ -147,6 +147,33 @@ pub const Editor = struct {
     /// zero, so overlapping arm sites can never multiply into extra chains.
     ticks: u8 = 0,
 
+    /// nvim-lsp style inlay hints for the CURRENT buffer's viewport.
+    /// Editor-level, not per-buffer: they are viewport- and version-scoped,
+    /// so switching buffers discards them instead of caching a set that will
+    /// be wrong by the time it is used again. `:InlayHints` / Space i.
+    hints_on: bool = false,
+    hints: std.ArrayListUnmanaged(Hint) = .{},
+    /// What `hints` describes. `hints_ver` is the buffer's lsp_version at
+    /// request time (-1 = nothing valid); [hints_top, hints_bot] is the row
+    /// window it covers. Any mismatch and the list is not drawn (rowHints).
+    hints_buf: usize = 0,
+    hints_ver: i32 = -1,
+    hints_top: usize = 0,
+    hints_bot: usize = 0,
+    /// A request is out; the reply lands a tick later and is dropped unless
+    /// the buffer is still where it was.
+    hints_req: ?struct { buf: usize, ver: i32, top: usize, bot: usize } = null,
+
+    /// One inlay hint positioned in the buffer: 0-based row, 0-based byte
+    /// column, and the ASCII label with zls's padding already in it. The
+    /// label owns its memory; `label.len` IS its width in cells.
+    const Hint = struct { row: usize, col: usize, label: []u8 };
+
+    /// Rows of margin above and below the viewport in a hint request: a
+    /// small scroll then costs no round trip, and zls charges the same
+    /// 5 ms either way.
+    const hint_margin: usize = 20;
+
     const TermView = enum { none, split, vert, float };
 
     /// Geometry captured during draw so mouse clicks can be hit-tested.
@@ -176,7 +203,7 @@ pub const Editor = struct {
         selected: usize = 0,
 
         const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols, qf };
-        /// Raised from 64: the cheatsheet sits at 69 rows and the
+        /// Raised from 64: the cheatsheet sits at 71 rows and the
         /// quickfix picker holds up to this many reference hits —
         /// popupMatches silently drops anything past the cap.
         const max_items = 96;
@@ -351,6 +378,7 @@ pub const Editor = struct {
         "Space g p    preview hunk",
         "Space g r    reset hunk",
         "Space g s    stage hunk",
+        "Space i      toggle inlay hints",
         "Space q      quickfix picker",
         "Space n      toggle line numbers",
         "Space r n    relative numbers",
@@ -402,6 +430,7 @@ pub const Editor = struct {
         ":LspRestart  restart zls",
         ":Format      zig fmt buffer",
         ":AutoFormat  format on save",
+        ":InlayHints  toggle inlay hints",
         "s (on dash)  restore session",
     };
 
@@ -410,7 +439,7 @@ pub const Editor = struct {
     /// others are small but unhinted like obj_i/obj_a/indent ops).
     fn whichKeyRows(p: Pending, visual: bool) ?[]const []const u8 {
         return switch (p) {
-            .leader => if (visual) &.{"/  toggle comment"} else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
+            .leader => if (visual) &.{"/  toggle comment"} else &.{ "b  buffer picker", "c  +cheatsheet", "e  toggle tree", "f  +find", "g  +git", "i  inlay hints", "n  toggle numbers", "q  quickfix list", "r  +relative", "t  theme picker", "x  close buffer", "/  toggle comment" },
             .leader_f => &.{ "f  find files", "w  live grep", "o  recent files", "s  document symbols", "z  buffer lines", "m  format buffer" },
             .leader_c => &.{ "h  cheatsheet", "r  rename symbol" },
             .leader_r => &.{"n  toggle relative numbers"},
@@ -1170,6 +1199,8 @@ pub const Editor = struct {
         if (self.lsp) |*l| l.deinit();
         if (self.lsp_root) |r| self.alloc.free(r);
         self.renameReqClear();
+        for (self.hints.items) |h| self.alloc.free(h.label);
+        self.hints.deinit(self.alloc);
     }
 
     pub fn widget(self: *Editor) vxfw.Widget {
@@ -1244,6 +1275,7 @@ pub const Editor = struct {
         self.yank_flash = null;
         self.lsp_req = null; // indices shift; a pending gd must not push a stale jump
         self.renameReqClear(); // indices shift; a pending rename target must not apply
+        self.hintsClear(); // indices shift; hints_buf would otherwise point at the wrong buffer
         self.cmpClose();
         self.lspDidClose(b);
         var removed = self.buffers.orderedRemove(self.active);
@@ -1304,6 +1336,7 @@ pub const Editor = struct {
         self.lsp_req = null;
         self.cmp_req = null;
         self.renameReqClear();
+        self.hintsClear(); // every lsp_version resets to 0 below; a stale hints_ver of 0 would match
         for (self.buffers.items) |*b| {
             for (b.diags.items) |d| self.alloc.free(d.message);
             b.diags.clearRetainingCapacity();
@@ -1464,10 +1497,15 @@ pub const Editor = struct {
             self.lsp_req = null;
             self.cmp_req = null;
             self.renameReqClear();
+            self.hintsClear();
             self.setStatus("zls exited — LSP off", .{});
             return true;
         }
         const l = &self.lsp.?;
+        // A didChange going out on THIS tick is the debounce: while the user
+        // types, every tick flushes and no hint request is made. The first
+        // quiet tick asks.
+        const flushed = self.buffers.items.len > 0 and self.cur().lsp_dirty;
         if (l.initialized) {
             for (self.buffers.items) |*b| {
                 if (!b.isZig()) continue;
@@ -1478,6 +1516,7 @@ pub const Editor = struct {
                 self.lspFlushChange(b);
             }
         }
+        self.hintTick(flushed);
         // FIFO: pop() would apply the OLDEST publish last, resurrecting
         // diagnostics that an immediately-following empty publish had
         // already cleared (last publish must win per LSP semantics).
@@ -1555,7 +1594,78 @@ pub const Editor = struct {
             self.applySignature(label, param, l.sig_active, l.sig_total);
             changed = true;
         }
+        if (l.hints_done) {
+            l.hints_done = false;
+            const hs = l.hints;
+            l.hints = &.{};
+            self.applyHints(hs);
+            changed = true;
+        }
         return changed;
+    }
+
+    /// One inlayHint request per settled version of the current buffer,
+    /// covering the viewport plus a margin.
+    fn hintTick(self: *Editor, flushed: bool) void {
+        if (!self.hints_on or flushed) return;
+        if (self.hints_req != null) return; // one in flight at a time
+        if (self.buffers.items.len == 0) return;
+        const l = if (self.lsp) |*p| p else return;
+        if (!l.initialized) return;
+        const b = self.cur();
+        // A queued didChange means zls's copy is older than this buffer, and
+        // every position in the answer would be against the wrong text.
+        if (!b.isZig() or !b.lsp_opened or b.lsp_dirty) return;
+        const last = b.lines.items.len -| 1;
+        const vis_top = @min(b.scroll, last);
+        const vis_bot = @min(vis_top + self.last_height -| 1, last);
+        // Already covered, same buffer, same version: nothing to do.
+        if (self.hints_buf == self.active and self.hints_ver == b.lsp_version and
+            self.hints_top <= vis_top and self.hints_bot >= vis_bot) return;
+        const lo = vis_top -| hint_margin;
+        const hi = @min(vis_bot + hint_margin, last);
+        if (lo > hi) return; // unreachable by construction; an inverted range kills zls
+        const uri = self.bufUri(b) orelse return;
+        defer self.alloc.free(uri);
+        l.inlayHint(uri, @intCast(lo), @intCast(hi));
+        self.hints_req = .{ .buf = self.active, .ver = b.lsp_version, .top = lo, .bot = hi };
+    }
+
+    fn hintsClear(self: *Editor) void {
+        for (self.hints.items) |h| self.alloc.free(h.label);
+        self.hints.clearRetainingCapacity();
+        self.hints_ver = -1; // no real lsp_version is ever negative
+        self.hints_req = null;
+    }
+
+    /// The inlayHint answer, ~one poll tick after the request. Dropped
+    /// wholesale unless the buffer is still exactly where the request was
+    /// made — a hint list against a version that moved on is worse than none.
+    fn applyHints(self: *Editor, hs: []Lsp.Hint) void {
+        defer Lsp.freeHints(self.alloc, hs);
+        const req = self.hints_req orelse return; // toggled off, restarted, buffer closed
+        self.hints_req = null;
+        if (!self.hints_on) return;
+        if (req.buf >= self.buffers.items.len or req.buf != self.active) return;
+        const b = &self.buffers.items[req.buf];
+        if (b.lsp_version != req.ver or b.lsp_dirty) return;
+        self.hintsClear();
+        for (hs) |h| {
+            if (h.line >= b.lines.items.len) continue;
+            // Anchors must sit strictly inside the row: RowIter emits no
+            // phantom past end of text, and zls has never produced one
+            // (0 of 1612 measured).
+            if (h.col >= b.lineLen(h.line)) continue;
+            const label = self.alloc.dupe(u8, h.label) catch break;
+            self.hints.append(self.alloc, .{ .row = h.line, .col = h.col, .label = label }) catch {
+                self.alloc.free(label);
+                break;
+            };
+        }
+        self.hints_buf = req.buf;
+        self.hints_ver = req.ver;
+        self.hints_top = req.top;
+        self.hints_bot = req.bot;
     }
 
     /// Byte offset of a 0-based LSP (line, character) in `b`, or null when the
@@ -3316,6 +3426,7 @@ pub const Editor = struct {
                     'e' => self.toggleTree(),
                     'f' => self.pending = .leader_f,
                     'g' => self.pending = .leader_g,
+                    'i' => self.toggleHints(),
                     'n' => self.numbers = !self.numbers,
                     'q' => self.openPopup(.qf),
                     'r' => self.pending = .leader_r,
@@ -4541,7 +4652,7 @@ pub const Editor = struct {
                 return self.completePath(arg, sp + 1);
             return;
         }
-        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart", "Format", "AutoFormat" };
+        const cmds = [_][]const u8{ "q", "q!", "qa", "qa!", "w", "wq", "x", "e", "bn", "bp", "bd", "bd!", "ls", "theme", "themes", "noh", "rename", "LspRestart", "Format", "AutoFormat", "InlayHints" };
         return self.completeFrom(&cmds, s, 0);
     }
 
@@ -4645,6 +4756,7 @@ pub const Editor = struct {
             LspRestart,
             Format,
             AutoFormat,
+            InlayHints,
         };
         if (std.meta.stringToEnum(Cmd, head)) |cmd| switch (cmd) {
             // :q closes the current buffer (quits when it is the last one).
@@ -4686,6 +4798,7 @@ pub const Editor = struct {
                 self.format_on_save = !self.format_on_save;
                 self.setStatus("format on save: {s}", .{if (self.format_on_save) "on" else "off"});
             },
+            .InlayHints => self.toggleHints(),
         } else if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
             if (self.buffers.items.len == 0) return;
             const b = self.cur();
@@ -5203,6 +5316,14 @@ pub const Editor = struct {
         self.focus = .tree;
     }
 
+    /// `:InlayHints` / `Space i`. The request goes out on the next poll tick
+    /// (the key press that ran this re-arms the chain on its way out).
+    fn toggleHints(self: *Editor) void {
+        self.hints_on = !self.hints_on;
+        if (!self.hints_on) self.hintsClear();
+        self.setStatus("inlay hints: {s}", .{if (self.hints_on) "on" else "off"});
+    }
+
     /// NvimTree-ish keys: j/k move, Enter/l open or toggle dir, h collapse /
     /// jump to parent, R refresh, q or C-n close, C-l back to the editor.
     /// mouse=a: clicks focus panes / place the cursor, tab clicks switch
@@ -5266,7 +5387,7 @@ pub const Editor = struct {
                     self.enterVisual(.visual);
                 const li = @min(b.scroll + (m.row - L.text_top), b.lines.items.len -| 1);
                 b.row = li;
-                b.col = byteColForWidth(b.lineText(li), m.col -| (L.tree_w + L.gutter));
+                b.col = self.byteColForWidth(b.lineText(li), li, m.col -| (L.tree_w + L.gutter));
                 return ctx.consumeAndRedraw();
             }
             return;
@@ -5343,7 +5464,7 @@ pub const Editor = struct {
             if (li < b.lines.items.len) {
                 b.row = li;
                 const want: u16 = m.col -| (L.tree_w + L.gutter);
-                b.col = byteColForWidth(b.lineText(li), want);
+                b.col = self.byteColForWidth(b.lineText(li), li, want);
                 b.goal_col = b.col;
                 // Double-click on the same spot selects the word under it.
                 const now = std.time.milliTimestamp();
@@ -5400,6 +5521,10 @@ pub const Editor = struct {
         i: usize = 0,
         /// Display column the next unit starts at; 0 is the first text cell.
         disp: u16 = 0,
+        /// Inlay hints anchored in this row, sorted by `col`, `col` < text.len.
+        hints: []const Hint = &.{},
+        /// Next unhandled hint.
+        hi: usize = 0,
 
         const tab_stop: u16 = 4;
 
@@ -5412,13 +5537,32 @@ pub const Editor = struct {
             disp: u16,
             width: u16,
             is_tab: bool,
+            /// Non-empty for a hint's phantom cells; `start == end` there,
+            /// since a hint occupies no bytes.
+            label: []const u8 = "",
         };
 
-        fn init(text: []const u8, ctx: ?vxfw.DrawContext) RowIter {
-            return .{ .text = text, .ctx = ctx };
+        fn init(text: []const u8, ctx: ?vxfw.DrawContext, hints: []const Hint) RowIter {
+            return .{ .text = text, .ctx = ctx, .hints = hints };
+        }
+
+        /// A hint anchored at the byte about to be emitted renders BEFORE
+        /// it: `v«: u32» = 1` and `f(«a: »1)` are the same rule — zls puts a
+        /// type hint's position on the byte after the identifier and a
+        /// parameter hint's on the first byte of the argument.
+        fn hintPending(self: *const RowIter) bool {
+            return self.hi < self.hints.len and self.hints[self.hi].col == self.i;
         }
 
         fn next(self: *RowIter) ?Unit {
+            if (self.hintPending()) {
+                const h = self.hints[self.hi];
+                self.hi += 1;
+                const w: u16 = @intCast(h.label.len); // ASCII: 1 byte == 1 cell
+                const d = self.disp;
+                self.disp = d + w;
+                return .{ .start = self.i, .end = self.i, .disp = d, .width = w, .is_tab = false, .label = h.label };
+            }
             if (self.i >= self.text.len) return null;
             const cp_len = std.unicode.utf8ByteSequenceLength(self.text[self.i]) catch 1;
             const end = @min(self.i + cp_len, self.text.len);
@@ -5438,13 +5582,18 @@ pub const Editor = struct {
 
         /// Display column at which byte `byte` renders.
         fn colOf(self: *RowIter, byte: usize) u16 {
-            while (self.i < byte) {
+            // A hint anchored exactly at `byte` renders immediately before
+            // it, so the cursor sitting on that byte belongs after the hint
+            // cells — hence the second clause.
+            while (self.i < byte or (self.i == byte and self.hintPending())) {
                 _ = self.next() orelse break;
             }
             return self.disp;
         }
 
-        /// Inverse: the byte whose display column reaches `want`.
+        /// Inverse: the byte whose display column reaches `want`. A phantom
+        /// advances `disp` without advancing `i`, so a click inside a hint's
+        /// cells returns the anchor byte automatically.
         fn byteAtCol(self: *RowIter, want: u16) usize {
             while (self.disp < want) {
                 _ = self.next() orelse break;
@@ -5453,12 +5602,41 @@ pub const Editor = struct {
         }
     };
 
-    /// Inverse of displayCol: byte offset whose display column reaches `want`.
-    /// No DrawContext here (mouse events carry an EventContext), so every
-    /// non-tab codepoint counts as one column — see RowIter.ctx.
-    fn byteColForWidth(text: []const u8, want: u16) usize {
-        var it = RowIter.init(text, null);
+    /// Inverse of displayCol. A click anywhere in a hint's cells lands on
+    /// the byte the hint is anchored to — phantoms move the column without
+    /// moving the byte.
+    fn byteColForWidth(self: *const Editor, text: []const u8, row: usize, want: u16) usize {
+        var it = RowIter.init(text, null, self.rowHints(row));
         return it.byteAtCol(want);
+    }
+
+    /// The current buffer's hints for `row`, or empty when the stored list
+    /// does not describe what is on screen right now. Every consumer of
+    /// column math goes through here, so the screen, the cursor and the
+    /// mouse always agree about whether hints exist.
+    ///
+    /// `b.lsp_dirty` is part of the test on purpose: it is set the instant
+    /// the buffer is edited, so hints disappear on the very first frame
+    /// after a keystroke instead of drawing at pre-edit offsets for a tick.
+    /// They come back one or two ticks after typing stops.
+    fn rowHints(self: *const Editor, row: usize) []const Hint {
+        if (!self.hints_on or self.hints.items.len == 0) return &.{};
+        if (self.buffers.items.len == 0 or self.hints_buf != self.active) return &.{};
+        const b = &self.buffers.items[self.active];
+        if (b.lsp_dirty or self.hints_ver != b.lsp_version) return &.{};
+        if (row >= b.lines.items.len) return &.{};
+        const hs = self.hints.items;
+        var lo: usize = 0;
+        while (lo < hs.len and hs[lo].row < row) lo += 1;
+        var hi = lo;
+        while (hi < hs.len and hs[hi].row == row) hi += 1;
+        // Belt and braces to the version guard: a hint whose byte offset no
+        // longer exists on this row would draw at a wrong column, so drop
+        // the row's hints rather than draw a lie. RowIter relies on this
+        // (every phantom must sit strictly inside the text).
+        const len = b.lineLen(row);
+        for (hs[lo..hi]) |h| if (h.col >= len) return &.{};
+        return hs[lo..hi];
     }
 
     fn handleTree(self: *Editor, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
@@ -5566,6 +5744,11 @@ pub const Editor = struct {
 
         // Paint the theme background over the whole text area first.
         const base = b.hl.baseStyle();
+        // nvim's LspInlayHint: dim + italic on the buffer background. Never
+        // any of the byte-keyed layers.
+        var hint_style = base;
+        hint_style.fg = th.gray;
+        hint_style.italic = true;
         var fill_row: u16 = text_top;
         while (fill_row < text_top + text_rows) : (fill_row += 1) {
             var fill_col: u16 = 0;
@@ -5652,10 +5835,25 @@ pub const Editor = struct {
             else
                 null;
             var cspan: ?ColorSpan = findColorSpan(text, 0);
-            var it = RowIter.init(text, ctx);
+            var it = RowIter.init(text, ctx, self.rowHints(li));
             var col: u16 = x0 + gutter;
             while (col < text_right) {
                 const u = it.next() orelse break;
+                if (u.label.len > 0) {
+                    // Phantom cells carry the hint style only: search match,
+                    // selection, yank flash, matchparen and illuminate all
+                    // key on a BYTE offset, and a hint owns no bytes.
+                    // Clipped at text_right exactly like a tab run.
+                    var k: usize = 0;
+                    while (k < u.label.len and col < text_right) : (k += 1) {
+                        surface.writeCell(col, draw_row, .{
+                            .char = .{ .grapheme = u.label[k .. k + 1], .width = 1 },
+                            .style = hint_style,
+                        });
+                        col += 1;
+                    }
+                    continue;
+                }
                 const i = u.start;
                 const end = u.end;
                 const slice = text[i..end];
@@ -6023,7 +6221,7 @@ pub const Editor = struct {
     /// Display column of the cursor within its line (tabs expand to 4-stops).
     fn displayCol(self: *Editor, ctx: vxfw.DrawContext) u16 {
         const b = self.cur();
-        var it = RowIter.init(b.lineText(b.row), ctx);
+        var it = RowIter.init(b.lineText(b.row), ctx, self.rowHints(b.row));
         return it.colOf(b.col);
     }
 
