@@ -164,6 +164,29 @@ pub const list = [_]Theme{
         .purple = c(0xb48ead),
         .gray = c(0x616e88),
     } },
+    // Light theme (Atom One Light). Every slot is picked against its real
+    // consumers: accents stay dark enough that `bg`-colored text (search,
+    // completion selection, yank flash, mode badge) is legible on them,
+    // bar_bg doubles as the selection background so it must read against
+    // the near-white ground, and gray must stay visibly dim on white
+    // (comments, inlay hints, which-key descriptions).
+    .{ .name = "white", .p = .{
+        .bg = c(0xfafafa),
+        .fg = c(0x383a42),
+        .gutter = c(0xc2c2c3),
+        .gutter_active = c(0x696c77),
+        .bar_bg = c(0xdfdfe0),
+        .bar_fg = c(0x424243),
+        .badge_fg = c(0xfafafa),
+        .red = c(0xe45649),
+        .orange = c(0x986801),
+        .yellow = c(0xc18401),
+        .green = c(0x50a14f),
+        .cyan = c(0x0184bc),
+        .blue = c(0x4078f2),
+        .purple = c(0xa626a4),
+        .gray = c(0xa0a1a7),
+    } },
 };
 
 /// Space-separated theme names, built at comptime (for :themes / errors).
