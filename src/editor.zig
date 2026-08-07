@@ -402,6 +402,7 @@ pub const Editor = struct {
         "Ctrl-o/i     jumplist back/fwd",
         "Ctrl-s       save file",
         "Ctrl-n/p     (insert) complete word",
+        "Ctrl-b/e     (insert) line start/end",
         "Ctrl-k       (insert) signature help",
         "Ctrl-Shift-c copy to clipboard",
         "Ctrl-d/u     half-page down/up",
@@ -4336,6 +4337,19 @@ pub const Editor = struct {
         // Ctrl-k is a different handler) and it inserts nothing.
         if (key.mods.ctrl and key.codepoint == 'k') {
             self.lspSignature(true);
+            return ctx.consumeAndRedraw();
+        }
+        // NvChad insert-mode navigation: <C-b> beginning / <C-e> end of
+        // line. The h/j/k/l variants are deliberately omitted — Ctrl-h and
+        // Ctrl-j alias to Backspace/Enter in legacy terminals, and Ctrl-k
+        // is the (also-NvChad) signature-help binding above.
+        if (key.mods.ctrl and (key.codepoint == 'b' or key.codepoint == 'e')) {
+            // Movement invalidates the completion menu like every other
+            // cursor-moving key (its region math assumes the cursor stays
+            // put); the signature panel survives — same row.
+            self.cmpClose();
+            b.col = if (key.codepoint == 'b') 0 else b.lineLen(b.row);
+            b.goal_col = b.col;
             return ctx.consumeAndRedraw();
         }
         if (self.cmp.active) {
