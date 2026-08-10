@@ -1301,7 +1301,7 @@ pub const Editor = struct {
 
     fn switchTheme(self: *Editor, arg: ?[]const u8) !void {
         const t = if (arg) |name|
-            themes.find(name) orelse return self.setStatus("no theme '{s}' ({s})", .{ name, themes.names })
+            themes.find(name) orelse return self.setStatus("no theme '{s}' -- :themes lists them", .{name})
         else
             themes.next(self.theme);
         try self.setTheme(t);
@@ -4812,7 +4812,7 @@ pub const Editor = struct {
             .@"bd!" => self.closeBuffer(ctx, true),
             .ls => self.openPopup(.buffers),
             .theme => try self.switchTheme(it.next()),
-            .themes => self.setStatus("themes: {s}", .{themes.names}),
+            .themes => self.openPopup(.themes),
             .noh => self.search_hl = false,
             .rename => try self.renameSymbol(it.next() orelse return self.setStatus("usage: :rename <new-name>", .{})),
             .LspRestart => self.lspRestart(),
