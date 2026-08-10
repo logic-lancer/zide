@@ -296,13 +296,6 @@ pub const list = [_]Theme{
     },
 };
 
-/// Space-separated theme names, built at comptime (for :themes / errors).
-pub const names = blk: {
-    var s: []const u8 = "";
-    for (list, 0..) |t, i| s = s ++ (if (i == 0) "" else " ") ++ t.name;
-    break :blk s;
-};
-
 pub fn find(name: []const u8) ?*const Theme {
     for (&list) |*t| {
         if (std.mem.eql(u8, t.name, name)) return t;
