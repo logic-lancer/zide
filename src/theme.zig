@@ -215,6 +215,11 @@ pub const list = [_]Theme{
     // dark enough for bg-colored text on them (search/badge/flash), a hue-
     // tinted sel_bg (cool tint on the warm grounds so it reads by hue), and
     // any stock hue measured near/below 3.0 on its ground runs darker here.
+    // Known cost of the cool tint (same family as white's red-in-selection
+    // note): blue/cyan foregrounds sit closest to it in hue and lose the
+    // most contrast on it -- solarized-light blue ~2.8 and latte cyan ~2.7
+    // inside a selection. Accepted: washed-out, not invisible, and darkening
+    // those hues would cost their identity on the ground.
     .{
         .name = "gruvbox-light",
         .p = .{

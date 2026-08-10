@@ -6349,6 +6349,12 @@ pub const Editor = struct {
         const left_style: vaxis.Style = if (diag_at_cursor != null) .{ .fg = th.gutter, .bg = th.bar_bg } else bar_style;
         end = writeText(surface, ctx, end, status_row, left, left_style);
 
+        // A status message owns the rest of the row: the breadcrumb and
+        // position segment would overwrite its tail (":themes" with nine
+        // names was losing the last entries). Messages clear on the next
+        // keystroke, so the position is only ever hidden for that moment.
+        if (self.status_len > 0) return;
+
         if (b) |buf| {
             var crumbs: [4]Crumb = undefined;
             const nc = self.breadcrumbs(&crumbs);
