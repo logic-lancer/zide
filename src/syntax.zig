@@ -18,7 +18,7 @@ pub const Highlighter = struct {
     theme: *const themes.Theme = &themes.list[0],
     /// Per-byte index into `styles`; 0 = default style.
     style_ids: []u8 = &.{},
-    styles: std.ArrayListUnmanaged(vaxis.Style) = .{},
+    styles: std.ArrayListUnmanaged(vaxis.Style) = .empty,
     name_ids: std.StringHashMapUnmanaged(u8) = .{},
 
     pub fn init(alloc: std.mem.Allocator) !Highlighter {

@@ -37,12 +37,12 @@
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#cc9154d5f4afa3fdfd289157f195ec67804ef437",
-            .hash = "vaxis-0.5.1-BWNV_MYNCQDO92x2PTpsfv6GwDHmjL98rf6iL3pbMLj4",
+            .url = "https://github.com/rockorager/libvaxis/archive/6cab03f8a3faeb58bddf334343889a7f685ba7a7.tar.gz",
+            .hash = "vaxis-0.6.0-BWNV_FcoCgB3Q_LTiQet_GeS23Bd7e224eHloS8PanKZ",
         },
         .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b4b72c903e69998fc88e27e154a5e3cc9166551b",
-            .hash = "tree_sitter-0.25.0-8heIf51vAQConvVIgvm-9mVIbqh7yabZYqPXfOpS3YoG",
+            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#0cf58172e61f6fdd16f681cde42b4acb531a23db",
+            .hash = "tree_sitter-0.26.0-8heIf3CaAQDeVTQc0DMSBhbQAEx5aF-dTen4_LPxMgrv"
         },
         .tree_sitter_zig = .{
             .url = "https://github.com/tree-sitter-grammars/tree-sitter-zig/archive/refs/tags/v1.1.2.tar.gz",

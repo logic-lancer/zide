@@ -15,14 +15,14 @@ pub const Term = struct {
     alloc: std.mem.Allocator,
     fd: std.posix.fd_t,
     pid: std.posix.pid_t,
-    lines: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .{},
+    lines: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .empty ,
     col: usize = 0,
     esc: enum { none, esc, csi, osc, osc_esc } = .none,
     exited: bool = false,
 
-    pub fn spawn(alloc: std.mem.Allocator, cols: u16, rows: u16) !Term {
-        const master = try std.posix.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
-        errdefer std.posix.close(master);
+    pub fn spawn(io: std.Io, alloc: std.mem.Allocator, cols: u16, rows: u16) !Term {
+        const master = std.posix.system.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, @as(c_uint, 0));
+        errdefer _ = std.posix.system.close(master);
 
         var unlock: c_int = 0;
         if (std.os.linux.ioctl(master, TIOCSPTLCK, @intFromPtr(&unlock)) != 0) return error.PtyUnlock;
@@ -32,43 +32,45 @@ pub const Term = struct {
         var path_buf: [32]u8 = undefined;
         const slave_path = try std.fmt.bufPrintZ(&path_buf, "/dev/pts/{d}", .{ptn});
 
-        const pid = try std.posix.fork();
+        const pid = std.posix.system.fork();
         if (pid == 0) {
             // Child: new session, adopt the slave as the controlling tty.
             _ = std.os.linux.setsid();
-            const slave = std.posix.openZ(slave_path, .{ .ACCMODE = .RDWR }, 0) catch std.posix.exit(1);
-            _ = std.os.linux.ioctl(slave, TIOCSCTTY, 0);
-            std.posix.dup2(slave, 0) catch std.posix.exit(1);
-            std.posix.dup2(slave, 1) catch std.posix.exit(1);
-            std.posix.dup2(slave, 2) catch std.posix.exit(1);
-            if (slave > 2) std.posix.close(slave);
-            std.posix.close(master);
+            const slave = try std.Io.Dir.openFileAbsolute(io, slave_path, .{.mode = .read_write});
+            _ = std.os.linux.ioctl(slave.handle, TIOCSCTTY, 0);
+            if (std.posix.system.dup2(slave.handle, 0) != 0) std.process.exit(1);
+            if (std.posix.system.dup2(slave.handle, 1) != 0) std.process.exit(1);
+            if (std.posix.system.dup2(slave.handle, 2) != 0) std.process.exit(1);
+            if (slave.handle > 2) _ = std.posix.system.close(slave.handle);
+            _ = std.posix.system.close(master);
 
-            const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+            const shell = std.posix.system.getenv("SHELL") orelse "/bin/sh";
             var shell_buf: [128]u8 = undefined;
-            const shell_z = std.fmt.bufPrintZ(&shell_buf, "{s}", .{shell}) catch std.posix.exit(1);
-            const argv = [_:null]?[*:0]const u8{shell_z};
-            const envp = [_:null]?[*:0]const u8{ "TERM=dumb", "PS1=$ " };
-            std.posix.execveZ(shell_z, &argv, &envp) catch {};
-            std.posix.exit(1);
+            const shell_z = std.fmt.bufPrintZ(&shell_buf, "{s}", .{shell}) catch std.process.exit(1);
+            const argv = [_][]const u8{shell_z};
+            var env_map = std.process.Environ.Map.init(alloc);
+            env_map.put("TERM", "dumb") catch std.process.exit(1);
+            env_map.put("PS1", "$") catch std.process.exit(1);
+            std.process.replace(io, .{.argv = &argv, .environ_map = &env_map}) catch {};
+            std.process.exit(1);
         }
 
         // Parent: non-blocking reads, initial window size.
-        const fl = try std.posix.fcntl(master, std.posix.F.GETFL, 0);
-        _ = try std.posix.fcntl(master, std.posix.F.SETFL, fl | @as(usize, 1 << 11)); // O_NONBLOCK
+        const fl = std.posix.system.fcntl(master, std.posix.F.GETFL, @as(c_int, 0));
+        _ = std.posix.system.fcntl(master, std.posix.F.SETFL, fl | @as(c_int, 1 << 11)); // O_NONBLOCK
 
         var t: Term = .{ .alloc = alloc, .fd = master, .pid = pid };
         t.resize(cols, rows);
-        try t.lines.append(alloc, .{});
+        try t.lines.append(alloc, .empty);
         return t;
     }
 
     pub fn deinit(self: *Term) void {
         if (self.pid > 0) {
-            std.posix.kill(self.pid, std.posix.SIG.HUP) catch {};
-            _ = std.posix.waitpid(self.pid, std.posix.W.NOHANG);
+            _ = std.posix.system.kill(self.pid, std.posix.SIG.HUP);
+            _ = std.posix.system.waitpid(self.pid, null, std.posix.W.NOHANG);
         }
-        if (self.fd >= 0) std.posix.close(self.fd);
+        if (self.fd >= 0) _ = std.posix.system.close(self.fd);
         for (self.lines.items) |*l| l.deinit(self.alloc);
         self.lines.deinit(self.alloc);
         self.* = undefined;
@@ -81,7 +83,7 @@ pub const Term = struct {
 
     pub fn write(self: *Term, bytes: []const u8) void {
         if (self.exited) return;
-        _ = std.posix.write(self.fd, bytes) catch {};
+        _ = std.posix.system.write(self.fd, bytes.ptr, bytes.len);
     }
 
     /// Drain pending shell output. Returns true when the screen changed.
@@ -139,7 +141,7 @@ pub const Term = struct {
         switch (byte) {
             0x1b => self.esc = .esc,
             '\n' => {
-                self.lines.append(self.alloc, .{}) catch return;
+                self.lines.append(self.alloc, .empty) catch return;
                 if (self.lines.items.len > max_scrollback) {
                     var first = self.lines.orderedRemove(0);
                     first.deinit(self.alloc);

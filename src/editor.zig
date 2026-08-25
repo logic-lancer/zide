@@ -13,17 +13,19 @@ const Lsp = @import("lsp.zig").Lsp;
 /// NvChad-style keys: Tab / Shift-Tab cycle buffers, Space is the leader
 /// (Space b = buffer picker, Space t = theme picker, Space x = close buffer).
 pub const Editor = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    buffers: std.ArrayListUnmanaged(Buffer) = .{},
+    environ_map: *std.process.Environ.Map,
+    buffers: std.ArrayListUnmanaged(Buffer) = .empty,
     active: usize = 0,
     theme: *const themes.Theme = &themes.list[0],
 
     mode: Mode = .normal,
     pending: Pending = .none,
     last_height: u16 = 24,
-    cmd: std.ArrayListUnmanaged(u8) = .{},
+    cmd: std.ArrayListUnmanaged(u8) = .empty,
     /// Last committed `/` search pattern (used by n/N and match highlighting).
-    search: std.ArrayListUnmanaged(u8) = .{},
+    search: std.ArrayListUnmanaged(u8) = .empty,
     /// True while the command line is a `/` search prompt rather than `:`.
     cmd_is_search: bool = false,
     /// Search-match highlighting toggle — `:noh` turns it off until the next search.
@@ -48,10 +50,10 @@ pub const Editor = struct {
     /// closing paren, so the row change IS the close condition.
     sig_row: usize = 0,
     popup: Popup = .{},
-    files: std.ArrayListUnmanaged([]u8) = .{},
+    files: std.ArrayListUnmanaged([]u8) = .empty,
     /// Recently opened files, most recent first (persisted, NvDash "recent").
-    oldfiles: std.ArrayListUnmanaged([]u8) = .{},
-    grep_hits: std.ArrayListUnmanaged(GrepHit) = .{},
+    oldfiles: std.ArrayListUnmanaged([]u8) = .empty,
+    grep_hits: std.ArrayListUnmanaged(GrepHit) = .empty,
     /// ]q / [q cursor into grep_hits; `qf_seen` makes the first jump land on
     /// the current entry instead of skipping it.
     qf_idx: usize = 0,
@@ -68,7 +70,7 @@ pub const Editor = struct {
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
     /// Macro registers: `q{a-z}` records raw key events, `@{a-z}` replays.
-    macros: [26]std.ArrayListUnmanaged(vaxis.Key) = [_]std.ArrayListUnmanaged(vaxis.Key){.{}} ** 26,
+    macros: [26]std.ArrayListUnmanaged(vaxis.Key) = [_]std.ArrayListUnmanaged(vaxis.Key){.empty} ** 26,
     /// Register char ('a'..'z') currently being recorded into, if any.
     recording: ?u8 = null,
     /// Last register replayed with `@`, reused by `@@`.
@@ -78,9 +80,9 @@ pub const Editor = struct {
     /// Replay re-entrancy depth; guards runaway recursive macros.
     replay_depth: u8 = 0,
     /// Dot-repeat: keys of the last completed change (`.` replays them).
-    dot: std.ArrayListUnmanaged(vaxis.Key) = .{},
+    dot: std.ArrayListUnmanaged(vaxis.Key) = .empty,
     /// In-progress change capture (from change-starting key until normal mode).
-    dot_rec: std.ArrayListUnmanaged(vaxis.Key) = .{},
+    dot_rec: std.ArrayListUnmanaged(vaxis.Key) = .empty,
     dot_capturing: bool = false,
     /// Buffer + its undo_seq at capture start: a settle only commits when
     /// the capture actually edited that buffer.
@@ -98,10 +100,10 @@ pub const Editor = struct {
     /// Last visual selection, for `gv` reselect: mode + anchor + cursor.
     last_vis: ?struct { mode: Mode, ar: usize, ac: usize, cr: usize, cc: usize } = null,
     /// Jumplist for Ctrl-o / Ctrl-i (vim `:jumps`): positions before big jumps.
-    jumps: std.ArrayListUnmanaged(Jump) = .{},
+    jumps: std.ArrayListUnmanaged(Jump) = .empty,
     jump_idx: usize = 0,
     /// Unnamed yank register; `reg_linewise` mirrors vim's charwise/linewise put.
-    reg: std.ArrayListUnmanaged(u8) = .{},
+    reg: std.ArrayListUnmanaged(u8) = .empty,
     reg_linewise: bool = false,
     /// NvTerm-style bottom terminal split (Alt-h toggles it).
     term: ?Term = null,
@@ -128,16 +130,16 @@ pub const Editor = struct {
     /// A clear-tick is already scheduled for the current flash.
     yank_flash_armed: bool = false,
     /// `Space f z` picker rows (see LineHit); cleared on popup close.
-    line_hits: std.ArrayListUnmanaged(LineHit) = .{},
+    line_hits: std.ArrayListUnmanaged(LineHit) = .empty,
     /// `Space f s` outline rows (see SymbolHit); cleared on popup close.
-    symbol_hits: std.ArrayListUnmanaged(SymbolHit) = .{},
+    symbol_hits: std.ArrayListUnmanaged(SymbolHit) = .empty,
     /// zls client; null when never started, spawn-failed, or dead.
     lsp: ?Lsp = null,
     /// A spawn failure or a crash disables LSP for the session — never a
     /// respawn loop.
     lsp_failed: bool = false,
-    /// Absolute cwd captured when the client starts, for uri <-> buffer matching.
-    lsp_root: ?[]u8 = null,
+    /// Absolute 0-terminated cwd captured when the client starts, for uri <-> buffer matching.
+    lsp_root: ?[:0]u8 = null,
     /// Where `gd` was pressed. The answer lands a poll tick later, so the
     /// jumplist entry must point here and not at wherever the cursor drifted.
     lsp_req: ?struct { buf: usize, row: usize, col: usize } = null,
@@ -159,7 +161,7 @@ pub const Editor = struct {
     /// so switching buffers discards them instead of caching a set that will
     /// be wrong by the time it is used again. `:InlayHints` / Space i.
     hints_on: bool = false,
-    hints: std.ArrayListUnmanaged(Hint) = .{},
+    hints: std.ArrayListUnmanaged(Hint) = .empty,
     /// What `hints` describes. `hints_ver` is the buffer's lsp_version at
     /// request time (-1 = nothing valid); [hints_top, hints_bot] is the row
     /// window it covers. Any mismatch and the list is not drawn (rowHints).
@@ -208,7 +210,7 @@ pub const Editor = struct {
     /// typing filters, arrows or C-j/C-k move, Enter picks, Esc closes.
     const Popup = struct {
         kind: Kind = .none,
-        filter: std.ArrayListUnmanaged(u8) = .{},
+        filter: std.ArrayListUnmanaged(u8) = .empty,
         selected: usize = 0,
 
         const Kind = enum { none, buffers, themes, files, keys, grep, recent, lines, symbols, qf };
@@ -229,14 +231,14 @@ pub const Editor = struct {
     /// the typed prefix (sel == null) or the selected candidate.
     const Cmp = struct {
         active: bool = false,
-        items: std.ArrayListUnmanaged([]u8) = .{},
+        items: std.ArrayListUnmanaged([]u8) = .empty,
         /// Index of the candidate currently applied in the buffer. Always
         /// set while the menu is active (opening applies a match at once).
         sel: usize = 0,
         /// Byte offset where the completed region starts, and its length.
         start: usize = 0,
         len: usize = 0,
-        prefix: std.ArrayListUnmanaged(u8) = .{},
+        prefix: std.ArrayListUnmanaged(u8) = .empty,
         /// False only while an LSP menu is showing with nothing inserted yet
         /// (nvim-cmp: the popup appears, the buffer still holds what you
         /// typed). The first Ctrl-n/Ctrl-p applies `sel` instead of moving
@@ -468,8 +470,13 @@ pub const Editor = struct {
         };
     }
 
-    pub fn init(alloc: std.mem.Allocator) Editor {
-        var self: Editor = .{ .alloc = alloc, .tree = Tree.init(alloc) };
+    pub fn init(io: std.Io, alloc: std.mem.Allocator, environ_map: *std.process.Environ.Map) Editor {
+        var self: Editor = .{
+.            io = io,
+            .alloc = alloc,
+            .environ_map = environ_map,
+            .tree = Tree.init(io, alloc)
+        };
         self.loadGitBranch();
         self.loadOldfiles();
         return self;
@@ -479,15 +486,14 @@ pub const Editor = struct {
 
     /// `$HOME/.cache/zide/oldfiles` — one absolute path per line.
     fn oldfilesPath(self: *Editor, buf: []u8) ?[]u8 {
-        _ = self;
-        const home = std.posix.getenv("HOME") orelse return null;
-        return std.fmt.bufPrint(buf, "{s}/.cache/zide/oldfiles", .{home}) catch null;
+        const home = self.environ_map.get("HOME");
+        return std.fmt.bufPrint(buf, "{?s}/.cache/zide/oldfiles", .{home}) catch null;
     }
 
     fn loadOldfiles(self: *Editor) void {
         var pbuf: [512]u8 = undefined;
         const path = self.oldfilesPath(&pbuf) orelse return;
-        const data = std.fs.cwd().readFileAlloc(self.alloc, path, 64 * 1024) catch return;
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .unlimited) catch return;
         defer self.alloc.free(data);
         var it = std.mem.tokenizeScalar(u8, data, '\n');
         while (it.next()) |line| {
@@ -503,19 +509,20 @@ pub const Editor = struct {
     fn saveOldfiles(self: *Editor) void {
         var pbuf: [512]u8 = undefined;
         const path = self.oldfilesPath(&pbuf) orelse return;
-        if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch return;
-        var f = std.fs.cwd().createFile(path, .{}) catch return;
-        defer f.close();
+        if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(self.io, dir) catch return;
+        var f = std.Io.Dir.cwd().createFile(self.io, path, .{}) catch return;
+        defer f.close(self.io);
         for (self.oldfiles.items) |p| {
-            f.writeAll(p) catch return;
-            f.writeAll("\n") catch return;
+            f.writeStreamingAll(self.io, p) catch return;
+            f.writeStreamingAll(self.io, "\n") catch return;
         }
     }
 
     /// Move `path` (as absolute) to the front of the recent-files list.
     fn recordOldfile(self: *Editor, path: []const u8) void {
         var abuf: [std.fs.max_path_bytes]u8 = undefined;
-        const abs = std.fs.cwd().realpath(path, &abuf) catch path;
+        const count = std.Io.Dir.cwd().realPathFile(self.io, path, &abuf) catch 0;
+        const abs = if (count==0) path else abuf[0..count];
         for (self.oldfiles.items, 0..) |p, i| {
             if (std.mem.eql(u8, p, abs)) {
                 const hit = self.oldfiles.orderedRemove(i);
@@ -542,8 +549,7 @@ pub const Editor = struct {
     /// `$HOME/.cache/zide/session` — one `row:col:/abs/path` line per open
     /// buffer, then a final `active:<index>`.
     fn sessionPath(self: *Editor, buf: []u8) ?[]u8 {
-        _ = self;
-        const home = std.posix.getenv("HOME") orelse return null;
+        const home = self.environ_map.get("HOME") orelse return null;
         return std.fmt.bufPrint(buf, "{s}/.cache/zide/session", .{home}) catch null;
     }
 
@@ -554,32 +560,33 @@ pub const Editor = struct {
         if (self.buffers.items.len == 0) return; // never clobber with nothing
         var pbuf: [512]u8 = undefined;
         const path = self.sessionPath(&pbuf) orelse return;
-        if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch return;
-        var f = std.fs.cwd().createFile(path, .{}) catch return;
-        defer f.close();
+        if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(self.io, dir) catch return;
+        var f = std.Io.Dir.cwd().createFile(self.io, path, .{}) catch return;
+        defer f.close(self.io);
         // `active` must index the lines actually written, not self.buffers:
         // buffers whose realpath fails (new unsaved file, deleted underneath)
         // are skipped and would shift every later index.
         var written: usize = 0;
         var active_out: usize = 0;
         for (self.buffers.items, 0..) |*b, i| {
-            var abuf: [std.fs.max_path_bytes]u8 = undefined;
-            const abs = std.fs.cwd().realpath(b.file_name, &abuf) catch continue;
+            const abs = std.fs.path.resolve(self.alloc, &.{b.file_name}) catch continue;
+            defer self.alloc.free(abs);
+
             var lbuf: [std.fs.max_path_bytes + 48]u8 = undefined;
             const line = std.fmt.bufPrint(&lbuf, "{d}:{d}:{s}\n", .{ b.row, b.col, abs }) catch continue;
             if (i == self.active) active_out = written;
-            f.writeAll(line) catch return;
+            f.writeStreamingAll(self.io, line) catch return;
             written += 1;
         }
         var abuf: [32]u8 = undefined;
-        f.writeAll(std.fmt.bufPrint(&abuf, "active:{d}\n", .{active_out}) catch return) catch return;
+        f.writeStreamingAll(self.io, std.fmt.bufPrint(&abuf, "active:{d}\n", .{active_out}) catch return) catch return;
     }
 
     /// Dashboard `s`: reopen every session buffer and restore its cursor.
     fn restoreSession(self: *Editor) void {
         var pbuf: [512]u8 = undefined;
         const path = self.sessionPath(&pbuf) orelse return;
-        const data = std.fs.cwd().readFileAlloc(self.alloc, path, 256 * 1024) catch
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(256 * 1024)) catch
             return self.setStatus("no saved session", .{});
         defer self.alloc.free(data);
 
@@ -597,7 +604,7 @@ pub const Editor = struct {
             const row = std.fmt.parseInt(usize, line[0..c1], 10) catch continue;
             const col = std.fmt.parseInt(usize, rest[0..c2], 10) catch continue;
             const fpath = rest[c2 + 1 ..];
-            if (fpath.len == 0 or !fileExists(fpath)) continue; // openFile would
+            if (fpath.len == 0 or !fileExists(self.io, fpath)) continue; // openFile would
             const before = self.buffers.items.len; //               fabricate an
             self.openFile(fpath) catch continue; //                 empty buffer
             if (self.buffers.items.len == before) continue;
@@ -617,8 +624,8 @@ pub const Editor = struct {
     /// Read the current branch from .git/HEAD (NvChad statusline segment).
     fn loadGitBranch(self: *Editor) void {
         var buf: [512]u8 = undefined;
-        const head = std.fs.cwd().readFile(".git/HEAD", &buf) catch return;
-        const trimmed = std.mem.trimRight(u8, head, "\r\n");
+        const head = std.Io.Dir.cwd().readFile(self.io, ".git/HEAD", &buf) catch return;
+        const trimmed = std.mem.trimEnd(u8, head, "\r\n");
         const name = if (std.mem.startsWith(u8, trimmed, "ref: "))
             std.fs.path.basename(trimmed[5..])
         else if (trimmed.len >= 7)
@@ -635,14 +642,13 @@ pub const Editor = struct {
     /// untracked files (diff exits non-zero / prints nothing useful).
     fn refreshGitSigns(self: *Editor, b: *Buffer) void {
         b.git_signs.clearRetainingCapacity();
-        const res = std.process.Child.run(.{
-            .allocator = self.alloc,
+        const res = std.process.run(self.alloc, self.io, .{
             .argv = &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name },
-            .max_output_bytes = 1 << 20,
+            .stdout_limit = .limited(1 << 20),
         }) catch return;
         defer self.alloc.free(res.stdout);
         defer self.alloc.free(res.stderr);
-        if (res.term != .Exited or res.term.Exited != 0) return;
+        if (res.term != .exited or res.term.exited != 0) return;
 
         b.git_signs.appendNTimes(self.alloc, .none, b.lines.items.len) catch return;
         var it = std.mem.tokenizeScalar(u8, res.stdout, '\n');
@@ -771,13 +777,12 @@ pub const Editor = struct {
             &.{ "git", "diff", "--no-color", "-U0", "HEAD", "--", b.file_name };
         const argv_index: []const []const u8 =
             &.{ "git", "diff", "--no-color", "-U0", "--", b.file_name };
-        const res = std.process.Child.run(.{
-            .allocator = self.alloc,
+        const res = std.process.run(self.alloc, self.io, .{
             .argv = if (base == .head) argv_head else argv_index,
-            .max_output_bytes = 1 << 20,
+            .stdout_limit = .limited(1 << 20),
         }) catch return null;
         self.alloc.free(res.stderr);
-        if (res.term != .Exited or res.term.Exited != 0) {
+        if (res.term != .exited or res.term.exited != 0) {
             self.alloc.free(res.stdout);
             return null;
         }
@@ -812,7 +817,7 @@ pub const Editor = struct {
         // means HEAD's side lacked the final newline — trust the marker,
         // not the buffer's EOF state (they differ in exactly the
         // trailing-newline-only hunks that made the old heuristic a no-op).
-        var old: std.ArrayListUnmanaged(u8) = .{};
+        var old: std.ArrayListUnmanaged(u8) = .empty;
         defer old.deinit(self.alloc);
         var old_no_nl = false;
         var last_sign: u8 = 0;
@@ -864,11 +869,12 @@ pub const Editor = struct {
     /// and the cwd need not be the repo root.
     fn spawnZigFmt(self: *Editor) ?std.process.Child {
         for (zig_exes) |exe| {
-            var child = std.process.Child.init(&.{ exe, "fmt", "--stdin" }, self.alloc);
-            child.stdin_behavior = .Pipe;
-            child.stdout_behavior = .Pipe;
-            child.stderr_behavior = .Pipe;
-            child.spawn() catch continue;
+            const child = std.process.spawn(self.io, .{
+                .argv = &.{exe, "fmt", "--stdin"},
+                .stdin = .pipe,
+                .stdout = .pipe,
+                .stderr = .pipe,
+            }) catch continue;
             return child;
         }
         return null;
@@ -895,31 +901,35 @@ pub const Editor = struct {
         // against a full stdout pipe (verified on 253 KB). SIGPIPE is a noop
         // under Zig's start code, so a dead child surfaces as an error.
         if (child.stdin) |in| {
-            in.writeAll(b.buf.items) catch {};
-            in.close();
+            in.writeStreamingAll(self.io, b.buf.items) catch {};
+            in.close(self.io);
             child.stdin = null; // wait() would otherwise close it twice
         }
         var out: []u8 = &.{};
         defer self.alloc.free(out); // free is a no-op on an empty slice
-        if (child.stdout) |f| out = f.readToEndAlloc(self.alloc, format_max) catch &.{};
+        if (child.stdout) |f| {
+            var reader = f.reader(self.io, &.{});
+            out = reader.interface.allocRemaining(self.alloc, .limited(format_max)) catch &.{};
+        }
         var ebuf: [256]u8 = undefined;
         var elen: usize = 0;
         if (child.stderr) |f| {
-            elen = f.readAll(&ebuf) catch 0;
+            var reader = f.reader(self.io, &.{});
+            elen = reader.interface.readSliceShort(&ebuf) catch 0;
             if (elen == ebuf.len) { // drain so the child never blocks
                 var sink: [512]u8 = undefined;
-                while ((f.read(&sink) catch 0) > 0) {}
+                while ((reader.interface.readSliceShort(&sink) catch 0) > 0) {}
             }
         }
-        const term = child.wait() catch {
+        const term = child.wait(self.io) catch {
             self.setStatus("zig fmt failed", .{});
             return .failed;
         };
         // Exit 2 on a parse error, `<stdin>:L:C: error: ...` on stderr. An
         // empty buffer legitimately formats to nothing, so only an empty
         // result from non-empty input counts as a failure.
-        if (term != .Exited or term.Exited != 0 or (out.len == 0 and b.buf.items.len != 0)) {
-            const t = std.mem.trimRight(u8, ebuf[0..elen], "\n");
+        if (term != .exited or term.exited != 0 or (out.len == 0 and b.buf.items.len != 0)) {
+            const t = std.mem.trimEnd(u8, ebuf[0..elen], "\n");
             var first = t[0 .. std.mem.indexOfScalar(u8, t, '\n') orelse t.len];
             // Cap so setStatus's 256-byte buffer cannot silently print
             // nothing.
@@ -964,7 +974,7 @@ pub const Editor = struct {
         const hdr_nl = std.mem.indexOf(u8, text, "\n@@ ") orelse
             return self.setStatus("unexpected diff format", .{});
 
-        var patch: std.ArrayListUnmanaged(u8) = .{};
+        var patch: std.ArrayListUnmanaged(u8) = .empty;
         defer patch.deinit(self.alloc);
         try patch.appendSlice(self.alloc, text[0 .. hdr_nl + 1]);
         // Rebuilt from the parsed Hunk: git omits a ",1" count and appends
@@ -984,31 +994,32 @@ pub const Editor = struct {
         if (patch.items.len > 0 and patch.items[patch.items.len - 1] != '\n')
             try patch.append(self.alloc, '\n');
 
-        var child = std.process.Child.init(
-            &.{ "git", "apply", "--cached", "--unidiff-zero", "-" },
-            self.alloc,
-        );
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return self.setStatus("could not run git apply", .{});
+        var child = std.process.spawn(self.io, .{
+            .argv = &.{ "git", "apply", "--cached", "--unidiff-zero", "-" },
+                .stdin = .pipe,
+                .stdout = .ignore,
+                .stderr = .pipe
+            },
+        ) catch return self.setStatus("could not run git apply", .{});
         if (child.stdin) |in| {
-            in.writeAll(patch.items) catch {};
-            in.close();
+            in.writeStreamingAll(self.io, patch.items) catch {};
+            in.close(self.io);
             child.stdin = null; // wait() would otherwise close it twice
         }
         var ebuf: [256]u8 = undefined;
         var elen: usize = 0;
         if (child.stderr) |errf| {
-            elen = errf.readAll(&ebuf) catch 0;
+            var reader = errf.reader(self.io, &.{});
+            elen = reader.interface.readSliceShort(&ebuf) catch 0;
             if (elen == ebuf.len) { // drain, so git never blocks on a full pipe
                 var sink: [512]u8 = undefined;
-                while ((errf.read(&sink) catch 0) > 0) {}
+                var errreader = errf.reader(self.io, &.{});
+                while ((errreader.interface.readSliceShort(&sink) catch 0) > 0) {}
             }
         }
-        const term = child.wait() catch return self.setStatus("git apply failed", .{});
-        if (term != .Exited or term.Exited != 0) {
-            const out = std.mem.trimRight(u8, ebuf[0..elen], "\n");
+        const term = child.wait(self.io) catch return self.setStatus("git apply failed", .{});
+        if (term != .exited or term.exited != 0) {
+            const out = std.mem.trimEnd(u8, ebuf[0..elen], "\n");
             var first = out[0 .. std.mem.indexOfScalar(u8, out, '\n') orelse out.len];
             // Cap so setStatus's 256-byte buffer can't overflow and
             // silently show nothing.
@@ -1144,14 +1155,13 @@ pub const Editor = struct {
         const row = @min(b.row, b.lastRow());
         var lbuf: [40]u8 = undefined;
         const spec = std.fmt.bufPrint(&lbuf, "{d},{d}", .{ row + 1, row + 1 }) catch return;
-        const res = std.process.Child.run(.{
-            .allocator = self.alloc,
+        const res = std.process.run(self.alloc, self.io, .{
             .argv = &.{ "git", "blame", "-L", spec, "--line-porcelain", "--", b.file_name },
-            .max_output_bytes = 1 << 16,
+            .stdout_limit = .limited(1 << 16),
         }) catch return self.setStatus("git blame: failed to run", .{});
         defer self.alloc.free(res.stdout);
         defer self.alloc.free(res.stderr);
-        if (res.term != .Exited or res.term.Exited != 0) {
+        if (res.term != .exited or res.term.exited != 0) {
             const msg = std.mem.sliceTo(std.mem.trim(u8, res.stderr, " \r\n"), '\n');
             return self.setStatus("git blame: {s}", .{if (msg.len > 0) msg else "not tracked"});
         }
@@ -1245,7 +1255,7 @@ pub const Editor = struct {
             }
         }
         self.pushJump();
-        const contents = std.fs.cwd().readFileAlloc(self.alloc, path, 64 * 1024 * 1024) catch |err| switch (err) {
+        const contents = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => try self.alloc.dupe(u8, ""),
             else => {
                 self.setStatus("could not read '{s}': {s}", .{ path, @errorName(err) });
@@ -1253,7 +1263,7 @@ pub const Editor = struct {
             },
         };
         defer self.alloc.free(contents);
-        const buffer = try Buffer.init(self.alloc, path, contents, self.theme);
+        const buffer = try Buffer.init(self.io, self.alloc, path, contents, self.theme);
         try self.buffers.append(self.alloc, buffer);
         self.active = self.buffers.items.len - 1;
         self.refreshGitSigns(self.cur());
@@ -1319,11 +1329,11 @@ pub const Editor = struct {
     fn ensureLsp(self: *Editor) ?*Lsp {
         if (self.lsp) |*l| return if (l.alive) l else null;
         if (self.lsp_failed) return null;
-        const root = std.process.getCwdAlloc(self.alloc) catch {
+        const root = std.process.currentPathAlloc(self.io, self.alloc) catch {
             self.lsp_failed = true;
             return null;
         };
-        self.lsp = Lsp.spawn(self.alloc, root) catch {
+        self.lsp = Lsp.spawn(self.io, self.alloc, root) catch {
             self.alloc.free(root);
             self.lsp_failed = true;
             self.setStatus("zls not found — LSP disabled", .{});
@@ -1383,7 +1393,7 @@ pub const Editor = struct {
             if (std.mem.eql(u8, a, abs)) return self.alloc.dupe(u8, b.file_name) catch null;
         }
         if (self.lsp_root) |root| {
-            if (std.fs.path.relative(self.alloc, root, abs) catch null) |rel| {
+        if (std.fs.path.relative(self.alloc, root, null, root, abs) catch null) |rel| {
                 if (rel.len > 0 and !std.mem.startsWith(u8, rel, "..")) return rel;
                 self.alloc.free(rel); // outside the project: keep it absolute
             }
@@ -1861,7 +1871,7 @@ pub const Editor = struct {
                     if (cache_path) |p| self.alloc.free(p);
                     if (cache_data) |d| self.alloc.free(d);
                     cache_path = self.alloc.dupe(u8, name) catch null;
-                    cache_data = std.fs.cwd().readFileAlloc(self.alloc, name, Popup.max_file_size) catch null;
+                    cache_data = std.Io.Dir.cwd().readFileAlloc(self.io, name, self.alloc, .limited(Popup.max_file_size),) catch null;
                 }
                 if (cache_data) |d| {
                     var it = std.mem.splitScalar(u8, d, '\n');
@@ -2010,7 +2020,7 @@ pub const Editor = struct {
 
     fn refreshFiles(self: *Editor) void {
         self.clearFiles();
-        Tree.listFiles(self.alloc, &self.files, Popup.max_files) catch {};
+        Tree.listFiles(self.io, self.alloc, &self.files, Popup.max_files) catch {};
     }
 
     fn closePopup(self: *Editor) void {
@@ -2035,7 +2045,7 @@ pub const Editor = struct {
         self.popup.selected = 0;
         if (q.len < 2) return; // avoid scanning everything on 1 char
         outer: for (self.files.items) |path| {
-            const data = std.fs.cwd().readFileAlloc(self.alloc, path, Popup.max_file_size) catch continue;
+            const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.alloc, .limited(Popup.max_file_size)) catch continue;
             defer self.alloc.free(data);
             if (std.mem.indexOfScalar(u8, data, 0) != null) continue; // binary
             var it = std.mem.splitScalar(u8, data, '\n');
@@ -2159,7 +2169,7 @@ pub const Editor = struct {
         // Files can vanish or become unreadable between the grep and now:
         // never report success over a jump that didn't happen (and keep
         // qf_idx advanced so ]q can step past dead entries).
-        if (!fileExists(h.path))
+        if (!fileExists(self.io, h.path))
             return self.setStatus("quickfix {d}/{d}: {s} is gone", .{ self.qf_idx + 1, n, h.path });
         if (!self.jumpTo(h.path, h.line)) return; // jumpTo's error status stands
         self.setStatus("quickfix {d}/{d}: {s}:{d}", .{ self.qf_idx + 1, n, h.path, h.line });
@@ -2261,7 +2271,7 @@ pub const Editor = struct {
                         self.qf_seen = true;
                         // Same honesty as ]q: a vanished file must not
                         // fabricate an empty buffer named after it.
-                        if (!fileExists(h.path)) {
+                        if (!fileExists(self.io, h.path)) {
                             self.setStatus("{s} is gone", .{h.path});
                         } else _ = self.jumpTo(h.path, h.line);
                     },
@@ -2332,7 +2342,7 @@ pub const Editor = struct {
             .tick => {
                 self.ticks -|= 1;
                 if (self.yank_flash) |f| {
-                    if (std.time.milliTimestamp() >= f.until_ms) {
+                    if (std.Io.Timestamp.now(self.io, .real).toMilliseconds() >= f.until_ms) {
                         self.yank_flash = null;
                         self.yank_flash_armed = false;
                         ctx.redraw = true;
@@ -2428,8 +2438,8 @@ pub const Editor = struct {
         };
     }
 
-    fn fileExists(path: []const u8) bool {
-        const st = std.fs.cwd().statFile(path) catch return false;
+    fn fileExists(io: std.Io, path: []const u8) bool {
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
         return st.kind == .file;
     }
 
@@ -2553,14 +2563,14 @@ pub const Editor = struct {
         while (tok.len > 0 and tok[0] == '@') tok = tok[1..];
         while (tok.len > 0 and tok[tok.len - 1] == '.') tok = tok[0 .. tok.len - 1];
         if (tok.len == 0) return self.setStatus("no file name under cursor", .{});
-        if (fileExists(tok)) {
+        if (fileExists(self.io, tok)) {
             self.pushJump();
             return self.openFile(tok);
         }
         if (std.fs.path.dirname(b.file_name)) |dir| {
             const joined = try std.fs.path.join(self.alloc, &.{ dir, tok });
             defer self.alloc.free(joined);
-            if (fileExists(joined)) {
+            if (fileExists(self.io, joined)) {
                 self.pushJump();
                 return self.openFile(joined);
             }
@@ -3926,7 +3936,7 @@ pub const Editor = struct {
             .seq = self.cur().undo_seq,
             .lo = lo,
             .hi = hi,
-            .until_ms = std.time.milliTimestamp() + yank_flash_ms,
+            .until_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds() + yank_flash_ms,
         };
         // Force the current keypress to schedule a clear-tick for THIS
         // deadline, even if one was pending for an earlier yank.
@@ -4711,16 +4721,16 @@ pub const Editor = struct {
         const dir_part = if (slash) |i| arg[0 .. i + 1] else "";
         const base = if (slash) |i| arg[i + 1 ..] else arg;
 
-        var names: std.ArrayListUnmanaged([]u8) = .{};
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
             for (names.items) |n| self.alloc.free(n);
             names.deinit(self.alloc);
         }
-        var dir = std.fs.cwd().openDir(if (dir_part.len == 0) "." else dir_part, .{ .iterate = true }) catch
+        var dir = std.Io.Dir.cwd().openDir(self.io, if (dir_part.len == 0) "." else dir_part, .{ .iterate = true }) catch
             return self.setStatus("no such dir: {s}", .{dir_part});
-        defer dir.close();
+        defer dir.close(self.io);
         var iter = dir.iterate();
-        while (iter.next() catch null) |ent| {
+        while (iter.next(self.io) catch null) |ent| {
             if (!std.mem.startsWith(u8, ent.name, base)) continue;
             if (base.len == 0 and ent.name[0] == '.') continue; // hide dotfiles unless asked
             const suffix: []const u8 = if (ent.kind == .directory) "/" else "";
@@ -4893,7 +4903,7 @@ pub const Editor = struct {
         while (row <= hi and row < b.lines.items.len) : (row += 1) {
             const text = self.alloc.dupe(u8, b.lineText(row)) catch return true;
             defer self.alloc.free(text);
-            var scratch: std.ArrayListUnmanaged(u8) = .{};
+            var scratch: std.ArrayListUnmanaged(u8) = .empty;
             defer scratch.deinit(self.alloc);
             var pos: usize = 0;
             var line_hits: usize = 0;
@@ -4995,7 +5005,7 @@ pub const Editor = struct {
         const old = try self.alloc.dupe(u8, b.buf.items[r[0]..r[1]]);
         defer self.alloc.free(old);
         if (std.mem.eql(u8, old, new)) return self.setStatus("rename: unchanged", .{});
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(self.alloc);
         try out.ensureTotalCapacity(self.alloc, b.buf.items.len);
         const text = b.buf.items;
@@ -5175,14 +5185,14 @@ pub const Editor = struct {
             return;
         }
         if (self.term == null) {
-            self.term = Term.spawn(self.alloc, self.term_cols, self.term_h) catch {
+            self.term = Term.spawn(self.io, self.alloc, self.term_cols, self.term_h) catch {
                 self.setStatus("terminal: failed to spawn shell", .{});
                 ctx.consumeAndRedraw();
                 return;
             };
         } else if (self.term.?.exited) {
             self.term.?.deinit();
-            self.term = Term.spawn(self.alloc, self.term_cols, self.term_h) catch {
+            self.term = Term.spawn(self.io, self.alloc, self.term_cols, self.term_h) catch {
                 self.term = null;
                 self.setStatus("terminal: failed to spawn shell", .{});
                 ctx.consumeAndRedraw();
@@ -5408,9 +5418,11 @@ pub const Editor = struct {
             {
                 if (self.mode != .visual and self.mode != .visual_line)
                     self.enterVisual(.visual);
-                const li = @min(b.scroll + (m.row - L.text_top), b.lines.items.len -| 1);
+                const mouse_row:usize = @intCast(m.row);
+                const li = @min(b.scroll + (mouse_row - L.text_top), b.lines.items.len -| 1);
                 b.row = li;
-                b.col = self.byteColForWidth(b.lineText(li), li, m.col -| (L.tree_w + L.gutter));
+                const mouse_col: u16 = @intCast(m.col);
+                b.col = self.byteColForWidth(b.lineText(li), li, mouse_col -| (L.tree_w + L.gutter));
                 return ctx.consumeAndRedraw();
             }
             return;
@@ -5454,7 +5466,8 @@ pub const Editor = struct {
             m.row >= L.text_top and m.row < L.text_top + L.text_rows)
         {
             const t = &self.tree;
-            const idx = t.scroll + (m.row - L.text_top);
+            const mouse_row: usize = @intCast(m.row);
+            const idx = t.scroll + (mouse_row - L.text_top);
             if (idx < t.entries.items.len) {
                 const again = self.focus == .tree and idx == t.selected;
                 self.focus = .tree;
@@ -5483,14 +5496,16 @@ pub const Editor = struct {
             // A plain click cancels any active visual selection (vim mouse=a).
             if (self.mode == .visual or self.mode == .visual_line)
                 self.exitVisual();
-            const li = b.scroll + (m.row - L.text_top);
+            const mouse_row: usize = @intCast(m.row);
+            const li = b.scroll + (mouse_row - L.text_top);
             if (li < b.lines.items.len) {
                 b.row = li;
-                const want: u16 = m.col -| (L.tree_w + L.gutter);
+                const mouse_col: u16 = @intCast(m.col);
+                const want: u16 = mouse_col -| (L.tree_w + L.gutter);
                 b.col = self.byteColForWidth(b.lineText(li), li, want);
                 b.goal_col = b.col;
                 // Double-click on the same spot selects the word under it.
-                const now = std.time.milliTimestamp();
+                const now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
                 if (now - self.last_click_ms < 400 and
                     b.row == self.last_click_row and b.col == self.last_click_col)
                 {

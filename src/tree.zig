@@ -14,17 +14,18 @@ pub const Entry = struct {
 };
 
 pub const Tree = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    entries: std.ArrayListUnmanaged(Entry) = .{},
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
     /// Set of expanded dir paths (owned keys), persists across refresh.
-    open_dirs: std.StringHashMapUnmanaged(void) = .{},
+    open_dirs: std.StringHashMapUnmanaged(void) = .empty,
     /// path -> git status (owned keys), rebuilt on refresh.
-    git: std.StringHashMapUnmanaged(GitStatus) = .{},
+    git: std.StringHashMapUnmanaged(GitStatus) = .empty,
     selected: usize = 0,
     scroll: usize = 0,
 
-    pub fn init(alloc: std.mem.Allocator) Tree {
-        return .{ .alloc = alloc };
+    pub fn init(io: std.Io, alloc: std.mem.Allocator) Tree {
+        return .{ .io = io, .alloc = alloc };
     }
 
     pub fn deinit(self: *Tree) void {
@@ -68,11 +69,12 @@ pub const Tree = struct {
     /// Recursively collect project file paths (same ignore rules as the
     /// sidebar), for the telescope-style file finder. Paths owned by `alloc`.
     pub fn listFiles(
+        io: std.Io,
         alloc: std.mem.Allocator,
         out: *std.ArrayListUnmanaged([]u8),
         max: usize,
     ) !void {
-        try listFilesDir(alloc, out, ".", max);
+        try listFilesDir(io, alloc, out, ".", max);
         std.mem.sort([]u8, out.items, {}, struct {
             fn lessThan(_: void, a: []u8, b: []u8) bool {
                 return std.ascii.lessThanIgnoreCase(a, b);
@@ -81,16 +83,17 @@ pub const Tree = struct {
     }
 
     fn listFilesDir(
+        io: std.Io,
         alloc: std.mem.Allocator,
         out: *std.ArrayListUnmanaged([]u8),
         rel: []const u8,
         max: usize,
     ) !void {
         if (out.items.len >= max) return;
-        var dir = std.fs.cwd().openDir(rel, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(io, rel, .{ .iterate = true }) catch return;
+        defer dir.close(io);
         var it = dir.iterate();
-        while (it.next() catch null) |ent| {
+        while (it.next(io) catch null) |ent| {
             if (out.items.len >= max) return;
             if (skip(ent.name)) continue;
             const child = if (std.mem.eql(u8, rel, "."))
@@ -100,7 +103,7 @@ pub const Tree = struct {
             switch (ent.kind) {
                 .directory => {
                     defer alloc.free(child);
-                    try listFilesDir(alloc, out, child, max);
+                    try listFilesDir(io, alloc, out, child, max);
                 },
                 .file, .sym_link => try out.append(alloc, child),
                 else => alloc.free(child),
@@ -109,8 +112,8 @@ pub const Tree = struct {
     }
 
     fn scanDir(self: *Tree, rel: []const u8, depth: u16) !void {
-        var dir = std.fs.cwd().openDir(rel, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(self.io, rel, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
 
         const Child = struct {
             name: []u8,
@@ -120,13 +123,13 @@ pub const Tree = struct {
                 return std.ascii.lessThanIgnoreCase(a.name, b.name);
             }
         };
-        var names: std.ArrayListUnmanaged(Child) = .{};
+        var names: std.ArrayListUnmanaged(Child) = .empty;
         defer {
             for (names.items) |n| self.alloc.free(n.name);
             names.deinit(self.alloc);
         }
         var it = dir.iterate();
-        while (try it.next()) |ent| {
+        while (try it.next(self.io)) |ent| {
             if (skip(ent.name)) continue;
             if (ent.kind != .file and ent.kind != .directory) continue;
             try names.append(self.alloc, .{
@@ -195,14 +198,13 @@ pub const Tree = struct {
     /// Parent dirs of dirty files are marked modified so closed dirs hint too.
     fn loadGit(self: *Tree) void {
         self.clearGit();
-        const res = std.process.Child.run(.{
-            .allocator = self.alloc,
+        const res = std.process.run(self.alloc, self.io, .{
             .argv = &.{ "git", "status", "--porcelain", "-uall" },
-            .max_output_bytes = 1 << 20,
+            .stdout_limit = .limited(1 << 20),
         }) catch return;
         defer self.alloc.free(res.stdout);
         defer self.alloc.free(res.stderr);
-        if (res.term != .Exited or res.term.Exited != 0) return;
+        if (res.term != .exited or res.term.exited != 0) return;
 
         var lines = std.mem.tokenizeScalar(u8, res.stdout, '\n');
         while (lines.next()) |line| {

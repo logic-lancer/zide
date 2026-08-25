@@ -3,15 +3,16 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Editor = @import("editor.zig").Editor;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
+
     const alloc = gpa.allocator();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
-
-    var editor = Editor.init(alloc);
+    const args = try init.minimal.args.toSlice(alloc);
+    defer alloc.free(args);
+    var editor = Editor.init(io, alloc, init.environ_map);
     defer editor.deinit();
 
     // With no args zide starts on the dashboard (NvDash-style).
@@ -20,7 +21,8 @@ pub fn main() !void {
         if (editor.buffers.items.len > 0) editor.active = 0;
     }
 
-    var app = try vxfw.App.init(alloc);
+    var buffer: [1024]u8 = undefined;
+    var app = try vxfw.App.init(io, alloc, init.environ_map, &buffer);
     defer app.deinit();
     try app.run(editor.widget(), .{});
 }

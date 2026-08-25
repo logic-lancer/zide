@@ -9,9 +9,10 @@ const lsp = @import("lsp.zig");
 /// the lines table is always present, possibly empty, so a trailing newline
 /// shows as an empty final line and edit logic needs no special cases.
 pub const Buffer = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    buf: std.ArrayListUnmanaged(u8) = .{},
-    lines: std.ArrayListUnmanaged(Line) = .{},
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    lines: std.ArrayListUnmanaged(Line) = .empty,
     hl: syntax.Highlighter,
     /// Owned copy of the path this buffer reads from / writes to.
     file_name: []u8,
@@ -24,7 +25,7 @@ pub const Buffer = struct {
 
     /// Per-line git status vs HEAD (gitsigns-style gutter markers).
     /// Refreshed on open/save; may be shorter than `lines` after edits.
-    git_signs: std.ArrayListUnmanaged(Sign) = .{},
+    git_signs: std.ArrayListUnmanaged(Sign) = .empty,
 
     /// LSP state. `lsp_version` is the didChange counter; `lsp_dirty` is set by
     /// every edit and cleared when the editor flushes a didChange on the poll
@@ -34,7 +35,7 @@ pub const Buffer = struct {
     lsp_version: i32 = 0,
     /// Diagnostics from the last publishDiagnostics, sorted by (line, col).
     /// May be older than the buffer: line indexes are clamped at use sites.
-    diags: std.ArrayListUnmanaged(lsp.Lsp.Diag) = .{},
+    diags: std.ArrayListUnmanaged(lsp.Lsp.Diag) = .empty,
 
     /// a-z vim marks (`m{a-z}`); positions are clamped when jumped to, so
     /// stale marks after edits degrade gracefully instead of invalidating.
@@ -46,8 +47,8 @@ pub const Buffer = struct {
     /// Undo history: every replaceRange is recorded here. Edits sharing a
     /// `seq` form one undo group (one normal-mode command, or one whole
     /// insert-mode session — the editor bumps the group on normal keys).
-    undo_stack: std.ArrayListUnmanaged(UndoEdit) = .{},
-    redo_stack: std.ArrayListUnmanaged(UndoEdit) = .{},
+    undo_stack: std.ArrayListUnmanaged(UndoEdit) = .empty,
+    redo_stack: std.ArrayListUnmanaged(UndoEdit) = .empty,
     undo_seq: u32 = 0,
     /// Set by the editor on non-insert keypresses; the next recorded edit
     /// starts a fresh group.
@@ -74,6 +75,7 @@ pub const Buffer = struct {
     pub const Line = struct { start: u32, end: u32 };
 
     pub fn init(
+        io: std.Io,
         alloc: std.mem.Allocator,
         file_name: []const u8,
         contents: []const u8,
@@ -85,6 +87,7 @@ pub const Buffer = struct {
         hl.styles.items[0] = hl.baseStyle(); // style id 0 must match the theme
 
         var self = Buffer{
+            .io = io,
             .alloc = alloc,
             .hl = hl,
             .file_name = try alloc.dupe(u8, file_name),
@@ -678,7 +681,7 @@ pub const Buffer = struct {
     }
 
     pub fn save(self: *Buffer) !void {
-        try std.fs.cwd().writeFile(.{ .sub_path = self.file_name, .data = self.buf.items });
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.file_name, .data = self.buf.items });
         self.dirty = false;
         self.saved_seq = self.topSeq();
     }

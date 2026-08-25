@@ -5,12 +5,13 @@ const std = @import("std");
 /// O_NONBLOCK, writes queue in `out`, reads accumulate in `in` and are
 /// parsed frame-by-frame from the editor's ~80ms poll tick.
 pub const Lsp = struct {
+io: std.Io,
     alloc: std.mem.Allocator,
     child: std.process.Child,
-    in_fd: std.posix.fd_t, // child stdout
-    out_fd: std.posix.fd_t, // child stdin
-    in: std.ArrayListUnmanaged(u8) = .{},
-    out: std.ArrayListUnmanaged(u8) = .{},
+    in_fd: std.Io.File, // child stdout
+    out_fd: std.Io.File, // child stdin
+    in: std.ArrayListUnmanaged(u8) = .empty,
+    out: std.ArrayListUnmanaged(u8) = .empty,
     /// False once the child dies or the stream desynchronizes. The editor
     /// tears the client down on the next tick and never respawns.
     alive: bool = true,
@@ -51,7 +52,7 @@ pub const Lsp = struct {
     sig_active: i64 = -1, // activeParameter index, -1 when absent
     sig_total: usize = 0, // parameters.len
     hints_id: i64 = 0,
-    /// An inlayHint response landed; `hints` is its payload (empty when the
+    /// An inlayHint response landed; `hints` is its payloand (empty when the
     /// server answered null). Taken and freed by the editor.
     hints_done: bool = false,
     hints: []Hint = &.{},
@@ -63,7 +64,7 @@ pub const Lsp = struct {
     hints_lo: u32 = 0,
     hints_hi: u32 = 0,
     /// Inbox drained by the editor: one entry per publishDiagnostics.
-    publishes: std.ArrayListUnmanaged(Publish) = .{},
+    publishes: std.ArrayListUnmanaged(Publish) = .empty,
     /// Last hover result, owned; the editor takes and frees it.
     hover_text: ?[]u8 = null,
 
@@ -123,22 +124,24 @@ pub const Lsp = struct {
 
     /// Spawn `zls` from PATH and send `initialize`. Returns error.FileNotFound
     /// when zls is not installed — the caller degrades to no-LSP.
-    pub fn spawn(alloc: std.mem.Allocator, root_abs: []const u8) !Lsp {
-        var child = std.process.Child.init(&.{"zls"}, alloc);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore; // zls logs go to window/logMessage
-        try child.spawn();
-        errdefer _ = child.kill() catch {};
+    pub fn spawn(io: std.Io, alloc: std.mem.Allocator, root_abs: []const u8) !Lsp {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{"zls"},
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,  // zls logs go to window/logMessage
+        });
+        errdefer child.kill(io);
 
         var self: Lsp = .{
+            .io = io,
             .alloc = alloc,
             .child = child,
-            .in_fd = child.stdout.?.handle,
-            .out_fd = child.stdin.?.handle,
+            .in_fd = child.stdout.?,
+            .out_fd = child.stdin.?,
         };
-        setNonBlock(self.in_fd);
-        setNonBlock(self.out_fd);
+        setNonBlock(self.in_fd.handle);
+        setNonBlock(self.out_fd.handle);
 
         const uri = try uriFromPath(alloc, root_abs);
         defer alloc.free(uri);
@@ -184,14 +187,14 @@ pub const Lsp = struct {
             self.flush();
         }
         if (self.child.stdin) |f| {
-            f.close(); // EOF makes zls exit on its own
+            f.close(self.io); // EOF makes zls exit on its own
             self.child.stdin = null;
         }
         if (self.child.stdout) |f| {
-            f.close(); // otherwise the read end leaks one fd per teardown
+            f.close(self.io); // otherwise the read end leaks one fd per teardown
             self.child.stdout = null;
         }
-        _ = self.child.kill() catch {}; // SIGTERM + reap
+        self.child.kill(self.io);
         self.in.deinit(self.alloc);
         self.out.deinit(self.alloc);
         for (self.publishes.items) |p| {
@@ -216,8 +219,8 @@ pub const Lsp = struct {
     }
 
     fn setNonBlock(fd: std.posix.fd_t) void {
-        const fl = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch return;
-        _ = std.posix.fcntl(fd, std.posix.F.SETFL, fl | @as(usize, 1 << 11)) catch {}; // O_NONBLOCK
+        const fl = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+        _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, fl | @as(c_int, 1 << 11)); // O_NONBLOCK
     }
 
     // ---- sending ----------------------------------------------------------
@@ -235,13 +238,14 @@ pub const Lsp = struct {
 
     fn sendValue(self: *Lsp, value: anytype) void {
         if (!self.alive) return;
-        var body: std.ArrayListUnmanaged(u8) = .{};
-        defer body.deinit(self.alloc);
-        std.json.stringify(value, .{}, body.writer(self.alloc)) catch return;
+        var body: std.Io.Writer.Allocating = .init(self.alloc);
+        defer body.deinit();
+        std.json.Stringify.value(value, .{}, &body.writer) catch return;
         var hbuf: [48]u8 = undefined;
-        const hdr = std.fmt.bufPrint(&hbuf, "Content-Length: {d}\r\n\r\n", .{body.items.len}) catch return;
+        const bytes = body.written();
+        const hdr = std.fmt.bufPrint(&hbuf, "Content-Length: {d}\r\n\r\n", .{bytes.len}) catch return;
         self.out.appendSlice(self.alloc, hdr) catch return;
-        self.out.appendSlice(self.alloc, body.items) catch return;
+        self.out.appendSlice(self.alloc, bytes) catch return;
         self.flush();
     }
 
@@ -250,7 +254,7 @@ pub const Lsp = struct {
     fn flush(self: *Lsp) void {
         var sent: usize = 0;
         while (sent < self.out.items.len) {
-            const n = std.posix.write(self.out_fd, self.out.items[sent..]) catch |e| switch (e) {
+            const n = self.out_fd.writeStreaming(self.io, &.{}, &.{self.out.items[sent..]}, 1) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
                     self.alive = false;
@@ -388,7 +392,7 @@ pub const Lsp = struct {
         self.flush();
         var buf: [16 * 1024]u8 = undefined;
         while (true) {
-            const n = std.posix.read(self.in_fd, &buf) catch |e| switch (e) {
+            const n = self.in_fd.readStreaming(self.io, &.{buf[0..]}) catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => {
                     self.alive = false;
@@ -502,7 +506,7 @@ pub const Lsp = struct {
             .array => |a| a,
             else => return,
         };
-        var list: std.ArrayListUnmanaged(Diag) = .{};
+        var list: std.ArrayListUnmanaged(Diag) = .empty;
         errdefer {
             for (list.items) |d| self.alloc.free(d.message);
             list.deinit(self.alloc);
@@ -611,7 +615,7 @@ pub const Lsp = struct {
             .array => |a| a,
             else => return, // null: not on a symbol
         };
-        var list: std.ArrayListUnmanaged(Loc) = .{};
+        var list: std.ArrayListUnmanaged(Loc) = .empty;
         errdefer {
             for (list.items) |l| self.alloc.free(l.path);
             list.deinit(self.alloc);
@@ -662,7 +666,7 @@ pub const Lsp = struct {
             else => return, // null: nothing completable here (e.g. zls cannot
             // resolve `std` because `zig` is not on PATH)
         };
-        var list: std.ArrayListUnmanaged([]u8) = .{};
+        var list: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (list.items) |i| self.alloc.free(i);
             list.deinit(self.alloc);
@@ -698,7 +702,7 @@ pub const Lsp = struct {
         self.rename_edits = &.{};
         self.rename_done = true;
         const res = objGet(root, "result") orelse return; // null: no symbol here
-        var list: std.ArrayListUnmanaged(TextEdit) = .{};
+        var list: std.ArrayListUnmanaged(TextEdit) = .empty;
         errdefer {
             for (list.items) |e| {
                 self.alloc.free(e.path);
@@ -825,7 +829,7 @@ pub const Lsp = struct {
             .array => |a| a,
             else => return, // null: nothing to show here
         };
-        var list: std.ArrayListUnmanaged(Hint) = .{};
+        var list: std.ArrayListUnmanaged(Hint) = .empty;
         errdefer {
             for (list.items) |h| self.alloc.free(h.label);
             list.deinit(self.alloc);
@@ -925,7 +929,7 @@ pub const Lsp = struct {
     /// `file:///abs/path`, percent-encoding everything outside the unreserved
     /// set (spaces, '#', '?', ...). `abs` must already be absolute.
     pub fn uriFromPath(alloc: std.mem.Allocator, abs: []const u8) ![]u8 {
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, "file://");
         for (abs) |c| {
@@ -944,7 +948,7 @@ pub const Lsp = struct {
     /// back verbatim, which simply fails to match any buffer.
     pub fn pathFromUri(alloc: std.mem.Allocator, uri: []const u8) ![]u8 {
         const body = if (std.mem.startsWith(u8, uri, "file://")) uri["file://".len..] else uri;
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(alloc);
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
