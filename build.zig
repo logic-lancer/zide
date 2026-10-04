@@ -17,13 +17,13 @@ pub fn build(b: *std.Build) void {
   
     const exe = b.addExecutable(.{
         .name = "zide",
-        .root_module = b.createModule(.{.root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-})
-    }
-);
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
     exe.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
     exe.root_module.addImport("tree-sitter", ts_dep.module("tree_sitter"));
     exe.root_module.addCSourceFile(.{
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
 
     // Size discipline (nullclaw-style): strip symbols outside Debug and let
     // the linker drop unreferenced sections.
-    if (optimize != .Debug) exe.root_module.strip = true;
+    if (optimize != .debug) exe.root_module.strip = true;
     exe.link_function_sections = true;
     exe.link_data_sections = true;
     exe.link_gc_sections = true;
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the editor");
     run_step.dependOn(&run_cmd.step);
 }

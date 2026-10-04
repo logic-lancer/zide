@@ -5,10 +5,10 @@ const Editor = @import("editor.zig").Editor;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = safe.deinit();
 
-    const alloc = gpa.allocator();
+    const alloc = safe.allocator();
 
     const args = try init.minimal.args.toSlice(alloc);
     defer alloc.free(args);

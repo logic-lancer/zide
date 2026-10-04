@@ -39,7 +39,7 @@ pub const Buffer = struct {
 
     /// a-z vim marks (`m{a-z}`); positions are clamped when jumped to, so
     /// stale marks after edits degrade gracefully instead of invalidating.
-    marks: [26]?Mark = [_]?Mark{null} ** 26,
+    marks: [26]?Mark = @splat(null),
     /// `'<` / `'>` — bounds of the most recent visual selection.
     mark_lt: ?Mark = null,
     mark_gt: ?Mark = null,
@@ -489,7 +489,7 @@ pub const Buffer = struct {
     /// Vim `=`: recompute leading whitespace for rows [lo, hi] from brace
     /// depth (4-space step). Blank lines are left empty.
     pub fn reindentRows(self: *Buffer, lo: usize, hi: usize) !void {
-        const spaces = " " ** 128;
+        const spaces: [128]u8 = @splat(' ');
         var depth: usize = 0;
         var i: usize = 0;
         while (i < lo) : (i += 1) depth = braceDepthAfter(self.lineText(i), depth);

@@ -54,7 +54,7 @@ taking cues from [Neovim](https://neovim.io)/[NvChad](https://nvchad.com) for UX
 
 ## Building
 
-Requires **Zig 0.14.1** (dependencies are pinned for it — see `build.zig.zon`).
+Requires **Zig 0.17.0** (dependencies are pinned for it — see `build.zig.zon`).
 
 ```sh
 zig build                          # debug build

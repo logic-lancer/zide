@@ -28,7 +28,7 @@
 
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.14.1",
+    .minimum_zig_version = "0.17.0",
 
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
@@ -37,13 +37,10 @@
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            .url = "https://github.com/rockorager/libvaxis/archive/6cab03f8a3faeb58bddf334343889a7f685ba7a7.tar.gz",
-            .hash = "vaxis-0.6.0-BWNV_FcoCgB3Q_LTiQet_GeS23Bd7e224eHloS8PanKZ",
+            .url = "git+https://github.com/rockorager/libvaxis#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
+            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
         },
-        .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#0cf58172e61f6fdd16f681cde42b4acb531a23db",
-            .hash = "tree_sitter-0.26.0-8heIf3CaAQDeVTQc0DMSBhbQAEx5aF-dTen4_LPxMgrv"
-        },
+        .tree_sitter = .{ .url = "git+https://github.com/tree-sitter/zig-tree-sitter#0cf58172e61f6fdd16f681cde42b4acb531a23db", .hash = "tree_sitter-0.26.0-8heIf3CaAQDeVTQc0DMSBhbQAEx5aF-dTen4_LPxMgrv" },
         .tree_sitter_zig = .{
             .url = "https://github.com/tree-sitter-grammars/tree-sitter-zig/archive/refs/tags/v1.1.2.tar.gz",
             .hash = "N-V-__8AAN6NXgCZxLUnqe4620P_FqHrEY8PHTA1-VlOn4yX",

@@ -30,13 +30,13 @@ pub const Term = struct {
         if (std.os.linux.ioctl(master, TIOCGPTN, @intFromPtr(&ptn)) != 0) return error.PtyNumber;
 
         var path_buf: [32]u8 = undefined;
-        const slave_path = try std.fmt.bufPrintZ(&path_buf, "/dev/pts/{d}", .{ptn});
+        const slave_path = try std.mem.printSentinel(&path_buf, "/dev/pts/{d}", .{ptn}, 0);
 
         const pid = std.posix.system.fork();
         if (pid == 0) {
             // Child: new session, adopt the slave as the controlling tty.
             _ = std.os.linux.setsid();
-            const slave = try std.Io.Dir.openFileAbsolute(io, slave_path, .{.mode = .read_write});
+            const slave = std.Io.Dir.openFileAbsolute(io, slave_path, .{ .mode = .read_write }) catch std.process.exit(1);
             _ = std.os.linux.ioctl(slave.handle, TIOCSCTTY, 0);
             if (std.posix.system.dup2(slave.handle, 0) != 0) std.process.exit(1);
             if (std.posix.system.dup2(slave.handle, 1) != 0) std.process.exit(1);
@@ -46,7 +46,7 @@ pub const Term = struct {
 
             const shell = std.posix.system.getenv("SHELL") orelse "/bin/sh";
             var shell_buf: [128]u8 = undefined;
-            const shell_z = std.fmt.bufPrintZ(&shell_buf, "{s}", .{shell}) catch std.process.exit(1);
+            const shell_z = std.mem.printSentinel(&shell_buf, "{s}", .{shell}, 0) catch std.process.exit(1);
             const argv = [_][]const u8{shell_z};
             var env_map = std.process.Environ.Map.init(alloc);
             env_map.put("TERM", "dumb") catch std.process.exit(1);

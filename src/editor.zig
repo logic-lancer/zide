@@ -70,7 +70,7 @@ pub const Editor = struct {
     git_branch: [64]u8 = undefined,
     git_branch_len: usize = 0,
     /// Macro registers: `q{a-z}` records raw key events, `@{a-z}` replays.
-    macros: [26]std.ArrayListUnmanaged(vaxis.Key) = [_]std.ArrayListUnmanaged(vaxis.Key){.empty} ** 26,
+    macros: [26]std.ArrayListUnmanaged(vaxis.Key) = @splat(.empty),
     /// Register char ('a'..'z') currently being recorded into, if any.
     recording: ?u8 = null,
     /// Last register replayed with `@`, reused by `@@`.
@@ -486,8 +486,8 @@ pub const Editor = struct {
 
     /// `$HOME/.cache/zide/oldfiles` — one absolute path per line.
     fn oldfilesPath(self: *Editor, buf: []u8) ?[]u8 {
-        const home = self.environ_map.get("HOME");
-        return std.fmt.bufPrint(buf, "{?s}/.cache/zide/oldfiles", .{home}) catch null;
+        const home = self.environ_map.get("HOME") orelse return null;
+        return std.fmt.bufPrint(buf, "{s}/.cache/zide/oldfiles", .{home}) catch null;
     }
 
     fn loadOldfiles(self: *Editor) void {
